@@ -6,7 +6,12 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "absurd-sdk>=0.2.0",
+    # Replay reads a pinned LeRobot v3 snapshot directly: parquet columns and info.json.
+    # That keeps dataset replay off the torch stack, which has no business running on a
+    # robot control host just to read joint angles.
+    "huggingface-hub>=0.30",
     "numpy>=2.0",
+    "pyarrow>=17.0",
     "pyyaml>=6.0",
 ]
 
