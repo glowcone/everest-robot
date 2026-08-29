@@ -1,0 +1,66 @@
+# Everest robot parameters for the Maker Arm v1.
+#
+# This file is owned by everest-robot and describes *policy*: which poses are approved,
+# how fast the arm may move between them, and which arm these values were measured on.
+# It intentionally does not restate motor directions, offsets, gains or mechanical limits
+# -- those live in maker-arm-sdk's hardware profile (maker_arm/profiles/maker_arm_v1.yaml)
+# and are enforced by the driver. The runtime cross-checks `robot.calibration_id` and
+# `robot.joint_order` against the connected arm before anything is enabled.
+#
+# Environment-specific values (CAN interface, camera device paths, credentials) never
+# belong here. They come from deployment configuration and environment variables.
+#
+# Unknown fields are a hard error. See docs/named-position-capture.md before adding a pose.
+schema_version: 1
+
+robot:
+  id: maker-arm-02
+  model: maker-arm-v1
+  # Must match the calibration the connected arm is running. Bump this whenever the arm is
+  # re-zeroed or mechanically changed; every preset below must then be recaptured.
+  calibration_id: maker-arm-02-2026-08-20
+  joint_order:
+    - shoulder_pan
+    - shoulder_lift
+    - elbow_flex
+    - wrist_flex
+    - wrist_yaw
+    - wrist_roll
+    - gripper
+  units: radians
+
+# Conservative bounds applied to every move unless a preset overrides them. The driver's
+# own max_velocity is a ceiling above these, not a substitute: this is the workflow's
+# self-imposed limit for automated motion.
+motion_defaults:
+  max_velocity_rad_s: 0.5
+  max_acceleration_rad_s2: 1.0
+  tolerance_rad: 0.03
+  settle_time_s: 0.25
+  timeout_s: 10.0
+  control_rate_hz: 30
+
+# No presets are defined yet, and none may be invented.
+#
+# Every entry requires `joints` (one value per joint in joint_order, radians, in calibrated
+# joint coordinates), plus `calibration_id`, `approved_by` and `captured_at` recording who
+# measured it and when. The loader rejects any preset whose calibration_id differs from
+# robot.calibration_id above. Capture them from a measured, operator-approved arm state by
+# following docs/named-position-capture.md -- never by hand-editing joint values.
+named_positions: {}
+
+# Waypoint sequences for transitions where direct joint-space interpolation has not been
+# shown to be collision-free. When a transition exists, the runtime must use it.
+named_transitions: {}
+
+policy:
+  default_controller: vla
+  fps: 30
+  max_duration_s: 30
+
+replay:
+  require_matching_robot_id: true
+  require_matching_calibration_id: true
+  # Set to an approved named position once one exists.
+  safe_start_position: null
+  max_speed_scale: 1.0
