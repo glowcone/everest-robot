@@ -80,8 +80,19 @@ Named positions ship empty on purpose. Capture them from a measured, operator-ap
 state by following [`docs/named-position-capture.md`](docs/named-position-capture.md); the
 loader refuses any preset whose calibration identity does not match the connected arm.
 
-Session recording, replay and LeRobot checkpoint loading are interface-only stubs pending
-the stored-session format decision, and refuse rather than guessing a format.
+Stored-session **replay** is implemented: it resolves a pinned Hugging Face dataset
+revision, validates the whole episode against this arm before claiming it, aligns to the
+recorded start pose, and replays the recorded actions at the recorded cadence. See
+[`docs/session-replay.md`](docs/session-replay.md), including the hardware acceptance
+procedure and two findings about the first target dataset.
+
+```bash
+# Validate a request locally -- claims nothing, energizes nothing.
+just replay-preflight <repo-id> <40-char-revision> <episode>
+```
+
+Session *recording* and LeRobot checkpoint loading remain interface-only stubs pending the
+dataset-writing decision, and refuse rather than guessing a format.
 
 ## Integration points
 

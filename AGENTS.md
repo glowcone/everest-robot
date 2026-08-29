@@ -30,9 +30,21 @@ Absurd checkpoints store.
   (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
   cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
   leave it held on `BaseException`, not only on its own failure paths.
-- `recording.py`, `replay.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending
-  the stored-session format decision. Keep them refusing with an actionable message rather
-  than guessing a format or a feature mapping.
+- `recording.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending the
+  dataset-writing decision. Keep them refusing with an actionable message rather than
+  guessing a format or a feature mapping.
+- `datasets.py` reads a pinned LeRobot v3 snapshot directly (parquet + `meta/info.json`)
+  rather than through `LeRobotDataset`, so replay needs no torch. Only the documented v3
+  layout is supported; extend the reader deliberately rather than loosening its checks.
+- `replay.py` must keep its ordering: everything decidable without hardware happens in
+  `preflight()`, which raises, and only then is the robot claimed. Failures after that
+  point return a `ReplayResult` with `stopped_reason`, because a physical attempt happened.
+- Replay pacing deliberately differs from the policy runner's: a late frame is absorbed,
+  never made up, because commanding a backlog faster drives the recorded path at an
+  unvalidated speed.
+- The `lerobot_frame` offsets in the parameters file are the most consequential values in
+  the replay path -- the two drivers do not share a zero pose. See
+  `docs/lerobot-frame-reconciliation.md` before touching them.
 - Third-party robotics dependencies live in the `hardware` extra and are imported lazily.
   A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
