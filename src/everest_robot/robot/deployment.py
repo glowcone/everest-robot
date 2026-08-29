@@ -17,6 +17,8 @@ Environment:
   or ``file``.
 * ``EVEREST_CAMERAS`` / ``EVEREST_CAMERAS_FILE`` -- see
   :mod:`everest_robot.robot.cameras`.
+* ``HF_TOKEN`` -- read by ``huggingface_hub`` itself for a private dataset. It is never
+  passed through workflow parameters and never appears in a result or an error.
 """
 
 from __future__ import annotations
@@ -24,13 +26,17 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from everest_robot.robot.cameras import CameraRuntime
 from everest_robot.robot.contracts import CancelCheck, Heartbeat
+from everest_robot.robot.datasets import HuggingFaceDatasetResolver
 from everest_robot.robot.lease import FileLease, PostgresAdvisoryLease, RobotLease
+from everest_robot.robot.lerobot_bridge import JointFrame
 from everest_robot.robot.maker_arm_port import MakerArmPort
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.ports import ArmPort
+from everest_robot.robot.replay import ReplayRunner
 from everest_robot.robot.session import RobotSession
 
 DEFAULT_PARAMETERS_PATH = "config/maker_arm_v1.yaml"
@@ -111,3 +117,43 @@ def open_session(
         cancel=cancel,
     )
     return session.open()
+
+
+def joint_frame(parameters: RobotParameters) -> JointFrame:
+    """The reconciliation between this arm's radians and LeRobot's degrees.
+
+    An absent ``lerobot_frame`` yields the identity frame, which asserts the two drivers
+    share a zero pose. They do not on this arm, so replay of a MakerFollower recording will
+    then fail preflight against the soft limits rather than command a wrong pose.
+    """
+
+    spec = parameters.lerobot_frame
+    return JointFrame(
+        parameters.identity.joint_names,
+        offsets_deg=spec.offsets_deg if spec is not None else (),
+    )
+
+
+def build_replay_runner(
+    *,
+    environ: Mapping[str, str] | None = None,
+    clock: Any = None,
+) -> ReplayRunner:
+    """Build a replay runner from deployment configuration.
+
+    The arm port is constructed but not connected: preflight has to be able to read the
+    driver's soft limits without claiming or energizing anything.
+    """
+
+    environ = os.environ if environ is None else environ
+    parameters = load_parameters(environ)
+    return ReplayRunner(
+        build_port(parameters, environ),
+        parameters,
+        resolver=HuggingFaceDatasetResolver(
+            require_full_revision=parameters.replay.require_full_revision
+        ),
+        lease=build_lease(parameters, environ),
+        frame=joint_frame(parameters),
+        clock=clock,
+    )

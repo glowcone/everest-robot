@@ -27,6 +27,8 @@ hardware = [
 [project.scripts]
 robot-worker = "everest_robot.worker:main"
 robot-start = "everest_robot.client:start"
+robot-replay = "everest_robot.client:start_replay"
+robot-replay-preflight = "everest_robot.client:replay_preflight"
 robot-db-init = "everest_robot.database:init"
 
 [dependency-groups]

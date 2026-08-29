@@ -1,17 +1,19 @@
-"""Absurd task definition for the carabiner attachment workflow."""
+"""Absurd task definitions: carabiner attachment, and stored-session replay."""
 
 import os
 from typing import Any
 
 from absurd_sdk import Absurd
 
-from everest_robot.adapters import robot_session
+from everest_robot.adapters import replay_session, robot_session
 from everest_robot.domain import (
     AttachmentResult,
     RecoveryTarget,
+    ReplayRequest,
     VerificationResult,
     json_dict,
 )
+from everest_robot.robot.replay import ReplayControl
 
 QUEUE_NAME = os.getenv("ROBOT_QUEUE", "robot")
 
@@ -110,9 +112,37 @@ def _attach_carabiner(params: dict[str, Any], ctx: Any, robot: Any) -> dict[str,
     raise RuntimeError(f"attachment was not secure after {max_cycles} recovery cycles")
 
 
+def run_replay_session(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Replay one stored dataset episode as a single durable stage.
+
+    One checkpoint covers the whole invocation. Frame-level checkpoints would be both
+    enormous and useless: the value of a checkpoint is that its effect need not be
+    repeated, and there is no way to resume a physical replay mid-episode from a stored
+    frame number without knowing where the arm actually is.
+    """
+
+    request = ReplayRequest.from_json(params)
+    heartbeat = _heartbeat_for(ctx)
+    control = ReplayControl(
+        # Absurd surfaces cancellation by raising out of the heartbeat, so there is no
+        # separate flag to poll. The raise unwinds through the replay session, which holds
+        # the arm and releases the lease on its way out.
+        heartbeat=(lambda progress: heartbeat()) if heartbeat else None,
+    )
+    return ctx.step(
+        "01-replay-session",
+        lambda: json_dict(replay_session(request, control)),
+    )
+
+
 def create_app() -> Absurd:
     """Create the database-backed app and register workflow tasks."""
 
     app = Absurd(queue_name=QUEUE_NAME)
     app.register_task("attach-carabiner", default_max_attempts=10)(run_attach_carabiner)
+    # Deliberately one attempt. A replay interrupted after 200 frames cannot be safely
+    # restarted from frame zero: the arm is in an unknown intermediate pose, and repeating
+    # the sequence from there is a different physical motion. Recovery is an operator
+    # decision -- inspect, realign through an approved path, and authorize a new attempt.
+    app.register_task("replay-session", default_max_attempts=1)(run_replay_session)
     return app

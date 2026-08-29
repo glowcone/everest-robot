@@ -29,7 +29,9 @@ from everest_robot.domain import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from everest_robot.domain import ReplayRequest, ReplayResult
     from everest_robot.robot.policy import PolicyHandle
+    from everest_robot.robot.replay import ReplayControl
     from everest_robot.robot.session import RobotSession
 
 
@@ -199,3 +201,28 @@ def robot_session(
         )
     finally:
         session.close()
+
+
+def replay_session(
+    request: ReplayRequest,
+    control: ReplayControl | None = None,
+    *,
+    runner: Any = None,
+    environ: Any = None,
+) -> ReplayResult:
+    """Replay a stored dataset episode. The adapter boundary for replay.
+
+    A workflow passes a request and gets a result; datasets, tensors, motors and leases all
+    stay on this side of the line.
+
+    Replay claims the robot itself rather than running inside an existing
+    :func:`robot_session`, and that ordering is the point: every dataset and configuration
+    check has to finish *before* anything is claimed or energized, so discovering a broken
+    episode never costs an energized arm.
+    """
+
+    if runner is None:
+        from everest_robot.robot.deployment import build_replay_runner
+
+        runner = build_replay_runner(environ=environ)
+    return runner.run(request, control)
