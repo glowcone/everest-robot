@@ -1,48 +1,172 @@
+# Everest robot: development and operations commands.
+#
+# Recipes load .env automatically (copy .env.example to .env first). Run `just` to list
+# them by group, or `just --list` for a flat list.
+#
+# Two workflows exist:
+#   attach-carabiner  the carabiner attachment state machine  (just start)
+#   replay-session    replay of a stored dataset episode      (just replay ...)
+#
+# Anything that can move a real arm is grouped under "replay" and "robot", and every one of
+# those recipes is safe to read before it is safe to run: see docs/session-replay.md.
+
 set dotenv-load
 
 default:
-    @just --list
+    @just --list --unsorted
 
-# Install the locked Python environment.
+# ── setup ──────────────────────────────────────────────────────────────────────────
+
+# Install the locked environment (no torch, no CAN). Enough for everything but real hardware.
+[group('setup')]
 setup:
     uv sync
 
+# Add the pinned robot SDKs (maker-arm, lerobot+torch). Only needed to drive a real arm.
+[group('setup')]
+setup-hardware:
+    uv sync --extra hardware
+
+# Print the resolved robot parameters and deployment environment. Touches nothing.
+[group('setup')]
+config:
+    uv run robot-config
+
+# ── database ───────────────────────────────────────────────────────────────────────
+
 # Start Postgres and wait until it is healthy.
+[group('database')]
 db-up:
     docker compose up -d --wait postgres
 
 # Stop the local containers without deleting database data.
+[group('database')]
 db-down:
     docker compose down
 
 # Install Absurd's schema and create the robot queue (first-time setup).
+[group('database')]
 db-init:
     uv run robot-db-init
 
-# Run the durable workflow worker.
+# Delete all database state and start over, clearing tasks from older workflow revisions.
+[group('database')]
+db-reset:
+    docker compose down -v
+    just db-up
+    just db-init
+
+# Open a psql shell in the Postgres container (the host needs no PostgreSQL client).
+[group('database')]
+psql:
+    docker compose exec postgres psql -U robot -d robot
+
+# ── workflows ──────────────────────────────────────────────────────────────────────
+
+# Run the durable workflow worker. Leave it running; it serves both task types.
+[group('workflow')]
 worker:
     uv run robot-worker
 
-# Spawn a workflow. Example: just start retry-demo 1
+# Spawn an attachment workflow; arg 2 simulates that many failed verifications first.
+[group('workflow')]
 start workflow_id="demo" verification_failures="0":
     uv run robot-start --workflow-id {{ workflow_id }} --verification-failures {{ verification_failures }}
 
-# Validate a replay request locally. Claims nothing, energizes nothing.
-# Example: just replay-preflight h8i76dfsd9/test1_20260829_130743 55e5611... 0
+# List recent tasks and their state.
+[group('workflow')]
+tasks limit="20":
+    docker compose exec -T postgres psql -U robot -d robot -c \
+        "SELECT task_id, task_name, state, attempts, enqueue_at \
+         FROM absurd.t_robot ORDER BY enqueue_at DESC LIMIT {{ limit }};"
+
+# Show one task's parameters and its durable result.
+[group('workflow')]
+task task_id:
+    docker compose exec -T postgres psql -U robot -d robot -c \
+        "SELECT task_name, state, attempts, jsonb_pretty(params) AS params, \
+                jsonb_pretty(completed_payload) AS result \
+         FROM absurd.t_robot WHERE task_id = '{{ task_id }}';"
+
+# Show one task's committed checkpoints: the record of which stages actually completed.
+[group('workflow')]
+checkpoints task_id:
+    docker compose exec -T postgres psql -U robot -d robot -c \
+        "SELECT checkpoint_name, status, updated_at, jsonb_pretty(state) AS value \
+         FROM absurd.c_robot WHERE task_id = '{{ task_id }}' ORDER BY updated_at;"
+
+# Cancel a task. A running stage stops at its next heartbeat, holding the arm on the way out.
+[group('workflow')]
+cancel task_id:
+    docker compose exec -T postgres psql -U robot -d robot -c \
+        "SELECT absurd.cancel_task('${ROBOT_QUEUE:-robot}', '{{ task_id }}');"
+
+# ── replay ─────────────────────────────────────────────────────────────────────────
+# The numbered recipes are the ordered path to a powered replay. Run them in order;
+# docs/session-replay.md explains what each one proves.
+
+# 1. Print the preflight report locally. Claims nothing, energizes nothing, needs no worker.
+[group('replay')]
 replay-preflight repo revision episode="0" policy="clamp_within_tolerance" deviation="2.0":
     uv run robot-replay-preflight \
         --repo-id {{ repo }} --revision {{ revision }} --episode {{ episode }} \
         --robot-id "$EVEREST_ROBOT_ID" --calibration-id "$EVEREST_CALIBRATION_ID" \
         --limit-policy {{ policy }} --max-limit-deviation-deg {{ deviation }}
 
-# Spawn a replay workflow. Add --dry-run through `just` by passing dry="--dry-run".
-replay repo revision episode="0" workflow_id="replay" dry="":
+# 2. The same validation through the durable workflow. Still commands no motion.
+[group('replay')]
+replay-dry-run repo revision episode="0" workflow_id="replay-dry":
+    just _replay {{ repo }} {{ revision }} {{ episode }} {{ workflow_id }} "--dry-run" "1.0" "0" ""
+
+# 3. Drive to the episode's recorded start pose and stop. The first recipe that MOVES the arm.
+[group('replay')]
+replay-align repo revision episode="0" workflow_id="replay-align":
+    just _replay {{ repo }} {{ revision }} {{ episode }} {{ workflow_id }} "" "0.25" "0" "0"
+
+# 4. Replay a short range at reduced speed. Widen the range and speed only once each is clean.
+[group('replay')]
+replay-range repo revision episode="0" workflow_id="replay-range" end_frame="30" speed="0.25":
+    just _replay {{ repo }} {{ revision }} {{ episode }} {{ workflow_id }} "" {{ speed }} "0" {{ end_frame }}
+
+# 5. Replay the full episode. Each attempt needs its own workflow id.
+[group('replay')]
+replay repo revision episode="0" workflow_id="replay" speed="1.0":
+    just _replay {{ repo }} {{ revision }} {{ episode }} {{ workflow_id }} "" {{ speed }} "0" ""
+
+# Shared spawn used by the replay recipes above.
+[private]
+_replay repo revision episode workflow_id dry speed start_frame end_frame:
     uv run robot-replay --workflow-id {{ workflow_id }} {{ dry }} \
         --repo-id {{ repo }} --revision {{ revision }} --episode {{ episode }} \
         --robot-id "$EVEREST_ROBOT_ID" --calibration-id "$EVEREST_CALIBRATION_ID" \
+        --speed {{ speed }} --start-frame {{ start_frame }} \
+        {{ if end_frame == "" { "" } else { "--end-frame " + end_frame } }} \
         --limit-policy clamp_within_tolerance --max-limit-deviation-deg 2.0
 
-# Run lint and unit tests.
+# ── development ────────────────────────────────────────────────────────────────────
+
+# Lint and unit tests. Run before handing off any change.
+[group('dev')]
 check:
     uv run ruff check .
     uv run pytest
+
+# Run the unit tests, passing any extra arguments through to pytest.
+[group('dev')]
+test *args:
+    uv run pytest {{ args }}
+
+# Lint only.
+[group('dev')]
+lint:
+    uv run ruff check .
+
+# Apply ruff's automatic fixes.
+[group('dev')]
+fmt:
+    uv run ruff check --fix .
+
+# Also run the tests that download the real dataset from Hugging Face.
+[group('dev')]
+test-network:
+    EVEREST_HF_NETWORK_TESTS=1 uv run pytest

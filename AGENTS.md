@@ -1,9 +1,18 @@
 # Repository guidance
 
-Use `just` as the primary interface for development commands. Run `just` to list the
-available recipes, `just setup` to install dependencies, `just db-up` and `just db-init`
-for first-time database setup, `just worker` to run the Absurd worker, and `just check`
-before handing off changes. Recipes automatically load local values from `.env`.
+Use `just` as the primary interface for development and operations. Run `just` to list the
+recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `database`
+(`db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
+`checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
+and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
+automatically. Run `just check` before handing off changes.
+
+The Justfile is documentation as much as tooling: a recipe's comment is what `just --list`
+shows, so keep it to one line and put longer explanation in the section header or in
+`docs/`. Anything that can move a real arm belongs in the `replay` or `workflow` group with
+its ordering made explicit. `absurdctl`'s subcommands shell out to `psql`, which the host
+is not assumed to have, so task inspection recipes run `psql` inside the Postgres container
+instead.
 
 Keep robot hardware, policy, and perception code behind the adapter boundary in
 `src/everest_robot/adapters.py`. Keep durable orchestration and checkpoint naming in
