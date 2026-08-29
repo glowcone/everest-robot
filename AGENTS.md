@@ -10,6 +10,34 @@ Keep robot hardware, policy, and perception code behind the adapter boundary in
 `src/everest_robot/workflow.py`. Any physical side effect must be designed to tolerate
 retries and brief overlapping execution.
 
+## The robot SDK layer
+
+`src/everest_robot/robot/` is the runtime the hardware adapter drives. It is a separate
+concern from `domain.py`: `robot/contracts.py` holds high-frequency runtime structures and
+the runtime's own durable results, while `domain.py` holds the workflow-visible types the
+Absurd checkpoints store.
+
+- `ports.py` is the single hardware boundary. Nothing above it imports a driver.
+  `maker_arm_port.py` adapts `maker_arm.Arm`; `fake_arm.py` is the deterministic stand-in
+  every layer above is tested against.
+- Soft limits, watchdogs, velocity limiting, fault handling and coordinate conversion
+  belong to `maker-arm-sdk` and must not be re-implemented here. See
+  `docs/adr/0001-production-motor-protocol.md` for the ownership split.
+- `parameters.py` loads `config/maker_arm_v1.yaml` strictly: unknown fields are rejected,
+  and a preset whose `calibration_id` does not match the file's robot is refused. Presets
+  come from `docs/named-position-capture.md`, never from hand-edited joint values.
+- `motion.py`, `policy.py` and `session.py` take an injectable `Clock`
+  (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
+  cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
+  leave it held on `BaseException`, not only on its own failure paths.
+- `recording.py`, `replay.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending
+  the stored-session format decision. Keep them refusing with an actionable message rather
+  than guessing a format or a feature mapping.
+- Third-party robotics dependencies live in the `hardware` extra and are imported lazily.
+  A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
+- `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
+  backend, parameters path). Do not read the environment anywhere else in the runtime.
+
 ## Working on workflow components
 
 Shared data contracts belong in `src/everest_robot/domain.py`. Add or change a typed

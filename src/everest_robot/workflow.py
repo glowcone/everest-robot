@@ -5,7 +5,7 @@ from typing import Any
 
 from absurd_sdk import Absurd
 
-from everest_robot.adapters import ScaffoldRobot
+from everest_robot.adapters import robot_session
 from everest_robot.domain import (
     AttachmentResult,
     RecoveryTarget,
@@ -26,10 +26,28 @@ def _verification_from_json(value: dict[str, Any]) -> VerificationResult:
     )
 
 
+def _heartbeat_for(ctx: Any) -> Any:
+    """The worker-claim heartbeat, if this context has one.
+
+    Long physical calls hold the arm for far longer than a claim timeout, so the runtime
+    beats from inside its control loops. Absurd also signals cancellation by raising from
+    here, which the motion and rollout loops treat as a stop-and-hold.
+    """
+
+    heartbeat = getattr(ctx, "heartbeat", None)
+    return (lambda: heartbeat()) if callable(heartbeat) else None
+
+
 def run_attach_carabiner(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Localize, pick up, position, attach, verify, and durably recover."""
 
-    robot = ScaffoldRobot(verification_failures=int(params.get("verification_failures", 0)))
+    with robot_session(params, heartbeat=_heartbeat_for(ctx)) as robot:
+        return _attach_carabiner(params, ctx, robot)
+
+
+def _attach_carabiner(params: dict[str, Any], ctx: Any, robot: Any) -> dict[str, Any]:
+    """The durable state machine. The robot is already claimed and connected."""
+
     detector = str(params.get("carabiner_detector", "deterministic-cv"))
     grasp_planner = str(params.get("grasp_planner", "graspnet"))
     position_name = str(params.get("attachment_position", "clip-attachment-ready"))
