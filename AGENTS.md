@@ -20,21 +20,20 @@ renaming either can affect workflows that started on an older revision.
 The placeholder implementations live on `ScaffoldRobot` in
 `src/everest_robot/adapters.py`. Preserve this boundary when adding production code:
 
-- **Carabiner pickup:** implement RL-policy or VLA invocation in
-  `pick_up_carabiner()`. Return an explicit `secured` result. Raise only for retryable
-  execution failures; a completed but unsuccessful grasp should remain observable to the
-  workflow. Make robot commands idempotent or guard them with a physical-state check.
-- **Rope localization:** implement deterministic CV or VLM inference in `locate_rope()`.
-  Return a pose with an explicit coordinate frame and record which detector produced it.
-  Do not hide coordinate transforms or mutable camera state in the workflow.
-- **Attachment control:** implement deterministic motion and force control in
-  `attach_carabiner()`. Consume the typed rope pose and return measurable control results.
-  Keep control loops inside the adapter; use Absurd checkpoints for stage boundaries, not
-  for every servo update.
+- **Carabiner localization and pickup:** implement CV detection and GraspNet grasp
+  planning in `localize_and_pick_up_carabiner()`. Return the detected pose, coordinate
+  frame, detector, grasp planner, and explicit `secured` result. Raise only for retryable
+  execution failures; make physical commands idempotent or guard them with a state check.
+- **Known-position motion:** implement deterministic navigation or arm motion in
+  `go_to_known_position()`. Named positions belong in robot configuration and should be
+  resolved and validated inside the adapter rather than embedded in orchestration.
+- **Attachment control:** implement the RL policy or VLA in `attach_clip()`. Return the
+  controller identity and measurable control results. Keep policy rollout and low-level
+  control inside the adapter; use Absurd checkpoints for stage boundaries, not each action.
 - **Attachment verification:** implement sensor/CV/VLM fusion in
   `verify_attachment()`. Return both the verdict and a `RecoveryTarget` so the workflow
-  can deliberately route back to pickup, localization, or attachment. Add a new recovery
-  target only alongside its orchestration branch and tests.
+  can deliberately route back to localization/pickup, known-position motion, or
+  attachment. Add a new recovery target only alongside its orchestration branch and tests.
 
 The durable state machine lives in `src/everest_robot/workflow.py`. Recovery iterations
 must use deterministic, cycle-specific checkpoint names; reusing a completed name causes

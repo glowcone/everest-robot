@@ -6,13 +6,13 @@ A Python/uv scaffold for a deterministic, durable robot workflow powered by
 The physical robot integrations are deliberately placeholders. The scaffold makes their
 boundaries explicit while exercising the orchestration shape:
 
-1. Pick up a carabiner with an RL policy or VLA. A failed action raises so Absurd retries
-   the task; a successful result is checkpointed in Postgres.
-2. Locate the rope with deterministic CV or a VLM.
-3. Attach the carabiner with deterministic control.
-4. Verify the attachment and route back to pickup, localization, or attachment. Each
+1. Localize the carabiner with CV and pick it up using GraspNet.
+2. Move the robot to a named, known attachment position.
+3. Attach the clip with an RL policy or VLA.
+4. Verify the attachment and route back to pickup, positioning, or attachment. Each
    recovery cycle uses unique checkpoint names so feedback creates new work.
-5. Return a durable `complete` result only after verification succeeds.
+
+The workflow returns a durable `complete` result only after verification succeeds.
 
 ## Run locally
 

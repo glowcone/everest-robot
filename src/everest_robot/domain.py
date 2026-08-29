@@ -8,30 +8,33 @@ from typing import Any
 class RecoveryTarget(StrEnum):
     """The stage verification says must be attempted again."""
 
-    LOCATE_ROPE = "locate_rope"
+    LOCALIZE_AND_PICK_UP = "localize_and_pick_up"
+    GO_TO_KNOWN_POSITION = "go_to_known_position"
     ATTACH = "attach"
-    PICK_UP = "pick_up"
 
 
 @dataclass(frozen=True)
-class PickupResult:
+class CarabinerPickupResult:
     secured: bool
-    controller: str
-
-
-@dataclass(frozen=True)
-class RopePose:
     frame: str
     x: float
     y: float
     z: float
     detector: str
+    grasp_planner: str
+
+
+@dataclass(frozen=True)
+class PositionResult:
+    reached: bool
+    position_name: str
 
 
 @dataclass(frozen=True)
 class AttachmentResult:
     motion_completed: bool
     force_newtons: float
+    controller: str
 
 
 @dataclass(frozen=True)
@@ -46,4 +49,3 @@ def json_dict(value: object) -> dict[str, Any]:
     """Convert a domain result to an Absurd-compatible JSON mapping."""
 
     return asdict(value)
-

@@ -1,9 +1,10 @@
 """Worker process entry point."""
 
-from everest_robot.workflow import QUEUE_NAME, app
+from everest_robot.workflow import QUEUE_NAME, create_app
 
 
 def main() -> None:
+    app = create_app()
     print(f"robot worker listening on queue {QUEUE_NAME}")
     try:
         app.start_worker()

@@ -8,9 +8,9 @@ from dataclasses import dataclass
 
 from everest_robot.domain import (
     AttachmentResult,
-    PickupResult,
+    CarabinerPickupResult,
+    PositionResult,
     RecoveryTarget,
-    RopePose,
     VerificationResult,
 )
 
@@ -22,15 +22,30 @@ class ScaffoldRobot:
     verification_failures: int = 0
     verification_calls: int = 0
 
-    def pick_up_carabiner(self, controller: str) -> PickupResult:
-        return PickupResult(secured=True, controller=controller)
+    def localize_and_pick_up_carabiner(
+        self,
+        detector: str,
+        grasp_planner: str,
+    ) -> CarabinerPickupResult:
+        return CarabinerPickupResult(
+            secured=True,
+            frame="robot_base",
+            x=0.42,
+            y=0.0,
+            z=0.18,
+            detector=detector,
+            grasp_planner=grasp_planner,
+        )
 
-    def locate_rope(self, detector: str) -> RopePose:
-        return RopePose(frame="robot_base", x=0.42, y=0.0, z=0.18, detector=detector)
+    def go_to_known_position(self, position_name: str) -> PositionResult:
+        return PositionResult(reached=True, position_name=position_name)
 
-    def attach_carabiner(self, rope: RopePose) -> AttachmentResult:
-        del rope
-        return AttachmentResult(motion_completed=True, force_newtons=8.0)
+    def attach_clip(self, controller: str) -> AttachmentResult:
+        return AttachmentResult(
+            motion_completed=True,
+            force_newtons=8.0,
+            controller=controller,
+        )
 
     def verify_attachment(self, attachment: AttachmentResult) -> VerificationResult:
         del attachment
@@ -43,4 +58,3 @@ class ScaffoldRobot:
                 reason="scaffolded verification failure",
             )
         return VerificationResult(secure=True, confidence=0.99)
-

@@ -9,13 +9,11 @@ from everest_robot.adapters import ScaffoldRobot
 from everest_robot.domain import (
     AttachmentResult,
     RecoveryTarget,
-    RopePose,
     VerificationResult,
     json_dict,
 )
 
 QUEUE_NAME = os.getenv("ROBOT_QUEUE", "robot")
-app = Absurd(queue_name=QUEUE_NAME)
 
 
 def _verification_from_json(value: dict[str, Any]) -> VerificationResult:
@@ -28,45 +26,47 @@ def _verification_from_json(value: dict[str, Any]) -> VerificationResult:
     )
 
 
-@app.register_task("attach-carabiner", default_max_attempts=10)
-def attach_carabiner(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
-    """Pick up, locate, attach, verify, and durably recover when needed."""
+def run_attach_carabiner(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Localize, pick up, position, attach, verify, and durably recover."""
 
     robot = ScaffoldRobot(verification_failures=int(params.get("verification_failures", 0)))
-    controller = str(params.get("pickup_controller", "rl-policy"))
-    detector = str(params.get("rope_detector", "deterministic-cv"))
+    detector = str(params.get("carabiner_detector", "deterministic-cv"))
+    grasp_planner = str(params.get("grasp_planner", "graspnet"))
+    position_name = str(params.get("attachment_position", "clip-attachment-ready"))
+    attachment_controller = str(params.get("attachment_controller", "vla"))
     max_cycles = int(params.get("max_recovery_cycles", 5))
 
-    pickup = ctx.step(
-        "01-pick-up-carabiner",
-        lambda: json_dict(robot.pick_up_carabiner(controller)),
-    )
-    if not pickup["secured"]:
-        raise RuntimeError("carabiner pickup failed; retrying from the durable checkpoint")
-
-    recovery_target = RecoveryTarget.LOCATE_ROPE
-    rope_json: dict[str, Any] | None = None
+    recovery_target = RecoveryTarget.LOCALIZE_AND_PICK_UP
+    pickup: dict[str, Any] | None = None
+    position: dict[str, Any] | None = None
     for cycle in range(max_cycles):
         suffix = f"cycle-{cycle:02d}"
-        if recovery_target is RecoveryTarget.PICK_UP:
+        if recovery_target is RecoveryTarget.LOCALIZE_AND_PICK_UP:
             pickup = ctx.step(
-                f"01-pick-up-carabiner-{suffix}",
-                lambda: json_dict(robot.pick_up_carabiner(controller)),
+                f"01-localize-and-pick-up-carabiner-{suffix}",
+                lambda: json_dict(
+                    robot.localize_and_pick_up_carabiner(detector, grasp_planner)
+                ),
             )
             if not pickup["secured"]:
-                raise RuntimeError("carabiner re-pickup failed")
+                raise RuntimeError("carabiner localization or GraspNet pickup failed")
 
-        if recovery_target in {RecoveryTarget.PICK_UP, RecoveryTarget.LOCATE_ROPE}:
-            rope_json = ctx.step(
-                f"02-locate-rope-{suffix}",
-                lambda: json_dict(robot.locate_rope(detector)),
+        if recovery_target in {
+            RecoveryTarget.LOCALIZE_AND_PICK_UP,
+            RecoveryTarget.GO_TO_KNOWN_POSITION,
+        }:
+            position = ctx.step(
+                f"02-go-to-known-position-{suffix}",
+                lambda: json_dict(robot.go_to_known_position(position_name)),
             )
-        if rope_json is None:
-            raise RuntimeError("attachment cannot start without a rope pose")
-        rope = RopePose(**rope_json)
+            if not position["reached"]:
+                raise RuntimeError("robot failed to reach the known attachment position")
+
+        if pickup is None or position is None:
+            raise RuntimeError("attachment prerequisites are unavailable")
         attachment = ctx.step(
-            f"03-attach-carabiner-{suffix}",
-            lambda rope=rope: json_dict(robot.attach_carabiner(rope)),
+            f"03-rl-vla-attach-clip-{suffix}",
+            lambda: json_dict(robot.attach_clip(attachment_controller)),
         )
         verification_json = ctx.step(
             f"04-verify-attachment-{suffix}",
@@ -81,7 +81,7 @@ def attach_carabiner(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "status": "complete",
                 "cycles": cycle + 1,
                 "pickup": pickup,
-                "rope": rope_json,
+                "position": position,
                 "attachment": attachment,
                 "verification": verification_json,
             }
@@ -90,3 +90,11 @@ def attach_carabiner(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
         recovery_target = verification.recovery_target
 
     raise RuntimeError(f"attachment was not secure after {max_cycles} recovery cycles")
+
+
+def create_app() -> Absurd:
+    """Create the database-backed app and register workflow tasks."""
+
+    app = Absurd(queue_name=QUEUE_NAME)
+    app.register_task("attach-carabiner", default_max_attempts=10)(run_attach_carabiner)
+    return app
