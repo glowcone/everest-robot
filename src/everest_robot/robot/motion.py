@@ -32,6 +32,26 @@ from everest_robot.robot.ports import ArmPort, violations
 
 
 @dataclass(frozen=True, slots=True)
+class MotionTarget:
+    """One destination for the controller: a label, joint values, and its bounds.
+
+    Named presets become targets through :meth:`NamedPosition` lookup. Replay's initial
+    alignment builds one directly, because the pose it must reach is whatever the episode
+    recorded and cannot be a preset captured in advance. Everything downstream -- limit
+    validation, bounded interpolation, settling, fault handling -- is identical either way,
+    which is the point: there is no second, laxer path to the motors.
+    """
+
+    name: str
+    joints: tuple[float, ...]
+    profile: MotionProfile
+
+    @classmethod
+    def from_position(cls, position: NamedPosition) -> MotionTarget:
+        return cls(name=position.name, joints=position.joints, profile=position.profile)
+
+
+@dataclass(frozen=True, slots=True)
 class TrapezoidPath:
     """A scalar path parameter s(t) from 0 to 1 under velocity and acceleration bounds.
 
@@ -134,7 +154,43 @@ class JointMotionController:
             position = self.parameters.position(position_name)
         except ParameterError as error:
             return self._refused(position_name, FailureReason.UNKNOWN_POSITION, str(error))
-        return self._run_legs(position_name, (position,), speed_scale=speed_scale, dry_run=dry_run)
+        return self._run_legs(
+            position_name,
+            (MotionTarget.from_position(position),),
+            speed_scale=speed_scale,
+            dry_run=dry_run,
+        )
+
+    def go_to_joint_target(
+        self,
+        label: str,
+        joints: Sequence[float],
+        *,
+        profile: MotionProfile | None = None,
+        speed_scale: float = 1.0,
+        dry_run: bool = False,
+    ) -> MotionResult:
+        """Move to an explicit joint target that is not a named preset.
+
+        For poses that come from data rather than from an operator capture -- a recorded
+        episode's initial state, for instance. The target still has to pass every check a
+        preset does, including the active hardware limits, and the caller is responsible
+        for having reached a pose from which a direct interpolation is known to be safe.
+        """
+
+        target = MotionTarget(
+            name=label,
+            joints=tuple(float(value) for value in joints),
+            profile=profile or self.parameters.motion_defaults,
+        )
+        if len(target.joints) != len(self.port.joint_names):
+            return self._refused(
+                label,
+                FailureReason.SCHEMA_MISMATCH,
+                f"{label}: expected {len(self.port.joint_names)} joint values, "
+                f"got {len(target.joints)}",
+            )
+        return self._run_legs(label, (target,), speed_scale=speed_scale, dry_run=dry_run)
 
     def follow_transition(
         self,
@@ -147,7 +203,10 @@ class JointMotionController:
 
         try:
             transition = self.parameters.transition(transition_name)
-            legs = tuple(self.parameters.position(name) for name in transition.waypoints)
+            legs = tuple(
+                MotionTarget.from_position(self.parameters.position(name))
+                for name in transition.waypoints
+            )
         except ParameterError as error:
             return self._refused(transition_name, FailureReason.UNKNOWN_POSITION, str(error))
         return self._run_legs(
@@ -158,7 +217,7 @@ class JointMotionController:
     def _run_legs(
         self,
         result_name: str,
-        legs: Sequence[NamedPosition],
+        legs: Sequence[MotionTarget],
         *,
         speed_scale: float,
         dry_run: bool,
@@ -183,7 +242,7 @@ class JointMotionController:
     def _walk(
         self,
         result_name: str,
-        legs: Sequence[NamedPosition],
+        legs: Sequence[MotionTarget],
         speed_scale: float,
         dry_run: bool,
         waypoints: tuple[str, ...],
@@ -243,7 +302,7 @@ class JointMotionController:
     # ── one leg ────────────────────────────────────────────────────────────────────
     def _move_to(
         self,
-        position: NamedPosition,
+        position: MotionTarget,
         *,
         speed_scale: float,
         dry_run: bool,
@@ -294,7 +353,7 @@ class JointMotionController:
 
     def _execute(
         self,
-        position: NamedPosition,
+        position: MotionTarget,
         targets: Sequence[float],
         start_state: JointState,
         path: TrapezoidPath,

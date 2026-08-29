@@ -428,3 +428,31 @@ def test_a_raising_heartbeat_still_leaves_the_arm_held() -> None:
     held = arm.read_state().positions
     clock.advance(5.0)
     assert arm.read_state().positions == pytest.approx(held)
+
+
+def test_an_explicit_joint_target_takes_the_same_path_as_a_preset() -> None:
+    controller, arm = make_controller()
+
+    result = controller.go_to_joint_target("replay-initial-state", (0.4, -0.6, -0.1))
+
+    assert result.reached
+    assert result.position_name == "replay-initial-state"
+    assert arm.read_state().positions[0] == pytest.approx(0.4, abs=0.02)
+
+
+def test_an_explicit_target_outside_the_limits_is_refused_like_a_preset() -> None:
+    controller, arm = make_controller()
+
+    result = controller.go_to_joint_target("replay-initial-state", (5.0, -0.6, -0.1))
+
+    assert result.failure_reason is FailureReason.LIMIT_VIOLATION
+    assert arm.sent_commands == []
+
+
+def test_an_explicit_target_must_cover_every_joint() -> None:
+    controller, arm = make_controller()
+
+    result = controller.go_to_joint_target("replay-initial-state", (0.4, -0.6))
+
+    assert result.failure_reason is FailureReason.SCHEMA_MISMATCH
+    assert arm.sent_commands == []

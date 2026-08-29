@@ -7,7 +7,7 @@ Two families live here and they are deliberately different:
   raw floats, are never persisted, and may contain ``nan`` where hardware reported no
   feedback.
 * **Durable results** (:class:`MotionResult`, :class:`PolicyRunResult`,
-  :class:`ReplayResult`, :class:`RecordingResult`) are what a workflow step stores. They
+  :class:`RecordingResult`) are what a workflow step stores. They
   are JSON-serializable through :meth:`JsonResult.to_json`, which is the only
   representation Absurd ever sees. Field names in those classes are a durable interface:
   workflows started on an older revision replay stored values by name.
@@ -276,26 +276,6 @@ class PolicyRunResult(JsonResult):
     config_digest: str
     clipped_joints: tuple[str, ...] = ()
     episode_id: str | None = None
-    failure_reason: FailureReason | None = None
-    failure_detail: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ReplayResult(JsonResult):
-    """The durable outcome of one stored-session replay."""
-
-    session_id: str
-    episode_index: int
-    frames_requested: int
-    frames_sent: int
-    elapsed_s: float
-    speed_scale: float
-    dry_run: bool
-    termination: TerminationReason
-    robot_id: str
-    calibration_id: str
-    config_digest: str
-    clipped_joints: tuple[str, ...] = ()
     failure_reason: FailureReason | None = None
     failure_detail: str | None = None
 

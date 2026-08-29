@@ -1,4 +1,7 @@
-"""The record/replay layer is interface-only for now; these tests pin that contract."""
+"""Recording is still interface-only; these tests pin that contract.
+
+Replay is implemented -- see test_replay.py.
+"""
 
 import pytest
 
@@ -9,7 +12,6 @@ from everest_robot.robot.recording import (
     NullSessionRecorder,
     SessionRecorder,
 )
-from everest_robot.robot.replay import SessionPlayer
 
 IDENTITY = RobotIdentity("maker-arm-02", "maker-arm-v1", "cal-2026-08-20", ("a", "b"))
 
@@ -53,10 +55,6 @@ def test_the_null_recorder_counts_frames_without_keeping_them() -> None:
     assert recorder.frames == []
 
 
-def test_dataset_recording_and_replay_refuse_with_an_actionable_message() -> None:
+def test_dataset_recording_refuses_with_an_actionable_message() -> None:
     with pytest.raises(NotImplementedError, match="format is still being decided"):
         LeRobotDatasetRecorder()
-
-    player = SessionPlayer.__new__(SessionPlayer)
-    with pytest.raises(NotImplementedError, match="format is still being decided"):
-        player.play(session=None)
