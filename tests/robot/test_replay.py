@@ -611,3 +611,82 @@ def test_a_slow_tick_is_absorbed_rather_than_burst_afterwards() -> None:
     # The stall is absorbed into the total, not clawed back by rushing later frames.
     assert total >= 0.5 + 11 / 30 - 1e-9
     assert result.elapsed_s >= 0.5
+
+
+def _fixture_copy(tmp_path: Path) -> Path:
+    import shutil
+
+    root = tmp_path / "dataset"
+    shutil.copytree(FIXTURE, root)
+    return root
+
+
+def test_a_non_finite_action_fails_before_the_arm_is_touched(tmp_path: Path) -> None:
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = _fixture_copy(tmp_path)
+    path = root / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    actions = np.array(table.column("action").to_pylist())
+    actions[4, 2] = np.nan
+    table = table.set_column(
+        table.schema.get_field_index("action"),
+        "action",
+        pa.array([list(row) for row in actions], type=pa.list_(pa.float32(), 7)),
+    )
+    pq.write_table(table, path)
+
+    runner, arm, _ = make_runner()
+    runner.resolver = FixtureResolver(root)
+
+    with pytest.raises(DatasetCompatibilityError, match="non-finite value at frame 4"):
+        runner.preflight(request())
+
+    assert arm.lifecycle is ArmLifecycle.DISCONNECTED
+    assert arm.sent_commands == []
+
+
+def test_a_non_positive_dataset_fps_is_refused(tmp_path: Path) -> None:
+    import json
+
+    for fps in (0, -30):
+        root = _fixture_copy(tmp_path / str(fps))
+        info = json.loads((root / "meta/info.json").read_text())
+        info["fps"] = fps
+        (root / "meta/info.json").write_text(json.dumps(info))
+
+        runner, _, _ = make_runner()
+        runner.resolver = FixtureResolver(root)
+
+        with pytest.raises(DatasetCompatibilityError, match="fps must be positive"):
+            runner.preflight(request())
+
+
+def test_clipping_metrics_come_from_what_the_driver_actually_accepted(monkeypatch) -> None:
+    """The metric is sourced from the action the driver returned, not from preflight."""
+
+    import everest_robot.robot.replay as replay_module
+
+    class ShavingPlayer(replay_module.SessionPlayer):
+        """A driver that quietly shaves half a degree off one joint on every frame."""
+
+        def play(self, plan, request, outcome):
+            accepted = self.session.bridge.send_action
+
+            def shave(action):
+                sent = accepted(action)
+                return {**sent, "shoulder_pan.pos": sent["shoulder_pan.pos"] - 0.5}
+
+            self.session.bridge.send_action = shave  # type: ignore[method-assign]
+            return super().play(plan, request, outcome)
+
+    monkeypatch.setattr(replay_module, "SessionPlayer", ShavingPlayer)
+    runner, _, _ = make_runner()
+
+    result = runner.run(request())
+
+    assert result.completed
+    assert result.clipped_frames == result.frames_sent
+    assert result.max_clipping_deg >= 0.5
