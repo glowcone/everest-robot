@@ -1,0 +1,35 @@
+[project]
+name = "everest-robot"
+version = "0.1.0"
+description = "A durable robot workflow scaffold built with Absurd"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "absurd-sdk>=0.2.0",
+]
+
+[project.scripts]
+robot-worker = "everest_robot.worker:main"
+robot-start = "everest_robot.client:start"
+robot-db-init = "everest_robot.database:init"
+
+[dependency-groups]
+dev = [
+    "absurdctl>=0.5.0",
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
