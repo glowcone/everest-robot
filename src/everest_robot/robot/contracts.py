@@ -237,6 +237,9 @@ class MotionResult(JsonResult):
     config_digest: str
     already_at_target: bool = False
     dry_run: bool = False
+    # The duration the bounded trajectory was planned to take. Reported for a dry run,
+    # where nothing is commanded and ``elapsed_s`` says nothing about the move.
+    planned_duration_s: float = 0.0
     clipped_joints: tuple[str, ...] = ()
     waypoints: tuple[str, ...] = ()
     failure_reason: FailureReason | None = None
