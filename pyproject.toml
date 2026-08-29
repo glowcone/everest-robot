@@ -3,9 +3,20 @@ name = "everest-robot"
 version = "0.1.0"
 description = "A durable robot workflow scaffold built with Absurd"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "absurd-sdk>=0.2.0",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Real robot hardware and the LeRobot policy/dataset stack. Everything under
+# ``everest_robot.robot`` imports these lazily, so the core package, its tests, and the
+# deterministic fakes all work without this extra installed.
+hardware = [
+    "lerobot[maker]",
+    "maker-arm",
 ]
 
 [project.scripts]
@@ -20,6 +31,12 @@ dev = [
     "ruff>=0.11",
 ]
 
+# Pinned to immutable commit SHAs: a moving branch would silently change the production
+# hardware safety boundary. Update a revision deliberately and commit the resulting uv.lock.
+[tool.uv.sources]
+lerobot = { git = "https://github.com/makermods-robotics/lerobot.git", rev = "af9072a8ca4b1767ef25b98eed1149d1bbf89f46" }
+maker-arm = { git = "https://github.com/makermods-robotics/maker-arm-sdk.git", rev = "8d3998d774650c239bc1b42f73c3f7d569e2c59d" }
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -29,7 +46,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
