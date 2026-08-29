@@ -218,15 +218,19 @@ class PolicyRunner:
         self.recorder.start_episode(task)
 
         period = 1.0 / rate
-        termination, failure, failure_detail = self._rollout(
-            handle, task, period, duration_limit, max_steps, telemetry, started_s
-        )
+        try:
+            termination, failure, failure_detail = self._rollout(
+                handle, task, period, duration_limit, max_steps, telemetry, started_s
+            )
+        except BaseException:
+            # A heartbeat raises when the workflow run is cancelled, and an interrupt can
+            # arrive anywhere. Neither may leave a moving arm behind, and a half-written
+            # episode is not a recording.
+            self._safe_stop(failed=True)
+            self.recorder.abort()
+            raise
 
-        if self.bridge.port.lifecycle is ArmLifecycle.ENABLED:
-            if failure is not None and self.estop_on_failure:
-                self.bridge.port.estop()
-            else:
-                self.bridge.port.hold_current_position()
+        self._safe_stop(failed=failure is not None)
 
         episode = self.recorder.finish_episode()
         return self._result(
@@ -305,6 +309,16 @@ class PolicyRunner:
                 self.clock.sleep(deadline - now)
 
     # ── helpers ────────────────────────────────────────────────────────────────────
+    def _safe_stop(self, *, failed: bool) -> None:
+        """Hold the arm, or e-stop after a failure if the deployment asked for that."""
+
+        if self.bridge.port.lifecycle is not ArmLifecycle.ENABLED:
+            return
+        if failed and self.estop_on_failure:
+            self.bridge.port.estop()
+        else:
+            self.bridge.port.hold_current_position()
+
     def _beat(self, now: float) -> None:
         if self.heartbeat is None:
             return

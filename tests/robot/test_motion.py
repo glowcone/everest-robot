@@ -401,3 +401,30 @@ def test_an_unknown_transition_is_refused() -> None:
 
     assert result.failure_reason is FailureReason.UNKNOWN_POSITION
     assert arm.sent_commands == []
+
+
+def test_a_raising_heartbeat_still_leaves_the_arm_held() -> None:
+    """Absurd signals cancellation by raising from ctx.heartbeat()."""
+
+    class Cancelled(BaseException):
+        pass
+
+    clock = ManualClock()
+    controller, arm = make_controller(clock=clock, heartbeat_interval_s=0.0)
+    beats = {"count": 0}
+
+    def heartbeat() -> None:
+        beats["count"] += 1
+        if beats["count"] > 2:
+            raise Cancelled("run cancelled")
+
+    controller.heartbeat = heartbeat
+
+    with pytest.raises(Cancelled):
+        controller.go_to_known_position("ready")
+
+    assert arm.lifecycle is ArmLifecycle.ENABLED
+    # Held where it stopped: the commanded target is the measured pose, not the goal.
+    held = arm.read_state().positions
+    clock.advance(5.0)
+    assert arm.read_state().positions == pytest.approx(held)

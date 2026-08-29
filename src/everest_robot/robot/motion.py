@@ -169,12 +169,32 @@ class JointMotionController:
         if detail is not None:
             return self._refused(result_name, FailureReason.IDENTITY_MISMATCH, detail, waypoints)
 
+        state = self.port.read_state()
+        try:
+            return self._walk(
+                result_name, legs, speed_scale, dry_run, waypoints, started_s, state
+            )
+        except BaseException:
+            # A heartbeat raises when the workflow run is cancelled, and an interrupt can
+            # arrive anywhere. Neither may leave a moving arm behind.
+            self._safe_stop()
+            raise
+
+    def _walk(
+        self,
+        result_name: str,
+        legs: Sequence[NamedPosition],
+        speed_scale: float,
+        dry_run: bool,
+        waypoints: tuple[str, ...],
+        started_s: float,
+        state: JointState,
+    ) -> MotionResult:
         commands = 0
         max_error = 0.0
         planned = 0.0
         clipped: tuple[str, ...] = ()
         already = True
-        state = self.port.read_state()
 
         # A dry run never moves, so each leg after the first must be planned from where the
         # previous waypoint would have left the arm, not from where it is standing now.
@@ -377,6 +397,19 @@ class JointMotionController:
                 settled_since_s = None
 
     # ── helpers ────────────────────────────────────────────────────────────────────
+    def _safe_stop(self) -> None:
+        """Hold the arm where it is, or e-stop if the deployment asked for that.
+
+        A driver already in FAULT is holding under its own policy and is not commanded
+        further.
+        """
+
+        if self.port.lifecycle is ArmLifecycle.ENABLED:
+            if self.estop_on_failure:
+                self.port.estop()
+            else:
+                self.port.hold_current_position()
+
     def _beat(self, now: float) -> None:
         if self.heartbeat is None:
             return
@@ -399,11 +432,7 @@ class JointMotionController:
         driver already in FAULT is holding by its own policy and is not commanded further.
         """
 
-        if self.port.lifecycle is ArmLifecycle.ENABLED:
-            if self.estop_on_failure:
-                self.port.estop()
-            else:
-                self.port.hold_current_position()
+        self._safe_stop()
         return _LegOutcome(
             state=state if state is not None else self.port.read_state(),
             commands_sent=commands,

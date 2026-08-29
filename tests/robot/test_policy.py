@@ -342,3 +342,37 @@ def test_heartbeats_fire_during_a_long_rollout() -> None:
 def test_the_checkpoint_loader_refuses_with_an_actionable_message() -> None:
     with pytest.raises(NotImplementedError, match="dataset feature metadata"):
         LeRobotPolicyHandle("checkpoints/vla")
+
+
+def test_a_raising_heartbeat_holds_the_arm_and_abandons_the_episode() -> None:
+    """Absurd signals cancellation by raising from ctx.heartbeat()."""
+
+    class Cancelled(BaseException):
+        pass
+
+    bridge, arm, clock = make_bridge()
+    recorder = InMemorySessionRecorder(IDENTITY)
+    beats = {"count": 0}
+
+    def heartbeat() -> None:
+        beats["count"] += 1
+        if beats["count"] > 2:
+            raise Cancelled("run cancelled")
+
+    runner = PolicyRunner(
+        bridge,
+        parameters(),
+        clock=clock,
+        recorder=recorder,
+        heartbeat=heartbeat,
+        heartbeat_interval_s=0.0,
+    )
+
+    with pytest.raises(Cancelled):
+        runner.run(policy(actions=100))
+
+    assert arm.lifecycle is ArmLifecycle.ENABLED
+    held = arm.read_state().positions
+    clock.advance(5.0)
+    assert arm.read_state().positions == pytest.approx(held)
+    assert recorder.frames == []
