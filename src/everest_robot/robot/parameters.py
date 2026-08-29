@@ -15,13 +15,14 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from everest_robot.domain import LimitPolicy
 from everest_robot.robot.contracts import MotionProfile, RobotIdentity
 
 SCHEMA_VERSION = 1
@@ -153,11 +154,75 @@ class PolicySettings:
 
 
 @dataclass(frozen=True, slots=True)
+class LeRobotFrameSpec:
+    """The measured offset between Everest joint radians and LeRobot feature degrees.
+
+    Both drivers describe the same joints, but their zero poses differ, so a dataset or
+    checkpoint recorded through ``MakerFollower`` is expressed in a frame this arm does not
+    share. Recording the offsets here -- with who approved them and when -- is what turns
+    that from an implicit assumption into a reviewable configuration decision.
+    """
+
+    offsets_deg: tuple[float, ...]
+    approved_by: str
+    captured_at: date
+    notes: str | None = None
+
+    @property
+    def is_identity(self) -> bool:
+        return not any(self.offsets_deg)
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedReplay:
+    """An operator-approved mapping from one dataset revision to this arm.
+
+    A dataset carries no record of which physical arm produced it, so replaying one is only
+    meaningful against an arm someone has confirmed is the same machine in the same
+    calibration. Absent an entry here, replay refuses.
+    """
+
+    repo_id: str
+    revision: str
+    robot_id: str
+    calibration_id: str
+    episodes: tuple[int, ...]
+    limit_policy: LimitPolicy
+    max_limit_deviation_deg: float
+    approved_by: str
+    initial_transition: str | None = None
+    initial_position: str | None = None
+    notes: str | None = None
+
+    def allows(self, revision: str, episode: int) -> bool:
+        return revision == self.revision and episode in self.episodes
+
+
+@dataclass(frozen=True, slots=True)
 class ReplaySettings:
+    """Bounds for stored-session replay.
+
+    Every field that can be omitted defaults to its *strictest* value, so a parameters file
+    that forgets one never ends up permitting more than it says. ``max_step_deg`` is the
+    exception and defaults to unenforced: there is no defensible universal value, and
+    preflight always reports the observed maximum so the arm owner can set one.
+    """
+
     require_matching_robot_id: bool
     require_matching_calibration_id: bool
     safe_start_position: str | None
     max_speed_scale: float
+    max_fps: float = 30.0
+    max_step_deg: float | None = None
+    tracking_error_limit_deg: float = 5.0
+    initial_pose_tolerance_deg: float = 1.0
+    settle_time_s: float = 0.5
+    heartbeat_interval_s: float = 5.0
+    max_consecutive_missed_deadlines: int = 5
+    require_full_revision: bool = True
+    require_approved_dataset: bool = True
+    hold_on_completion: bool = True
+    hold_on_failure: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +238,8 @@ class RobotParameters:
     replay: ReplaySettings
     config_digest: str
     source: str
+    lerobot_frame: LeRobotFrameSpec | None = None
+    approved_replays: Mapping[str, ApprovedReplay] = field(default_factory=dict)
 
     @property
     def joint_names(self) -> tuple[str, ...]:
@@ -191,6 +258,9 @@ class RobotParameters:
         except KeyError:
             known = ", ".join(sorted(self.named_transitions)) or "none defined"
             raise ParameterError(f"unknown named transition {name!r}; known: {known}") from None
+
+    def approved_replay(self, repo_id: str) -> ApprovedReplay | None:
+        return self.approved_replays.get(repo_id)
 
     def verify_identity(self, hardware: RobotIdentity) -> None:
         """Raise unless the connected arm is the one these parameters describe.
@@ -225,7 +295,7 @@ class RobotParameters:
         _reject_unknown(
             root,
             ("schema_version", "robot", "motion_defaults", "named_positions",
-             "named_transitions", "policy", "replay"),
+             "named_transitions", "policy", "replay", "lerobot_frame", "approved_replays"),
             source,
         )
         _require(root, ("schema_version", "robot", "motion_defaults", "policy", "replay"), source)
@@ -257,6 +327,20 @@ class RobotParameters:
         replay = _parse_replay(
             _mapping(root["replay"], f"{source}.replay"), f"{source}.replay", positions=positions
         )
+        frame = None
+        if root.get("lerobot_frame") is not None:
+            frame = _parse_frame(
+                _mapping(root["lerobot_frame"], f"{source}.lerobot_frame"),
+                f"{source}.lerobot_frame",
+                identity=identity,
+            )
+        approved = _parse_approved_replays(
+            _mapping(root.get("approved_replays") or {}, f"{source}.approved_replays"),
+            f"{source}.approved_replays",
+            identity=identity,
+            positions=positions,
+            transitions=transitions,
+        )
 
         return cls(
             schema_version=SCHEMA_VERSION,
@@ -268,6 +352,8 @@ class RobotParameters:
             replay=replay,
             config_digest=config_digest,
             source=source,
+            lerobot_frame=frame,
+            approved_replays=approved,
         )
 
 
@@ -404,6 +490,29 @@ def _parse_policy(value: Mapping[str, Any], where: str) -> PolicySettings:
     )
 
 
+_REPLAY_REQUIRED = (
+    "require_matching_robot_id",
+    "require_matching_calibration_id",
+    "safe_start_position",
+    "max_speed_scale",
+)
+
+_REPLAY_NUMBERS = (
+    "max_fps",
+    "tracking_error_limit_deg",
+    "initial_pose_tolerance_deg",
+    "settle_time_s",
+    "heartbeat_interval_s",
+)
+
+_REPLAY_FLAGS = (
+    "require_full_revision",
+    "require_approved_dataset",
+    "hold_on_completion",
+    "hold_on_failure",
+)
+
+
 def _parse_replay(
     value: Mapping[str, Any],
     where: str,
@@ -411,13 +520,14 @@ def _parse_replay(
     positions: Mapping[str, NamedPosition],
 ) -> ReplaySettings:
     allowed = (
-        "require_matching_robot_id",
-        "require_matching_calibration_id",
-        "safe_start_position",
-        "max_speed_scale",
+        *_REPLAY_REQUIRED,
+        *_REPLAY_NUMBERS,
+        *_REPLAY_FLAGS,
+        "max_step_deg",
+        "max_consecutive_missed_deadlines",
     )
     _reject_unknown(value, allowed, where)
-    _require(value, allowed, where)
+    _require(value, _REPLAY_REQUIRED, where)
 
     start = value["safe_start_position"]
     if start is not None:
@@ -433,6 +543,28 @@ def _parse_replay(
             f"{where}.max_speed_scale: {scale} exceeds the recorded session speed"
         )
 
+    defaults = ReplaySettings(True, True, None, 1.0)
+    numbers = {
+        name: _number(value[name], f"{where}.{name}") if name in value else getattr(defaults, name)
+        for name in _REPLAY_NUMBERS
+    }
+    flags = {
+        name: _flag(value[name], f"{where}.{name}") if name in value else getattr(defaults, name)
+        for name in _REPLAY_FLAGS
+    }
+
+    max_step = value.get("max_step_deg")
+    if max_step is not None:
+        max_step = _number(max_step, f"{where}.max_step_deg")
+
+    missed = value.get("max_consecutive_missed_deadlines")
+    if missed is None:
+        missed = defaults.max_consecutive_missed_deadlines
+    elif isinstance(missed, bool) or not isinstance(missed, int) or missed < 1:
+        raise ParameterError(
+            f"{where}.max_consecutive_missed_deadlines: expected a positive integer, got {missed!r}"
+        )
+
     return ReplaySettings(
         require_matching_robot_id=_flag(
             value["require_matching_robot_id"], f"{where}.require_matching_robot_id"
@@ -442,4 +574,145 @@ def _parse_replay(
         ),
         safe_start_position=start,
         max_speed_scale=scale,
+        max_step_deg=max_step,
+        max_consecutive_missed_deadlines=int(missed),
+        **numbers,
+        **flags,
     )
+
+
+def _parse_frame(
+    value: Mapping[str, Any],
+    where: str,
+    *,
+    identity: RobotIdentity,
+) -> LeRobotFrameSpec:
+    """Parse the joint-frame reconciliation, requiring an entry for every joint."""
+
+    _reject_unknown(value, ("joints", "approved_by", "captured_at", "notes"), where)
+    _require(value, ("joints", "approved_by", "captured_at"), where)
+
+    joints = _mapping(value["joints"], f"{where}.joints")
+    missing = [name for name in identity.joint_names if name not in joints]
+    if missing:
+        # A partial frame would silently leave some joints unconverted, which is worse
+        # than no frame at all.
+        raise ParameterError(f"{where}.joints: missing offset(s) for {', '.join(missing)}")
+    extra = sorted(set(joints) - set(identity.joint_names))
+    if extra:
+        raise ParameterError(f"{where}.joints: {', '.join(extra)} are not joints of this robot")
+
+    offsets = tuple(
+        _number(joints[name], f"{where}.joints.{name}", positive=False)
+        for name in identity.joint_names
+    )
+    return LeRobotFrameSpec(
+        offsets_deg=offsets,
+        approved_by=_text(value["approved_by"], f"{where}.approved_by"),
+        captured_at=_parse_date(value["captured_at"], f"{where}.captured_at"),
+        notes=value.get("notes"),
+    )
+
+
+def _parse_approved_replays(
+    value: Mapping[str, Any],
+    where: str,
+    *,
+    identity: RobotIdentity,
+    positions: Mapping[str, NamedPosition],
+    transitions: Mapping[str, NamedTransition],
+) -> dict[str, ApprovedReplay]:
+    approved: dict[str, ApprovedReplay] = {}
+    for repo_id, raw in value.items():
+        scope = f"{where}.{repo_id}"
+        entry = _mapping(raw, scope)
+        allowed = (
+            "revision",
+            "robot_id",
+            "calibration_id",
+            "episodes",
+            "limit_policy",
+            "max_limit_deviation_deg",
+            "approved_by",
+            "initial_transition",
+            "initial_position",
+            "notes",
+        )
+        _reject_unknown(entry, allowed, scope)
+        _require(
+            entry,
+            ("revision", "robot_id", "calibration_id", "episodes", "limit_policy", "approved_by"),
+            scope,
+        )
+
+        revision = _text(entry["revision"], f"{scope}.revision")
+        if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+            raise ParameterError(
+                f"{scope}.revision: expected a full 40-character commit SHA, got {revision!r}"
+            )
+
+        robot_id = _text(entry["robot_id"], f"{scope}.robot_id")
+        calibration_id = _text(entry["calibration_id"], f"{scope}.calibration_id")
+        if robot_id != identity.robot_id or calibration_id != identity.calibration_id:
+            # An approval for another arm or another calibration is not an approval.
+            raise ParameterError(
+                f"{scope}: approved for {robot_id}/{calibration_id} but this file describes "
+                f"{identity.robot_id}/{identity.calibration_id}"
+            )
+
+        episodes = entry["episodes"]
+        if not isinstance(episodes, list) or not episodes:
+            raise ParameterError(f"{scope}.episodes: expected a non-empty list of episode indices")
+        indices: list[int] = []
+        for index, episode in enumerate(episodes):
+            if isinstance(episode, bool) or not isinstance(episode, int) or episode < 0:
+                raise ParameterError(
+                    f"{scope}.episodes[{index}]: expected a non-negative integer, got {episode!r}"
+                )
+            indices.append(episode)
+
+        try:
+            policy = LimitPolicy(_text(entry["limit_policy"], f"{scope}.limit_policy"))
+        except ValueError as error:
+            supported = ", ".join(p.value for p in LimitPolicy)
+            raise ParameterError(
+                f"{scope}.limit_policy: {entry['limit_policy']!r} is not one of {supported}"
+            ) from error
+
+        deviation = entry.get("max_limit_deviation_deg", 0.0)
+        deviation = _number(deviation, f"{scope}.max_limit_deviation_deg", allow_zero=True)
+        if policy is LimitPolicy.REJECT and deviation:
+            raise ParameterError(
+                f"{scope}.max_limit_deviation_deg: must be 0 under the 'reject' policy, which "
+                "clamps nothing"
+            )
+
+        transition = entry.get("initial_transition")
+        if transition is not None:
+            transition = _text(transition, f"{scope}.initial_transition")
+            if transition not in transitions:
+                raise ParameterError(
+                    f"{scope}.initial_transition: {transition!r} is not a named transition"
+                )
+        position = entry.get("initial_position")
+        if position is not None:
+            position = _text(position, f"{scope}.initial_position")
+            if position not in positions:
+                raise ParameterError(
+                    f"{scope}.initial_position: {position!r} is not a named position"
+                )
+
+        approved[repo_id] = ApprovedReplay(
+            repo_id=repo_id,
+            revision=revision,
+            robot_id=robot_id,
+            calibration_id=calibration_id,
+            episodes=tuple(indices),
+            limit_policy=policy,
+            max_limit_deviation_deg=deviation,
+            approved_by=_text(entry["approved_by"], f"{scope}.approved_by"),
+            initial_transition=transition,
+            initial_position=position,
+            notes=entry.get("notes"),
+        )
+    return approved

@@ -195,3 +195,134 @@ def test_yaml_round_trip_matches_the_mapping_loader(tmp_path: Path) -> None:
 
     assert parameters.position("ready").joints == (0.1, -0.2, 0.0)
     assert parameters.source == str(path)
+
+
+# ── replay configuration ───────────────────────────────────────────────────────────
+FRAME = {
+    "approved_by": "operator",
+    "captured_at": "2026-08-29",
+    "joints": {"shoulder_pan": -119.94, "shoulder_lift": -59.31, "gripper": -0.25},
+}
+REVISION = "55e561161026be306d06354a8941c4431e8e805f"
+
+
+def approval(**overrides: object) -> dict:
+    entry = {
+        "revision": REVISION,
+        "robot_id": "maker-arm-02",
+        "calibration_id": CALIBRATION,
+        "episodes": [0, 1],
+        "limit_policy": "clamp_within_tolerance",
+        "max_limit_deviation_deg": 1.0,
+        "approved_by": "operator",
+    }
+    entry.update(overrides)  # type: ignore[arg-type]
+    return entry
+
+
+def test_the_shipped_config_reconciles_the_frame_but_approves_no_dataset() -> None:
+    parameters = RobotParameters.from_yaml(SHIPPED_CONFIG)
+
+    # Enabling a dataset is the arm owner's approval, not this file's author's.
+    assert parameters.approved_replays == {}
+    assert parameters.lerobot_frame is not None
+    assert not parameters.lerobot_frame.is_identity
+    assert parameters.replay.require_approved_dataset
+    assert parameters.replay.require_full_revision
+    # No defensible universal value exists, so it ships unenforced and reported instead.
+    assert parameters.replay.max_step_deg is None
+
+
+def test_omitted_replay_settings_default_to_their_strictest_value() -> None:
+    parameters = load(document())
+
+    assert parameters.replay.require_approved_dataset
+    assert parameters.replay.require_full_revision
+    assert parameters.replay.hold_on_completion
+    assert parameters.replay.hold_on_failure
+
+
+def test_replay_settings_are_range_checked() -> None:
+    for field, value in [
+        ("max_fps", -1),
+        ("tracking_error_limit_deg", 0),
+        ("max_consecutive_missed_deadlines", 0),
+        ("max_consecutive_missed_deadlines", 1.5),
+    ]:
+        with pytest.raises(ParameterError, match=field):
+            load(document(replay={**document()["replay"], field: value}))
+
+
+def test_a_partial_frame_is_refused() -> None:
+    partial = {**FRAME, "joints": {"shoulder_pan": -119.94}}
+    with pytest.raises(ParameterError, match="missing offset"):
+        load(document(lerobot_frame=partial))
+
+    foreign = {**FRAME, "joints": {**FRAME["joints"], "elbow_flex": 1.0}}
+    with pytest.raises(ParameterError, match="not joints of this robot"):
+        load(document(lerobot_frame=foreign))
+
+
+def test_the_frame_carries_its_provenance() -> None:
+    parameters = load(document(lerobot_frame=FRAME))
+
+    assert parameters.lerobot_frame is not None
+    assert parameters.lerobot_frame.offsets_deg == (-119.94, -59.31, -0.25)
+    assert parameters.lerobot_frame.approved_by == "operator"
+
+
+def test_an_approved_replay_names_a_pinned_revision_and_episodes() -> None:
+    parameters = load(document(approved_replays={"ns/set": approval()}))
+
+    entry = parameters.approved_replay("ns/set")
+
+    assert entry is not None
+    assert entry.allows(REVISION, 1)
+    assert not entry.allows(REVISION, 4)
+    assert not entry.allows("a" * 40, 0)
+    assert parameters.approved_replay("ns/other") is None
+
+
+def test_an_approval_for_another_arm_is_not_an_approval() -> None:
+    with pytest.raises(ParameterError, match="this file describes"):
+        load(document(approved_replays={"ns/set": approval(robot_id="maker-arm-99")}))
+    with pytest.raises(ParameterError, match="this file describes"):
+        load(document(approved_replays={"ns/set": approval(calibration_id="older")}))
+
+
+def test_an_approval_must_pin_a_full_revision() -> None:
+    with pytest.raises(ParameterError, match="40-character commit SHA"):
+        load(document(approved_replays={"ns/set": approval(revision="main")}))
+
+
+def test_an_approval_needs_an_approver_and_episodes() -> None:
+    entry = approval()
+    del entry["approved_by"]
+    with pytest.raises(ParameterError, match="approved_by"):
+        load(document(approved_replays={"ns/set": entry}))
+
+    with pytest.raises(ParameterError, match="non-empty list"):
+        load(document(approved_replays={"ns/set": approval(episodes=[])}))
+    with pytest.raises(ParameterError, match="non-negative integer"):
+        load(document(approved_replays={"ns/set": approval(episodes=[-1])}))
+
+
+def test_a_reject_policy_may_not_carry_a_clamping_tolerance() -> None:
+    with pytest.raises(ParameterError, match="clamps nothing"):
+        load(
+            document(
+                approved_replays={
+                    "ns/set": approval(limit_policy="reject", max_limit_deviation_deg=1.0)
+                }
+            )
+        )
+
+
+def test_an_unknown_limit_policy_is_refused() -> None:
+    with pytest.raises(ParameterError, match="is not one of"):
+        load(document(approved_replays={"ns/set": approval(limit_policy="clip_a_bit")}))
+
+
+def test_an_approval_may_only_reference_known_transitions() -> None:
+    with pytest.raises(ParameterError, match="not a named transition"):
+        load(document(approved_replays={"ns/set": approval(initial_transition="nowhere")}))

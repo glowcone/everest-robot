@@ -58,9 +58,77 @@ policy:
   fps: 30
   max_duration_s: 30
 
+# Reconciles this arm's calibrated joint radians with the degree frame LeRobot's
+# MakerFollower uses, which is what every recorded dataset and trained checkpoint is
+# expressed in. The two drivers describe the same joints but not the same zero pose.
+#
+# HOW THESE WERE DERIVED, AND WHAT REMAINS TO BE CHECKED: each offset is the difference
+# between maker-arm-sdk's soft limits (maker_arm/profiles/maker_arm_v1.yaml, radians) and
+# MakerFollower's (config_maker_follower.py, degrees). The two ranges have the same width
+# on every joint to within 0.07 deg, which is what makes a pure per-joint offset the right
+# model, and the offsets computed from the lower and upper limits agree to within 0.07 deg.
+# That is a strong consistency check but it is NOT a physical measurement. Before any
+# powered replay, confirm on hardware: command a known pose through the SDK, read it back
+# through MakerFollower's convention, and check the difference matches the offset below.
+# See docs/lerobot-frame-reconciliation.md.
+lerobot_frame:
+  approved_by: "derived from both drivers' limit tables -- NOT yet hardware-verified"
+  captured_at: 2026-08-29
+  notes: "maker-arm-sdk profile 2026-08-20 vs MakerFollower joint_limits"
+  joints:
+    shoulder_pan: -119.94
+    shoulder_lift: -59.31
+    elbow_flex: -219.66
+    wrist_flex: -17.56
+    wrist_yaw: -130.64
+    wrist_roll: -208.53
+    gripper: -0.25
+
 replay:
   require_matching_robot_id: true
   require_matching_calibration_id: true
   # Set to an approved named position once one exists.
   safe_start_position: null
   max_speed_scale: 1.0
+  max_fps: 30
+  # Largest allowed frame-to-frame action change. Null means unenforced: there is no
+  # defensible universal value, and the plan's proposed 0.25 deg is far below what the
+  # target dataset actually contains (up to 7.7 deg on the gripper, 99th percentile
+  # 2.4 deg at 30 fps). Preflight always reports the observed maximum -- set this from
+  # that report once the arm owner has chosen a bound.
+  max_step_deg: null
+  tracking_error_limit_deg: 5.0
+  initial_pose_tolerance_deg: 1.0
+  settle_time_s: 0.5
+  heartbeat_interval_s: 5.0
+  max_consecutive_missed_deadlines: 5
+  require_full_revision: true
+  require_approved_dataset: true
+  hold_on_completion: true
+  hold_on_failure: true
+
+# Datasets this arm is approved to replay. A dataset records no evidence of which physical
+# arm produced it, so replay is only meaningful against an arm someone has confirmed is the
+# same machine in the same calibration. With `require_approved_dataset: true` above, replay
+# refuses any repo that is not listed here.
+#
+# The entry for the first target dataset is written out below, ready to enable. It is left
+# commented out deliberately: enabling it is the arm owner's approval, not this file's
+# author's. Before uncommenting, confirm this arm and calibration recorded that dataset,
+# verify the lerobot_frame offsets on hardware, and work through the acceptance procedure
+# in docs/session-replay.md.
+approved_replays: {}
+  # h8i76dfsd9/test1_20260829_130743:
+  #   revision: 55e561161026be306d06354a8941c4431e8e805f
+  #   robot_id: maker-arm-02
+  #   calibration_id: maker-arm-02-2026-08-20
+  #   episodes: [0, 1, 2, 3, 4]
+  #   # The dataset's endpoints exceed the driver limits by at most 0.8 deg (elbow_flex
+  #   # 2.00 vs 2.8, gripper -2.00 vs -2.5, shoulder_lift -3.00 vs -3.2), so a 1.0 deg
+  #   # tolerance accepts it while still rejecting a materially different episode.
+  #   limit_policy: clamp_within_tolerance
+  #   max_limit_deviation_deg: 1.0
+  #   approved_by: "<arm owner>"
+  #   # Name the approved staging pose or transition once one has been captured; without
+  #   # one, alignment interpolates straight to the recorded initial state.
+  #   initial_transition: null
