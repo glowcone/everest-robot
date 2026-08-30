@@ -1,7 +1,8 @@
 # Repository guidance
 
 Use `just` as the primary interface for development and operations. Run `just` to list the
-recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robot`
+recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`, and the
+read-only `camera-scan`, `camera-scan-json`, `camera-show`), `robot`
 (`monitor` -- powered calibration teleoperation; `goto` -- powered named-position motion;
 `goto-list`, `goto-dry`, `monitor-read-only`, `monitor-once`, `monitor-fake` -- no motion),
 `database`
@@ -223,9 +224,25 @@ The CLI entry points are `src/everest_robot/client.py`,
 `src/everest_robot/worker.py`, `src/everest_robot/database.py`,
 `src/everest_robot/monitor.py`, `src/everest_robot/goto.py`, and
 `src/everest_robot/jog.py`, plus the local `src/everest_robot/fsm_cli.py` and the
-hardware-free `src/everest_robot/policy_check.py`. Keep hardware-specific
+hardware-free `src/everest_robot/policy_check.py` and
+`src/everest_robot/cameras_cli.py`. Keep hardware-specific
 configuration out of these modules; pass selection and tuning data through validated task
 parameters or environment-backed configuration.
+
+`src/everest_robot/cameras_cli.py` (`robot-cameras`) is the operator's answer to "which
+camera is `wrist`" -- the one pairing in `EVEREST_CAMERAS` that no check in the system can
+verify, because a swapped id satisfies every shape, feature and readiness gate and only
+looks through the wrong lens. `scan` probes the host's capture devices and draws each id
+into its own window; `show` opens the *configured* cameras through the same `CameraRuntime`
+a rollout uses, which is what catches a size the driver quietly refused. Every decision it
+makes -- which ids to probe, which by-id link is the stable one, what the label says, what
+the skeleton configuration would be -- is a pure function tested without a camera or a
+window, and it never claims the robot lease. Keep it that way: it is an instrument, and the
+moment it can move something it stops being safe to run beside a held arm. Note that
+`lerobot` depends on `opencv-python-headless`, which overwrites `opencv-python`'s `cv2`, so
+a hardware environment can end up with no `imshow` at all -- `_no_window_message` names that
+cause, and it applies to `robot-pixel-map`'s windows too. See
+`docs/camera-identification.md`.
 
 `src/everest_robot/carabiner_detect.py` is the wrist-camera carabiner detector. It lives
 inside the installed package rather than in the repository's top-level `carabiner/` (now a

@@ -33,6 +33,30 @@ setup-hardware:
 config:
     uv run robot-config
 
+# Which camera is `wrist` and which is `front` is the one fact nothing in the running system
+# can tell you: a swapped id trains and runs a policy on the wrong view while every check
+# still passes. `camera-scan` puts each capture device in its own window with its id drawn
+# into the picture, so you identify them by waving a hand; `camera-scan-json` prints an
+# EVEREST_CAMERAS skeleton for what it found; `camera-show` opens what is already configured
+# through the same runtime a rollout uses, which is what catches a resolution the driver
+# quietly refused. All three are read-only and never claim the arm -- but they do hold the
+# cameras, so stop them before starting a rollout. See docs/camera-identification.md.
+
+# Show every capture device in its own window, labelled with the id to configure. No motion.
+[group('setup')]
+camera-scan *args:
+    uv run robot-cameras scan {{ args }}
+
+# List the cameras this host can see and print an EVEREST_CAMERAS skeleton. No windows.
+[group('setup')]
+camera-scan-json *args:
+    uv run robot-cameras scan --no-window --json {{ args }}
+
+# Open the configured EVEREST_CAMERAS by name and flag any shape the driver refused.
+[group('setup')]
+camera-show *args:
+    uv run robot-cameras show {{ args }}
+
 # ── robot ──────────────────────────────────────────────────────────────────────────
 # Calibration teleoperation, named-position motion, and explicit read-only instruments.
 # All claim the arm, so a worker cannot be holding it. The `goto` recipes are ordered:

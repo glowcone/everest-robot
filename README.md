@@ -273,7 +273,7 @@ configuration works on a workstation and in the cell:
 | `EVEREST_CAN_PORT`, `EVEREST_CAN_BACKEND` | `can0` with `socketcan`, or a serial port with `slcan`. |
 | `EVEREST_ROBOT_PARAMETERS`, `EVEREST_ARM_PROFILE` | Override either configuration file's path. |
 | `EVEREST_LEASE_BACKEND` | `postgres` (default when the database is configured) or `file`. |
-| `EVEREST_CAMERAS`, `EVEREST_CAMERAS_FILE` | Camera devices as JSON, inline or from a file. |
+| `EVEREST_CAMERAS`, `EVEREST_CAMERAS_FILE` | Camera devices as JSON, inline or from a file. `just camera-scan` identifies which id is which camera; see [`docs/camera-identification.md`](docs/camera-identification.md). |
 | `EVEREST_POLICY_DEVICE` | Inference device: `auto` (default; CUDA, then MPS, then CPU), or an explicit `cuda`/`mps`/`cpu`, which is never silently downgraded. |
 | `EVEREST_WRIST_CAMERA`, `EVEREST_WRIST_CAMERA_COLOR` | Which configured camera the attachment detector looks through (default `wrist`), and whether it produces `rgb` (default) or `bgr`. |
 | `EVEREST_GRASP_GRIPPER_BELOW_RAD` | Gripper position, in joint radians, below which it counts as holding the carabiner. Unset means grasp is never asserted. |
@@ -295,6 +295,7 @@ The runtime prefers refusing to guessing, so most surprises are a deliberate che
 | `lies outside the active limits` | The episode leaves the driver's soft limits by more than the configured tolerance. The preflight report says by how much and on which joint. |
 | `is claimed by another worker` / `by another process` | Something else holds the robot lease. `just monitor` takes it too; only one process may own the arm. |
 | `maker_arm is not installed` | `just setup-hardware`. |
+| `OpenCV cannot open a window` | The environment has the headless OpenCV build that `lerobot` pulls in, which overwrites the one with `imshow`. `uv pip install --reinstall opencv-python`, or pass `--no-window`. |
 | `NotImplementedError` from a workflow stage | That stage has no hardware implementation yet — see Integration points below. |
 
 ### Development
