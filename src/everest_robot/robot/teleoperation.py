@@ -109,6 +109,7 @@ class TeleoperationController:
         rate_hz: float = 25.0,
         max_velocity_rad_s: float = 0.25,
         leader_loss_timeout_s: float = 0.5,
+        out_of_range_timeout_s: float = 2.0,
         clamp_joints: Sequence[str] = ("gripper",),
     ) -> None:
         if rate_hz <= 0 or not math.isfinite(rate_hz):
@@ -117,12 +118,15 @@ class TeleoperationController:
             raise ValueError("max_velocity_rad_s must be finite and positive")
         if leader_loss_timeout_s <= 0 or not math.isfinite(leader_loss_timeout_s):
             raise ValueError("leader_loss_timeout_s must be finite and positive")
+        if out_of_range_timeout_s <= 0 or not math.isfinite(out_of_range_timeout_s):
+            raise ValueError("out_of_range_timeout_s must be finite and positive")
         self.follower = follower
         self.leader = leader
         self.mapper = mapper
         self.rate_hz = float(rate_hz)
         self.max_velocity_rad_s = float(max_velocity_rad_s)
         self.leader_loss_timeout_s = float(leader_loss_timeout_s)
+        self.out_of_range_timeout_s = float(out_of_range_timeout_s)
         self.clamp_joints = frozenset(clamp_joints)
         self._stop = threading.Event()
         self._paused = threading.Event()
@@ -130,11 +134,25 @@ class TeleoperationController:
         self._last_raw: dict[int, float] = {}
         self._last_seen: dict[int, float] = {}
         self._command: tuple[float, ...] = ()
+        self._clamped: tuple[str, ...] = ()
+        self._out_of_range_since: float | None = None
         self.error: str | None = None
 
     @property
     def paused(self) -> bool:
         return self._paused.is_set()
+
+    @property
+    def clamped_joints(self) -> tuple[str, ...]:
+        """Arm joints whose leader pose is currently being held at a soft limit.
+
+        Written by the control loop and read by the TUI, which is why it is a single
+        tuple rebind rather than a mutated list: the reader always sees one whole cycle's
+        answer. Empty is the normal case, and the deliberate gripper clamp never appears
+        here -- an operator needs to see the excursions that are not routine.
+        """
+
+        return self._clamped
 
     @property
     def running(self) -> bool:
@@ -153,7 +171,11 @@ class TeleoperationController:
                 raise RuntimeError(f"Star leader has no reliable reading for servo(s) {missing}")
             now = time.monotonic()
             self._last_seen = dict.fromkeys(self.leader.servo_ids, now)
-            targets = self._mapped_targets(self._last_raw)
+            targets, out_of_range = self._mapped_targets(self._last_raw)
+            if out_of_range:
+                raise RuntimeError(
+                    f"Star mapping is outside follower limits: {', '.join(out_of_range)}"
+                )
             current = self.follower.read_state()
             if not current.all_finite:
                 raise RuntimeError("follower has missing position feedback")
@@ -181,6 +203,8 @@ class TeleoperationController:
             self._paused.clear()
         else:
             self._paused.set()
+            self._clamped = ()
+            self._out_of_range_since = None
             self.follower.hold_current_position()
             state = self.follower.read_state()
             if state.all_finite:
@@ -224,7 +248,17 @@ class TeleoperationController:
                 ]
                 if lost:
                     raise RuntimeError(f"Star leader readings lost for servo(s) {lost}")
-                desired = self._mapped_targets(readings)
+                desired, out_of_range = self._mapped_targets(readings)
+                self._clamped = out_of_range
+                if not out_of_range:
+                    self._out_of_range_since = None
+                elif self._out_of_range_since is None:
+                    self._out_of_range_since = now
+                elif now - self._out_of_range_since > self.out_of_range_timeout_s:
+                    raise RuntimeError(
+                        "Star mapping stayed outside follower limits for "
+                        f"{self.out_of_range_timeout_s:g}s: {', '.join(out_of_range)}"
+                    )
                 # Clamp velocity against the measured tick time, not the nominal period:
                 # a tick that overran its period (bus contention with the TUI thread)
                 # must not slow the arm below the configured velocity. The cap keeps a
@@ -248,20 +282,30 @@ class TeleoperationController:
             self.error = f"{type(error).__name__}: {error}"
             self._stop.set()
         finally:
+            self._clamped = ()
             if self.follower.lifecycle is ArmLifecycle.ENABLED:
                 self.follower.hold_current_position()
 
-    def _mapped_targets(self, readings: Mapping[int, float]) -> tuple[float, ...]:
-        """Map leader readings to follower joint targets, gated by the soft limits.
+    def _mapped_targets(
+        self, readings: Mapping[int, float]
+    ) -> tuple[tuple[float, ...], tuple[str, ...]]:
+        """Map leader readings to follower targets, and say which hit a soft limit.
 
-        An arm joint mapping outside the follower's limits is refused: the fixed Star
-        mapping should never produce it, so it means the mapping or the frame is wrong.
-        Joints in ``clamp_joints`` (the gripper) are clamped instead: closing a MakerMod
-        gripper deliberately commands a position past the object so the motor stalls
-        compliantly (grip force is kp times position error), and the gripper mapping's
-        rest point sits exactly on the follower's soft limit, so squeezing the leader
-        always maps past it. The follower clamps to its own limits regardless; clamping
-        here just applies the same policy before the gate.
+        Every joint is clamped into the follower's limits; the second element names the
+        arm joints that needed it, and the callers decide what that means. Before the
+        follower is enabled a single excursion is fatal -- the fixed Star mapping should
+        never produce one, so it means the mapping or the frame is wrong. Once following,
+        it is the operator: a leader arm has reach and a wrist range the follower does
+        not, so walking it past the edge is ordinary, and killing a calibration session
+        for it would be worse than holding the follower at the limit until the leader
+        comes back. A sustained excursion is still the mapping, so the loop times it.
+
+        Joints in ``clamp_joints`` (the gripper) are clamped without being reported:
+        closing a MakerMod gripper deliberately commands a position past the object so
+        the motor stalls compliantly (grip force is kp times position error), and the
+        gripper mapping's rest point sits exactly on the follower's soft limit, so
+        squeezing the leader always maps past it. The follower clamps to its own limits
+        regardless; clamping here just applies the same policy one layer up.
         """
 
         mapped = tuple(float(value) for value in self.mapper.map(dict(readings)))
@@ -271,13 +315,15 @@ class TeleoperationController:
                 f"{len(self.follower.joint_names)}"
             )
         targets: list[float] = []
-        violations: list[str] = []
+        out_of_range: list[str] = []
         for target, limit in zip(mapped, self.follower.limits(), strict=True):
-            if math.isfinite(target) and limit.name in self.clamp_joints:
+            # A non-finite target is not an excursion and cannot be clamped into one:
+            # the mapper has produced a number that means nothing, so stop either way.
+            if not math.isfinite(target):
+                raise RuntimeError(f"Star mapping produced a non-finite target for {limit.name}")
+            if not limit.contains(target):
                 target = limit.clamp(target)
-            if not math.isfinite(target) or not limit.contains(target):
-                violations.append(limit.name)
+                if limit.name not in self.clamp_joints:
+                    out_of_range.append(limit.name)
             targets.append(target)
-        if violations:
-            raise RuntimeError(f"Star mapping is outside follower limits: {', '.join(violations)}")
-        return tuple(targets)
+        return tuple(targets), tuple(out_of_range)

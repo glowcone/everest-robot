@@ -1,3 +1,4 @@
+import math
 import time
 
 import pytest
@@ -110,6 +111,88 @@ def test_mapping_outside_follower_limits_is_rejected_before_enable() -> None:
     assert not leader.connected
 
 
+def test_a_momentary_excursion_is_clamped_and_following_continues() -> None:
+    """A leader has reach the follower does not; walking past the edge is not a crash.
+
+    The follower is held at the soft limit and the joint is named, so an operator can
+    tell "that joint is at the end of its travel" from "the arm has stopped".
+    """
+
+    arm = connected_arm()
+    leader = FakeLeader()
+    controller = TeleoperationController(
+        arm,
+        leader,
+        IdentityMapper(),
+        rate_hz=200.0,
+        max_velocity_rad_s=2.0,
+        out_of_range_timeout_s=0.5,
+    )
+    controller.connect_and_measure()
+    controller.start()
+
+    leader.readings = {0: 4.0, 1: -1.0, 2: -0.5}
+    deadline = time.monotonic() + 0.3
+    while not controller.clamped_joints and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert controller.clamped_joints == ("shoulder_pan",)
+    assert controller.running
+    assert all(command[0] <= 1.0 + 1e-9 for command in arm.sent_commands)
+
+    leader.readings = {0: 0.5, 1: -1.0, 2: -0.5}
+    deadline = time.monotonic() + 0.3
+    while controller.clamped_joints and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert controller.clamped_joints == ()
+    assert controller.error is None
+    assert controller.running
+    controller.close()
+
+
+def test_a_sustained_excursion_stops_and_holds() -> None:
+    """Out of range and staying there is the mapping, not the operator."""
+
+    arm = connected_arm()
+    leader = FakeLeader()
+    controller = TeleoperationController(
+        arm,
+        leader,
+        IdentityMapper(),
+        rate_hz=200.0,
+        max_velocity_rad_s=0.2,
+        out_of_range_timeout_s=0.02,
+    )
+    controller.connect_and_measure()
+    controller.start()
+    leader.readings = {0: 4.0, 1: -1.0, 2: -0.5}
+
+    deadline = time.monotonic() + 0.5
+    while controller.running and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert controller.error is not None
+    assert "stayed outside follower limits" in controller.error
+    assert "shoulder_pan" in controller.error
+    assert arm.lifecycle is ArmLifecycle.ENABLED
+    assert controller.clamped_joints == ()
+    controller.close()
+
+
+def test_a_non_finite_mapping_stops_instead_of_being_clamped() -> None:
+    """NaN is not an excursion: there is no pose to hold the follower at."""
+
+    arm = connected_arm()
+    leader = FakeLeader({0: math.nan, 1: -1.0, 2: -0.5})
+    controller = TeleoperationController(arm, leader, IdentityMapper())
+
+    with pytest.raises(RuntimeError, match="non-finite target"):
+        controller.connect_and_measure()
+
+    assert arm.lifecycle is ArmLifecycle.CONNECTED
+    assert not leader.connected
+
+
 def test_gripper_mapping_past_its_limit_is_clamped_not_refused() -> None:
     """Closing a MakerMod gripper commands past the object on purpose (stall grip).
 
@@ -135,6 +218,8 @@ def test_gripper_mapping_past_its_limit_is_clamped_not_refused() -> None:
     assert arm.sent_commands
     # Every gripper command stays at or inside the clamped limit.
     assert all(command[2] <= 0.0 + 1e-9 for command in arm.sent_commands)
+    # The routine gripper clamp is not an excursion and must not be flagged as one.
+    assert controller.clamped_joints == ()
     controller.close()
 
 

@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import curses
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING
@@ -223,6 +224,7 @@ def _draw(
     *,
     paused: bool,
     captured: int | None = None,
+    clamped: Sequence[str] = (),
 ) -> None:
     screen.erase()
     _, width = screen.getmaxyx()
@@ -251,19 +253,15 @@ def _draw(
         f"calibration {context.calibration_id}  config {context.config_digest[:19]}",
         palette.dim,
     )
-    reference = "reference marked" if monitor.reference is not None else "no reference"
-    # Pressing p is otherwise invisible, which leaves the operator unsure whether the pose
-    # they meant to keep was taken.
-    held = f"  ·  POSE HELD (sample {captured})" if captured is not None else ""
     _put(
         screen,
         2,
         0,
-        f"lifecycle {sample.lifecycle.value.upper()}  ·  {context.poll_hz:g} Hz  ·  "
-        f"sample {sample.index}  ·  {reference}"
-        f"{'  ·  FOLLOW PAUSED' if paused else ''}{held}",
+        _status_line(monitor, sample, context, paused=paused, captured=captured, clamped=clamped),
         palette.warn
-        if paused or sample.lifecycle not in (ArmLifecycle.CONNECTED, ArmLifecycle.ENABLED)
+        if paused
+        or clamped
+        or sample.lifecycle not in (ArmLifecycle.CONNECTED, ArmLifecycle.ENABLED)
         else palette.dim,
     )
 
@@ -276,6 +274,39 @@ def _draw(
     _put(screen, footer + 1, 0, _HELP, palette.dim)
     screen.noutrefresh()
     curses.doupdate()
+
+
+def _status_line(
+    monitor: JointMonitor,
+    sample: MonitorSample,
+    context: MonitorContext,
+    *,
+    paused: bool,
+    captured: int | None,
+    clamped: Sequence[str],
+) -> str:
+    """The line under the header: what the session is doing, right now.
+
+    Pressing p is otherwise invisible, which leaves the operator unsure whether the pose
+    they meant to keep was taken; a clamped joint is likewise invisible, because the
+    follower simply stops moving while the leader keeps going. Naming the joint is the
+    difference between "the arm is stuck" and "that joint is at the end of its travel".
+    """
+
+    reference = "reference marked" if monitor.reference is not None else "no reference"
+    parts = [
+        f"lifecycle {sample.lifecycle.value.upper()}",
+        f"{context.poll_hz:g} Hz",
+        f"sample {sample.index}",
+        reference,
+    ]
+    if paused:
+        parts.append("FOLLOW PAUSED")
+    if clamped:
+        parts.append(f"CLAMPED: {', '.join(clamped)}")
+    if captured is not None:
+        parts.append(f"POSE HELD (sample {captured})")
+    return "  ·  ".join(parts)
 
 
 def help_lines(context: MonitorContext) -> list[str]:
@@ -334,6 +365,9 @@ def _mode_guide(context: MonitorContext) -> tuple[str, ...]:
             "POWERED. The follower is enabled and tracking the Star leader at a",
             "bounded velocity. space pauses following and holds; q stops, holds and",
             "releases. This process holds the robot lease, so no worker can run.",
+            "A leader pose the follower cannot reach is held at the soft limit and",
+            "named as CLAMPED above; bring the leader back and following resumes.",
+            "Staying out of range stops the session, because that is the mapping.",
         )
     return (
         "READ ONLY. The arm is never enabled, so you can position it by hand.",
@@ -440,6 +474,7 @@ def run_tui(
                 palette,
                 paused=paused,
                 captured=None if captured is None else captured.index,
+                clamped=() if controller is None else controller.clamped_joints,
             )
             if controller is not None and controller.error:
                 return captured
@@ -521,6 +556,13 @@ def main() -> None:
     parser.add_argument("--leader-rate", type=float, default=25.0)
     parser.add_argument("--max-velocity", type=float, default=0.25)
     parser.add_argument("--leader-loss-timeout", type=float, default=0.5)
+    parser.add_argument(
+        "--out-of-range-timeout",
+        type=float,
+        default=2.0,
+        help="seconds the leader may map outside the follower's soft limits before "
+        "following stops; shorter excursions are clamped and shown as CLAMPED",
+    )
     parser.add_argument("--sync-threshold", type=float, default=0.8)
     parser.add_argument(
         "--yes", action="store_true", help="accept a startup pose difference without prompting"
@@ -602,6 +644,7 @@ def _run_session(
             rate_hz=args.leader_rate,
             max_velocity_rad_s=args.max_velocity,
             leader_loss_timeout_s=args.leader_loss_timeout,
+            out_of_range_timeout_s=args.out_of_range_timeout,
         )
         try:
             difference = controller.connect_and_measure()

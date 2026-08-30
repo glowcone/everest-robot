@@ -15,6 +15,7 @@ from everest_robot.monitor import (
     _prompt_save,
     _row,
     _state_of,
+    _status_line,
     _unsaveable,
     help_lines,
     run_tui,
@@ -380,6 +381,39 @@ def test_a_pose_outside_the_soft_limits_is_not_offered() -> None:
     assert reason is not None and "shoulder_lift outside" in reason
 
 
+# ── the status line ────────────────────────────────────────────────────────────────
+
+
+def test_a_clamped_joint_is_named_in_the_status_line() -> None:
+    """A follower held at its limit stops moving; without this it just looks stuck."""
+
+    clock = ManualClock()
+    monitor = JointMonitor(connected_arm(clock), clock=clock)
+    sample = monitor.sample()
+
+    line = _status_line(
+        monitor,
+        sample,
+        capture_context(),
+        paused=False,
+        captured=None,
+        clamped=("shoulder_pan",),
+    )
+
+    assert "CLAMPED: shoulder_pan" in line
+
+
+def test_the_status_line_says_nothing_about_clamping_when_nothing_is_clamped() -> None:
+    clock = ManualClock()
+    monitor = JointMonitor(connected_arm(clock), clock=clock)
+    sample = monitor.sample()
+
+    line = _status_line(monitor, sample, capture_context(), paused=False, captured=None, clamped=())
+
+    assert "CLAMPED" not in line
+    assert "no reference" in line
+
+
 # ── the on-screen guide ────────────────────────────────────────────────────────────
 
 
@@ -456,6 +490,15 @@ def test_the_fake_guide_says_a_pose_cannot_be_saved_from_it() -> None:
     body = "\n".join(help_lines(capture_context(fake=True, powered=False)))
 
     assert "cannot be saved" in body
+
+
+def test_the_powered_guide_explains_what_a_clamped_joint_means() -> None:
+    """CLAMPED appears on screen, so the guide has to say what it is telling you."""
+
+    body = "\n".join(help_lines(capture_context(powered=True)))
+
+    assert "CLAMPED" in body
+    assert "Staying out of range stops the session" in body
 
 
 def test_the_guide_points_at_the_validation_that_makes_a_preset_safe() -> None:
