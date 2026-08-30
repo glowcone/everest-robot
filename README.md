@@ -18,14 +18,15 @@ The workflow returns a durable `complete` result only after verification succeed
 
 ## Running the system
 
-Prerequisites: Docker, Python 3.12+, and [uv](https://docs.astral.sh/uv/). Every command
-below is a [just](https://just.systems/) recipe; run `just` to see them grouped by purpose.
-Recipes load `.env`, so copy the example first.
+Prerequisites: Python 3.12+, [uv](https://docs.astral.sh/uv/), and a Postgres -- either
+Docker or a PostgreSQL installed on the host. Every command below is a
+[just](https://just.systems/) recipe; run `just` to see them grouped by purpose. Recipes
+load `.env`, so copy the example first.
 
 ```bash
 cp .env.example .env
 just setup      # locked environment: no torch, no CAN
-just db-up      # Postgres in Docker
+just db-up      # Postgres, in Docker or on the host
 just db-init    # Absurd schema and the robot queue
 just config     # what this deployment will actually do
 ```
@@ -33,6 +34,27 @@ just config     # what this deployment will actually do
 `just config` reads the robot parameters file and the environment and prints the resolved
 result. It touches no hardware and no database, so it is the first thing to run when
 something is configured but not behaving.
+
+### Where Postgres comes from
+
+Docker is optional. `just db-up` uses `compose.yaml` when Docker Compose *and* a reachable
+daemon are both present, and otherwise drives a PostgreSQL the host already has -- a
+Homebrew install, a distribution package, or a server elsewhere. `just db-backend` prints
+which one it picked and against which URL; `EVEREST_DB_BACKEND=docker|native` forces the
+choice. Every other command goes through `ABSURD_DATABASE_URL` and cannot tell the two
+apart.
+
+```bash
+brew install postgresql@17     # macOS, if you would rather not run Docker
+just db-backend                # -> native (server at localhost:5432)
+just db-up                     # starts it via `brew services`, then creates role+database
+```
+
+The two backends differ in exactly two places, both deliberate. On the native backend
+`just db-down` stops nothing, because that server is shared with the rest of the machine;
+stop it yourself if you mean to. And `just db-reset` drops and recreates the `robot`
+database rather than deleting a Docker volume. The native backend also needs `psql` on
+`PATH`, which Homebrew leaves unlinked for the versioned formulae.
 
 ### Carabiner marker vision
 
@@ -74,9 +96,10 @@ so a retry resumes after them instead of repeating them. Cancelling sets the tas
 a running stage notices at its next heartbeat, holds the arm, and releases the lease on the
 way out.
 
-The host needs no PostgreSQL client — these recipes run `psql` inside the container. If old
-tasks from a previous revision of a workflow are cluttering the picture, `just db-reset`
-clears everything and reinitializes.
+On the Docker backend these recipes run `psql` inside the container, so the host needs no
+PostgreSQL client; on the native backend they use the host's own. If old tasks from a
+previous revision of a workflow are cluttering the picture, `just db-reset` clears
+everything and reinitializes.
 
 ### Replaying a stored session
 
@@ -152,6 +175,7 @@ configuration works on a workstation and in the cell:
 | Variable | Purpose |
 | --- | --- |
 | `ABSURD_DATABASE_URL`, `ROBOT_QUEUE` | Postgres connection and queue name. |
+| `EVEREST_DB_BACKEND` | `docker` or `native`; auto-detected when unset. Only the `database` recipes read it. |
 | `EVEREST_ROBOT_BACKEND` | `scaffold` (default) or `hardware`. |
 | `EVEREST_ROBOT_ID`, `EVEREST_CALIBRATION_ID` | Identity the replay recipes pass; must match the parameters file. |
 | `EVEREST_CAN_PORT`, `EVEREST_CAN_BACKEND` | `can0` with `socketcan`, or a serial port with `slcan`. |
@@ -242,4 +266,6 @@ briefly overlap execution around crashes -- which is what the robot lease exists
 safe. Long-running policy/control calls heartbeat from inside their control loops, and
 treat a raising heartbeat (Absurd's cancellation signal) as stop-and-hold.
 
-Postgres data lives in the Docker volume `postgres-data`, which `just db-reset` deletes.
+Postgres data lives in the Docker volume `postgres-data` on the Docker backend, and in the
+host server's own `robot` database on the native one. `just db-reset` clears whichever it
+is.

@@ -57,16 +57,24 @@ monitor-fake:
     uv run robot-monitor --fake
 
 # ── database ───────────────────────────────────────────────────────────────────────
+# Docker is optional. `robot-db` uses compose.yaml when Docker Compose and its daemon are
+# both available, and an already-installed PostgreSQL (Homebrew, a package) otherwise.
+# EVEREST_DB_BACKEND=docker|native forces the choice; both use ABSURD_DATABASE_URL.
 
-# Start Postgres and wait until it is healthy.
+# Print which Postgres backend these recipes will use, and against which URL.
+[group('database')]
+db-backend:
+    uv run robot-db backend
+
+# Start Postgres and wait until it accepts connections.
 [group('database')]
 db-up:
-    docker compose up -d --wait postgres
+    uv run robot-db up
 
-# Stop the local containers without deleting database data.
+# Stop the containers without deleting data. A shared host server is left running.
 [group('database')]
 db-down:
-    docker compose down
+    uv run robot-db down
 
 # Install Absurd's schema and create the robot queue (first-time setup).
 [group('database')]
@@ -76,14 +84,13 @@ db-init:
 # Delete all database state and start over, clearing tasks from older workflow revisions.
 [group('database')]
 db-reset:
-    docker compose down -v
-    just db-up
+    uv run robot-db reset
     just db-init
 
-# Open a psql shell in the Postgres container (the host needs no PostgreSQL client).
+# Open a psql shell against the robot database, wherever it is running.
 [group('database')]
 psql:
-    docker compose exec postgres psql -U robot -d robot
+    uv run robot-db psql
 
 # ── workflows ──────────────────────────────────────────────────────────────────────
 
@@ -100,14 +107,14 @@ start workflow_id="demo" verification_failures="0":
 # List recent tasks and their state.
 [group('workflow')]
 tasks limit="20":
-    docker compose exec -T postgres psql -U robot -d robot -c \
+    uv run robot-db sql \
         "SELECT task_id, task_name, state, attempts, enqueue_at \
          FROM absurd.t_robot ORDER BY enqueue_at DESC LIMIT {{ limit }};"
 
 # Show one task's parameters and its durable result.
 [group('workflow')]
 task task_id:
-    docker compose exec -T postgres psql -U robot -d robot -c \
+    uv run robot-db sql \
         "SELECT task_name, state, attempts, jsonb_pretty(params) AS params, \
                 jsonb_pretty(completed_payload) AS result \
          FROM absurd.t_robot WHERE task_id = '{{ task_id }}';"
@@ -115,14 +122,14 @@ task task_id:
 # Show one task's committed checkpoints: the record of which stages actually completed.
 [group('workflow')]
 checkpoints task_id:
-    docker compose exec -T postgres psql -U robot -d robot -c \
+    uv run robot-db sql \
         "SELECT checkpoint_name, status, updated_at, jsonb_pretty(state) AS value \
          FROM absurd.c_robot WHERE task_id = '{{ task_id }}' ORDER BY updated_at;"
 
 # Cancel a task. A running stage stops at its next heartbeat, holding the arm on the way out.
 [group('workflow')]
 cancel task_id:
-    docker compose exec -T postgres psql -U robot -d robot -c \
+    uv run robot-db sql \
         "SELECT absurd.cancel_task('${ROBOT_QUEUE:-robot}', '{{ task_id }}');"
 
 # ── replay ─────────────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ Use `just` as the primary interface for development and operations. Run `just` t
 recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robot`
 (`monitor` -- powered calibration teleoperation; `monitor-read-only`, `monitor-once`,
 `monitor-fake` -- read-only), `database`
-(`db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
+(`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
 automatically. Run `just check` before handing off changes.
@@ -13,8 +13,18 @@ The Justfile is documentation as much as tooling: a recipe's comment is what `ju
 shows, so keep it to one line and put longer explanation in the section header or in
 `docs/`. Anything that can move a real arm belongs in the `replay` or `workflow` group with
 its ordering made explicit. `absurdctl`'s subcommands shell out to `psql`, which the host
-is not assumed to have, so task inspection recipes run `psql` inside the Postgres container
-instead.
+is not assumed to have, so task inspection recipes go through `robot-db sql`, which runs
+`psql` inside the Postgres container on the Docker backend and the host's client on the
+native one.
+
+Docker is optional. `src/everest_robot/database.py` owns the choice: Docker Compose when
+both it and its daemon answer, otherwise a PostgreSQL the host already runs (Homebrew, a
+package, a remote server), forced with `EVEREST_DB_BACKEND=docker|native`. No recipe or
+module outside that file may name `docker` -- everything else goes through
+`ABSURD_DATABASE_URL` and cannot tell the backends apart. Two asymmetries are deliberate
+and should not be "fixed": the native backend's `down` stops nothing, because the server is
+shared with the rest of the workstation, and its `reset` drops the configured database
+rather than a volume.
 
 Keep robot hardware, policy, and perception code behind the adapter boundary in
 `src/everest_robot/adapters.py`. Keep durable orchestration and checkpoint naming in
@@ -108,5 +118,6 @@ parameters or environment-backed configuration.
 
 Add deterministic unit tests under `tests/` for every adapter result and recovery branch.
 Before handing off a change, run `just check`. For orchestration changes, also run the
-Docker-backed smoke path: `just db-up`, `just db-init`, `just worker`, then in another
-terminal `just start <workflow-id> <verification-failures>`.
+database-backed smoke path on whichever backend `just db-backend` reports: `just db-up`,
+`just db-init`, `just worker`, then in another terminal
+`just start <workflow-id> <verification-failures>`.
