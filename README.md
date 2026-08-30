@@ -160,6 +160,33 @@ All modes claim the robot lease. Powered following and monitoring therefore happ
 same process; run it *instead of* a worker, not alongside one. A joint whose feedback counter
 stops advancing is flagged `QUIET`.
 
+### Driving to a named position
+
+Teleoperation is how a pose gets captured; `just goto` is how the arm gets back to one.
+It is the counterpart to `just raise`: that command nudges one joint relative to measured
+feedback, this one drives the whole arm to a pose someone captured, approved, and committed
+to `config/maker_arm_v1.yaml`. Both go through the same motion controller as the workflow,
+so the limit checks, bounded interpolation, settling and fault handling are identical.
+
+```bash
+just goto-list                      # approved positions and the transitions that reach them
+just goto-dry clip-attachment-ready # claims and validates; energizes nothing
+just goto clip-attachment-ready     # POWERED, at speed scale 0.25
+just goto clip-attachment-ready 1.0 # at the position's approved bounds
+```
+
+The recipes are ordered on purpose, and `docs/named-position-capture.md` step 3 is the
+procedure they exist for: dry run, then 0.25, then 0.5, then full speed, from every pose the
+move can start at.
+
+No pose is invented here. An unknown destination is refused with the list of approved ones
+*before* the robot is claimed, and a preset that falls outside the driver's live soft limits
+is refused rather than clamped. Where a `named_transitions` sequence ends at the requested
+position, `just goto` takes it and says so — the transition exists precisely because the
+straight line was not shown to be collision-free, so there is no flag to override it. A move
+that swings any joint by more than 0.35 rad asks for confirmation before energizing; pass
+`--yes` to skip that, which `just goto` does not do for you.
+
 ### Configuration
 
 Two files hold *robot behaviour*, and both are versioned:
@@ -195,6 +222,7 @@ The runtime prefers refusing to guessing, so most surprises are a deliberate che
 | `... is not in approved_replays` | No operator-approved mapping from this dataset to this arm. Add one, or set `require_approved_dataset: false` for a bench experiment. |
 | `is not a full 40-character commit SHA` | Replay pins immutable revisions; a branch name would replay different motion on different days. |
 | `parameters do not match the connected arm` | The calibration identity in the parameters file differs from the deployment's. Presets and datasets from another calibration describe different physical poses. |
+| `unknown named position` | The destination is not in `named_positions`. `just goto-list` shows what is; capture new ones with `docs/named-position-capture.md`. |
 | `lies outside the active limits` | The episode leaves the driver's soft limits by more than the configured tolerance. The preflight report says by how much and on which joint. |
 | `is claimed by another worker` / `by another process` | Something else holds the robot lease. `just monitor` takes it too; only one process may own the arm. |
 | `maker_arm is not installed` | `just setup-hardware`. |
@@ -229,6 +257,7 @@ without them.
 Named positions ship empty on purpose. Capture them from a measured, operator-approved arm
 state by following [`docs/named-position-capture.md`](docs/named-position-capture.md); the
 loader refuses any preset whose calibration identity does not match the connected arm.
+`just goto` drives to them once they exist.
 
 Stored-session **replay** is implemented: it resolves a pinned Hugging Face dataset
 revision, validates the whole episode against this arm before claiming it, aligns to the

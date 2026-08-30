@@ -52,15 +52,21 @@ motion, policy and replay result, so a run can be traced back to the exact confi
 Each *transition* is approved separately from each *pose*. A pose being safe says nothing
 about the straight line in joint space that reaches it.
 
-1. Dry-run first: `go_to_known_position(name, dry_run=True)` validates the preset against
-   the active hardware limits and reports the planned motion without commanding it.
-2. Execute the move at `speed_scale=0.25` from every pose the workflow can start it from,
-   with a hand on the e-stop. Watch for contact with the fixture, cable pull, and gripper
-   payload swing.
-3. Repeat at `speed_scale=0.5`, then at the approved `max_velocity_rad_s`.
+1. Dry-run first: `just goto-dry <name>` validates the preset against the active hardware
+   limits and reports the planned motion without commanding it. `just goto-list` shows
+   which presets and transitions the file currently offers.
+2. Execute the move with `just goto <name> 0.25` from every pose the workflow can start it
+   from, with a hand on the e-stop. Watch for contact with the fixture, cable pull, and
+   gripper payload swing. A move that swings any joint more than 0.35 rad asks for
+   confirmation before it energizes anything.
+3. Repeat with `just goto <name> 0.5`, then at the approved `max_velocity_rad_s`
+   (`just goto <name> 1.0`).
 4. If any approach cannot be made safe as a direct interpolation, do not raise the speed
    or widen the tolerance. Capture the intermediate clearance poses and record the path as
-   a `named_transitions` entry instead. The runtime uses the transition when one exists.
+   a `named_transitions` entry instead. The runtime uses the transition when one exists,
+   and so does `just goto`: once a transition ends at a pose, that is how the command
+   reaches it, with no flag to go straight there. Where two transitions end at the same
+   pose it refuses and asks which, since that is an operator's choice.
 
 ## 4. Re-approval
 

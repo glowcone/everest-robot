@@ -7,8 +7,9 @@
 #   attach-carabiner  the carabiner attachment state machine  (just start)
 #   replay-session    replay of a stored dataset episode      (just replay ...)
 #
-# Powered calibration teleoperation lives in `monitor`; replay motion stays in the ordered
-# replay group. Every robot recipe claims the arm exclusively.
+# Powered calibration teleoperation lives in `monitor` and powered named-position motion in
+# `goto`; replay motion stays in the ordered replay group. Every robot recipe claims the arm
+# exclusively.
 
 set dotenv-load
 
@@ -33,8 +34,10 @@ config:
     uv run robot-config
 
 # ── robot ──────────────────────────────────────────────────────────────────────────
-# Calibration teleoperation plus explicit read-only instruments. All claim the arm, so a
-# worker cannot be holding it.
+# Calibration teleoperation, named-position motion, and explicit read-only instruments.
+# All claim the arm, so a worker cannot be holding it. The `goto` recipes are ordered:
+# `goto-list` reads the configuration, `goto-dry` claims and validates without energizing,
+# and only `goto` moves.
 
 # Follow the Star leader at bounded speed while watching follower encoders. POWERED.
 [group('robot')]
@@ -55,6 +58,21 @@ monitor-once:
 [group('robot')]
 monitor-fake:
     uv run robot-monitor --fake
+
+# List the approved named positions and the transitions that reach them. Touches nothing.
+[group('robot')]
+goto-list:
+    uv run robot-goto --list
+
+# Validate a named-position move against the live limits and measured pose. Moves nothing.
+[group('robot')]
+goto-dry position:
+    uv run robot-goto {{ position }} --dry-run
+
+# Drive the arm to an approved named position, using its transition if one exists. POWERED.
+[group('robot')]
+goto position speed="0.25":
+    uv run robot-goto {{ position }} --speed-scale {{ speed }}
 
 # ── database ───────────────────────────────────────────────────────────────────────
 # Docker is optional. `robot-db` uses compose.yaml when Docker Compose and its daemon are

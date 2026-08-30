@@ -2,8 +2,9 @@
 
 Use `just` as the primary interface for development and operations. Run `just` to list the
 recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robot`
-(`monitor` -- powered calibration teleoperation; `monitor-read-only`, `monitor-once`,
-`monitor-fake` -- read-only), `database`
+(`monitor` -- powered calibration teleoperation; `goto` -- powered named-position motion;
+`goto-list`, `goto-dry`, `monitor-read-only`, `monitor-once`, `monitor-fake` -- no motion),
+`database`
 (`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
@@ -77,6 +78,12 @@ Absurd checkpoints store.
   Star leader and commands the already-claimed follower while the same process renders that
   view. `--read-only` and `--once` never enable. Never split control and monitoring across
   processes or allow either to bypass the robot lease.
+- `goto.py` (`robot-goto`) and `jog.py` (`robot-raise`) are the only motion commands outside
+  the durable workflow, and both are thin: they resolve a destination and hand it to
+  `JointMotionController`. Keep it that way -- no second path to the motors. `goto.py`
+  resolves its route from the parameters file *before* opening a session, so an unknown or
+  ambiguous destination costs no claim, and it must keep preferring an approved
+  `named_transitions` sequence over the direct line with no flag to override it.
 
 ## Working on workflow components
 
@@ -111,8 +118,9 @@ task-level retries for transient failures. Long-running model or motion calls mu
 heartbeats often enough to retain their worker claim.
 
 The CLI entry points are `src/everest_robot/client.py`,
-`src/everest_robot/worker.py`, `src/everest_robot/database.py`, and
-`src/everest_robot/monitor.py`. Keep hardware-specific
+`src/everest_robot/worker.py`, `src/everest_robot/database.py`,
+`src/everest_robot/monitor.py`, `src/everest_robot/goto.py`, and
+`src/everest_robot/jog.py`. Keep hardware-specific
 configuration out of these modules; pass selection and tuning data through validated task
 parameters or environment-backed configuration.
 
