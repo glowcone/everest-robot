@@ -30,7 +30,9 @@ Absurd checkpoints store.
 
 - `ports.py` is the single hardware boundary. Nothing above it imports a driver.
   `maker_arm_port.py` adapts `maker_arm.Arm`; `fake_arm.py` is the deterministic stand-in
-  every layer above is tested against.
+  every layer above is tested against. `robstride_mit_port.py` (`EVEREST_ARM_DRIVER=mit`)
+  drives motors provisioned in MIT protocol and is qualified for the calibration monitor
+  only -- never wire it into replay or workflow; see the ADR-0001 addendum.
 - Soft limits, watchdogs, velocity limiting, fault handling and coordinate conversion
   belong to `maker-arm-sdk` and must not be re-implemented here. See
   `docs/adr/0001-production-motor-protocol.md` for the ownership split.

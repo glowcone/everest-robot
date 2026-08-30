@@ -229,6 +229,26 @@ above because it is implemented in the same adapter layer, not inside `maker-arm
   must route this through an operator- or workflow-gated recovery path, not an automatic retry,
   since the underlying fault condition may still be physically present.
 
+## Addendum (2026-08-29): MIT-mode calibration monitor port
+
+The motors on this project's arm are currently provisioned in **MIT** mode (they answer
+the makermodslab teleop stack, and `maker_arm.Arm.connect()` reports "online: none"), and
+switching them back to the private protocol was not practical for the calibration session
+at hand. An MIT-protocol `ArmPort` therefore exists:
+`src/everest_robot/robot/robstride_mit_port.py` (`RobstrideMitPort`, over the lerobot
+fork's `RobstrideMotorsBus`), selected by `EVEREST_ARM_DRIVER=mit`.
+
+Its qualified scope is the **lease-local calibration teleoperation monitor**
+(`just monitor`) only. The gaps this ADR documents remain in force and accepted for that
+scope: no motor-side CAN watchdog, no host-side feedback-age watchdog, no fault-hold. The
+teleoperation loop mitigates at its level (hold-on-failure, torque-off on disconnect), and
+frame reconciliation goes through the parameters file's `lerobot_frame` offsets
+(docs/lerobot-frame-reconciliation.md).
+
+Production replay and the durable workflow remain on the private protocol with
+`maker-arm-sdk`; this ADR's decision stands. Do not wire `RobstrideMitPort` into replay or
+workflow paths — that requires reopening this ADR under its revisit criteria.
+
 ## Revisit criteria
 
 Reopen this decision only if one or more of the following becomes true:

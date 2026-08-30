@@ -11,6 +11,11 @@ Environment:
   (default ``config/maker_arm_v1.yaml``).
 * ``EVEREST_CAN_BACKEND`` -- ``socketcan`` (default) or ``slcan``.
 * ``EVEREST_CAN_PORT`` -- interface name (``can0``) or serial port (``/dev/ttyACM0``).
+* ``EVEREST_ARM_DRIVER`` -- ``maker-arm`` (default, the private-protocol production
+  driver) or ``mit`` for motors provisioned in RobStride's MIT protocol. The ``mit``
+  driver is qualified for the lease-local calibration monitor only; replay and the
+  workflow stay on ``maker-arm``. See the addendum in
+  docs/adr/0001-production-motor-protocol.md.
 * ``EVEREST_ARM_PROFILE`` -- maker-arm hardware profile path; defaults to the one shipped
   with the installed SDK, which is what its limits and gains were captured against.
 * ``EVEREST_LEASE_BACKEND`` -- ``postgres`` (default when ``ABSURD_DATABASE_URL`` is set)
@@ -37,6 +42,7 @@ from everest_robot.robot.maker_arm_port import MakerArmPort
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.ports import ArmPort
 from everest_robot.robot.replay import ReplayRunner
+from everest_robot.robot.robstride_mit_port import RobstrideMitPort
 from everest_robot.robot.session import RobotSession
 
 DEFAULT_PARAMETERS_PATH = "config/maker_arm_v1.yaml"
@@ -77,7 +83,7 @@ def build_lease(
 def build_port(
     parameters: RobotParameters, environ: Mapping[str, str] | None = None
 ) -> ArmPort:
-    """Build the maker-arm port for the configured CAN interface."""
+    """Build the arm port for the configured CAN interface and driver."""
 
     environ = os.environ if environ is None else environ
     port = environ.get("EVEREST_CAN_PORT")
@@ -87,8 +93,21 @@ def build_port(
             "the USB-CAN adapter's serial port (e.g. '/dev/ttyACM0') with EVEREST_CAN_BACKEND=slcan"
         )
     backend = environ.get("EVEREST_CAN_BACKEND", "socketcan")
-    profile = environ.get("EVEREST_ARM_PROFILE")
+    driver = environ.get("EVEREST_ARM_DRIVER", "maker-arm")
 
+    if driver == "mit":
+        return RobstrideMitPort.from_deployment(
+            parameters.identity,
+            joint_frame(parameters),
+            port=port,
+            backend=backend,
+        )
+    if driver != "maker-arm":
+        raise ValueError(
+            f"unsupported EVEREST_ARM_DRIVER {driver!r} (expected maker-arm or mit)"
+        )
+
+    profile = environ.get("EVEREST_ARM_PROFILE")
     backend_kwargs = {"channel": port} if backend == "socketcan" else {"port": port}
     return MakerArmPort.from_profile(
         parameters.identity,
