@@ -172,7 +172,7 @@ class EverestAttachmentFSMHandlers:
     def clip_rl_step(self) -> ClipRLStep:
         raise NotImplementedError(
             "CLIP_RL needs one action from a freshly seeded persistent policy session, "
-            "then attachment, grasp, visibility, and alignment checks"
+            "then neutral-return, attachment, grasp, visibility, and alignment checks"
         )
 
     def hold(self, reason: str) -> None:

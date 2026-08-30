@@ -83,6 +83,8 @@ The state machine is:
 
                  CLIP_RL -- attachment verified --> SUCCESS
 
+                 CLIP_RL -- policy returned to neutral --> INITIAL
+
                  Any active state -- cancelled / safety fault --> ABORTED
 
                  Any active state -- action or time budget exhausted --> FAILED
@@ -102,7 +104,10 @@ the authoritative transition to `CLIP_RL`. Losing the target returns to `SEARCH_
 `CLIP_RL` executes one learned action and then checks attachment and recovery observations.
 Successful verification terminates. A visible but poorly aligned carabiner returns to
 `SEARCH_CV`; losing an ungrasped carabiner returns to `SEARCH_RL`; otherwise rollout
-continues in `CLIP_RL`.
+continues in `CLIP_RL`. If the policy reports that it has returned to neutral, that signal
+takes precedence over its same-step verification result and transitions to `INITIAL`. The
+FSM clears its per-cycle state budgets and policy context, then takes a fresh motion-free
+observation; lifetime action and wall-clock budgets do not reset.
 
 Search and clip may use the same checkpoint, but they are separate policy sessions. CV has
 physically intervened between them, so cached actions and recurrent state from before CV
@@ -125,7 +130,7 @@ The trace is diagnostic evidence, not a physical-effect checkpoint.
   API remains valid for uninterrupted rollouts but must not be adapted by repeated resets.
 - CV following can reuse `VisualTracker`, but detection, pixel-to-joint targeting, and the
   definition of `followed` remain behind an integration handler.
-- Removing the known-position/neutral stage avoids an unnecessary motion and preserves the
-  useful post-pickup pose produced by the policy.
+- The orchestrator never commands a known-position/neutral stage. It observes the RL
+  policy's normal return to neutral and uses that event to reset for another cycle.
 - Outer durability is optional. If added, one attempt is one non-retryable physical stage,
   not one durable checkpoint per FSM action.

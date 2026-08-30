@@ -67,6 +67,7 @@ class ClipRLStep:
     """Result after one learned grasp/clip action and fresh recovery checks."""
 
     attachment_verified: bool
+    returned_to_neutral: bool = False
     carabiner_visible: bool = False
     alignment_degraded: bool = False
     carabiner_grasped: bool = False
@@ -138,6 +139,7 @@ class AttachmentFSMResult:
     reason: str
     actions: int
     elapsed_s: float
+    resets: int
     state_actions: Mapping[str, int]
     transitions: tuple[StateTransition, ...]
 
@@ -167,23 +169,32 @@ class AttachmentFSM:
         started = self.monotonic()
         state = AttachmentState.INITIAL
         actions = 0
-        counts = {candidate.value: 0 for candidate in ACTIVE_STATES if candidate is not state}
+        action_states = ACTIVE_STATES - {AttachmentState.INITIAL}
+        counts = {candidate.value: 0 for candidate in action_states}
+        cycle_counts = dict(counts)
+        resets = 0
         transitions: list[StateTransition] = []
-        self.handlers.enter_state(state, None)
 
         try:
-            initial = self.handlers.observe_initial()
-            if initial.already_attached:
-                next_state, reason = AttachmentState.SUCCESS, "attachment already verified"
-            elif initial.carabiner_detected:
-                next_state, reason = AttachmentState.SEARCH_CV, "carabiner initially detected"
-            else:
-                next_state, reason = AttachmentState.SEARCH_RL, "carabiner not initially detected"
-            state = self._transition(
-                state, next_state, reason, actions, initial, transitions, enter=True
-            )
+            self.handlers.enter_state(state, None)
 
             while state in ACTIVE_STATES:
+                if state is AttachmentState.INITIAL:
+                    initial = self.handlers.observe_initial()
+                    if initial.already_attached:
+                        next_state = AttachmentState.SUCCESS
+                        reason = "attachment already verified"
+                    elif initial.carabiner_detected:
+                        next_state = AttachmentState.SEARCH_CV
+                        reason = "carabiner initially detected"
+                    else:
+                        next_state = AttachmentState.SEARCH_RL
+                        reason = "carabiner not initially detected"
+                    state = self._transition(
+                        state, next_state, reason, actions, initial, transitions, enter=True
+                    )
+                    continue
+
                 elapsed = self.monotonic() - started
                 if actions >= self.config.max_total_actions:
                     state = self._transition(
@@ -205,7 +216,7 @@ class AttachmentFSM:
                         transitions,
                     )
                     break
-                if counts[state.value] >= self.config.state_budget(state):
+                if cycle_counts[state.value] >= self.config.state_budget(state):
                     state = self._transition(
                         state,
                         AttachmentState.FAILED,
@@ -219,7 +230,11 @@ class AttachmentFSM:
                 result, next_state, reason = self._step(state)
                 actions += 1
                 counts[state.value] += 1
+                cycle_counts[state.value] += 1
                 if next_state is not state:
+                    if next_state is AttachmentState.INITIAL:
+                        cycle_counts = {candidate.value: 0 for candidate in action_states}
+                        resets += 1
                     state = self._transition(
                         state, next_state, reason, actions, result, transitions, enter=True
                     )
@@ -240,6 +255,7 @@ class AttachmentFSM:
             reason=reason,
             actions=actions,
             elapsed_s=self.monotonic() - started,
+            resets=resets,
             state_actions=dict(sorted(counts.items())),
             transitions=tuple(transitions),
         )
@@ -263,6 +279,8 @@ class AttachmentFSM:
 
         if state is AttachmentState.CLIP_RL:
             result = self.handlers.clip_rl_step()
+            if result.returned_to_neutral:
+                return result, AttachmentState.INITIAL, "policy returned to neutral"
             if result.attachment_verified:
                 return result, AttachmentState.SUCCESS, "attachment verified"
             if result.carabiner_visible and result.alignment_degraded:

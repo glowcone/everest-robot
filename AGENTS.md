@@ -160,8 +160,10 @@ most one physical action and return the typed result that the FSM uses for its t
 handlers must not contain hidden retry loops or choose the next state. `INITIAL` is
 motion-free, `SEARCH_CV` reuses `VisualTracker`, and `SEARCH_RL`/`CLIP_RL` use distinct
 persistent policy sessions even when they share a checkpoint. There is no automatic neutral
-or known-position move. Keep total, per-state, and wall-clock budgets finite, and treat the
-trace as diagnostics rather than resumable physical state.
+or known-position command. When `CLIP_RL` reports that the policy returned to neutral, the
+FSM returns to `INITIAL` and clears per-cycle state budgets; keep the lifetime total-action
+and wall-clock budgets finite. Treat the trace as diagnostics rather than resumable physical
+state.
 
 The CLI entry points are `src/everest_robot/client.py`,
 `src/everest_robot/worker.py`, `src/everest_robot/database.py`,

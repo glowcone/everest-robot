@@ -120,8 +120,15 @@ def test_cv_loss_returns_to_rl_search():
 @pytest.mark.parametrize(
     ("clip_result", "recovery"),
     [
-        (ClipRLStep(False, True, True, False), AttachmentState.SEARCH_CV),
-        (ClipRLStep(False, False, False, False), AttachmentState.SEARCH_RL),
+        (
+            ClipRLStep(
+                attachment_verified=False,
+                carabiner_visible=True,
+                alignment_degraded=True,
+            ),
+            AttachmentState.SEARCH_CV,
+        ),
+        (ClipRLStep(attachment_verified=False), AttachmentState.SEARCH_RL),
     ],
 )
 def test_clip_recovery_uses_observed_carabiner_state(clip_result, recovery):
@@ -135,6 +142,38 @@ def test_clip_recovery_uses_observed_carabiner_state(clip_result, recovery):
 
     assert result.succeeded
     assert recovery in destinations(result)
+
+
+def test_policy_return_to_neutral_resets_through_initial():
+    handlers = ScriptedHandlers(
+        initial=InitialObservation(False, True),
+        clip=deque(
+            [
+                ClipRLStep(
+                    attachment_verified=True,
+                    returned_to_neutral=True,
+                    carabiner_grasped=True,
+                )
+            ]
+        ),
+    )
+    observations = iter(
+        [InitialObservation(False, True), InitialObservation(True, False)]
+    )
+    handlers.observe_initial = lambda: next(observations)  # type: ignore[method-assign]
+
+    result = AttachmentFSM(handlers).run()
+
+    assert result.succeeded
+    assert result.resets == 1
+    assert result.actions == 2
+    assert destinations(result) == [
+        AttachmentState.SEARCH_CV,
+        AttachmentState.CLIP_RL,
+        AttachmentState.INITIAL,
+        AttachmentState.SUCCESS,
+    ]
+    assert handlers.entered.count((AttachmentState.INITIAL, AttachmentState.CLIP_RL)) == 1
 
 
 def test_state_budget_stops_a_policy_that_never_finds_the_target():

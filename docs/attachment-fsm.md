@@ -91,6 +91,7 @@ clip RL.
 Command exactly one action from the post-CV policy session. Then obtain fresh evidence for:
 
 - `attachment_verified`;
+- `returned_to_neutral` from the policy/runtime;
 - `carabiner_grasped`;
 - `carabiner_visible`;
 - `alignment_degraded`;
@@ -99,7 +100,10 @@ Command exactly one action from the post-CV policy session. Then obtain fresh ev
 Verification should use the eventual sensor/CV/VLM fusion behind the adapter. A verified
 attachment succeeds. A visible, degraded alignment returns to CV. An invisible, ungrasped
 carabiner returns to RL search. A grasped carabiner stays with clip RL even when it occludes
-the detector.
+the detector. `returned_to_neutral` takes precedence: it returns to `INITIAL`, clears
+per-cycle action budgets and policy context, and takes a fresh initial observation. Do not
+infer neutral from elapsed steps; use the policy's completion signal or a configured,
+measured neutral-pose tolerance.
 
 ### `hold(reason)`
 
@@ -112,8 +116,9 @@ disconnects, and releases the lease.
 
 The CLI prints a JSON `AttachmentFSMResult` containing the terminal state, total and
 per-state action counts, elapsed time, and every actual state transition with its guard
-evidence. Configure action and time bounds through `AttachmentFSMConfig`; keep finite
-defaults in production.
+evidence. It also reports how many neutral resets occurred. Configure action and time
+bounds through `AttachmentFSMConfig`; keep finite defaults in production. A neutral reset
+clears per-cycle state budgets but never the lifetime action or wall-clock bound.
 
 The transition trace is evidence, not a resumable checkpoint. After interruption, never
 restore an FSM state and repeat its next action blindly. Observe the physical robot and
