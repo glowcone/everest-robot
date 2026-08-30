@@ -60,6 +60,9 @@ from everest_robot.robot.ports import clip_to_limits
 # lerobot import; from_deployment() reuses the fork's tables for everything else).
 FULL_TURN_DEG = 360.0
 WRAP_GRACE_DEG = 20.0
+# Longer than RobstrideMotorsBus's 20 ms state-cache TTL. Waiting before the enable
+# sample prevents a plausible cached value from satisfying the first-frame gate.
+ENABLE_FRESH_WAIT_S = 0.025
 
 
 def load_lerobot_mit() -> tuple[Any, Any, Any, Any, Any]:
@@ -279,10 +282,20 @@ class RobstrideMitPort:
             self._bus.sync_write("Kd", {name: kd for name, (_, kd) in self._gains.items()})
 
             self._flush_rx()
+            feedback_before = dict(self._bus.last_feedback_time)
+            time.sleep(ENABLE_FRESH_WAIT_S)
             problems: list[str] = []
             offsets = dict.fromkeys(self.joint_names, 0.0)
+            measured_deg: dict[str, float] = {}
             for name in self.joint_names:
                 raw = float(self._bus.read("Present_Position", name))
+                measured_deg[name] = raw
+                if not math.isfinite(raw):
+                    problems.append(f"{name} has no finite fresh position")
+                    continue
+                if self._bus.last_feedback_time.get(name) == feedback_before.get(name):
+                    problems.append(f"{name} did not provide fresh feedback before enable")
+                    continue
                 low, high = self._limits_deg[name]
                 low, high = low - WRAP_GRACE_DEG, high + WRAP_GRACE_DEG
                 if low <= raw <= high:
@@ -303,7 +316,20 @@ class RobstrideMitPort:
                 )
 
             self._turn_offsets_deg = offsets
-            self._bus.enable_torque()
+            # Robstride's enable frame carries no position target. Enable and immediately
+            # seed the MIT goal from the same fresh measured pose so no zero/default or
+            # previous-process target becomes the first commanded position.
+            try:
+                self._bus.enable_torque()
+                for name in self.joint_names:
+                    self._bus.write("Goal_Position", name, measured_deg[name])
+            except BaseException:
+                self._bus.disable_torque()
+                raise
+            corrected = [
+                measured_deg[name] + offsets[name] for name in self.joint_names
+            ]
+            self._last_positions_rad = self._frame.to_radians(corrected)
         self._lifecycle = ArmLifecycle.ENABLED
 
     def disable(self) -> None:
