@@ -18,9 +18,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from everest_robot.attachment_fsm import (
+    AttachmentAbort,
     AttachmentState,
     ClipRLStep,
     InitialObservation,
@@ -34,11 +35,11 @@ from everest_robot.domain import (
     RecoveryTarget,
     VerificationResult,
 )
-from everest_robot.robot.contracts import ArmLifecycle
+from everest_robot.robot.contracts import ArmLifecycle, TerminationReason
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from everest_robot.domain import ReplayRequest, ReplayResult
-    from everest_robot.robot.policy import PolicyHandle
+    from everest_robot.robot.policy import PolicyHandle, PolicySession, PolicyStep
     from everest_robot.robot.replay import ReplayControl
     from everest_robot.robot.session import RobotSession
 
@@ -129,61 +130,187 @@ class ScaffoldAttachmentFSMHandlers:
         self.hold_reasons.append(reason)
 
 
+@runtime_checkable
+class AttachmentPerception(Protocol):
+    """The fresh observations ADR-0003's gates are decided from.
+
+    Separate from the policy handlers because it fails separately: the learned half of
+    ``SEARCH_RL`` and ``CLIP_RL`` is a loaded checkpoint and a one-action session, while
+    every signal below is perception -- detection, attachment verification, grasp and
+    alignment. Keeping them apart means the policy path can be brought up and rehearsed on
+    a real arm while the perception fusion is still being built, and it makes the refusal
+    name exactly one missing subsystem.
+
+    Each method is called immediately after one physical action, and must report what is
+    true *now*. The FSM, not this protocol, decides what any of it means.
+    """
+
+    def preflight(self) -> None:
+        """Raise unless every gate below can be served. Called before the robot is claimed."""
+
+    def carabiner_detection(self) -> SearchRLStep: ...
+
+    def clip_observations(self) -> ClipRLStep: ...
+
+
+@dataclass(frozen=True)
+class UnavailableAttachmentPerception:
+    """The default: refuses, and says which subsystem is missing.
+
+    Refusing in :meth:`preflight` is what keeps the refusal cheap. A gate that cannot be
+    read is discovered before the lease is taken and before a motor is energized, never
+    after a learned action has already moved the arm.
+    """
+
+    def preflight(self) -> None:
+        raise NotImplementedError(
+            "no attachment perception is configured: SEARCH_RL needs a carabiner detector "
+            "and CLIP_RL needs attachment, grasp, visibility and alignment checks. The "
+            "learned half of both states is implemented -- pass a perception "
+            "implementation to attachment_fsm_handlers() to run them."
+        )
+
+    def carabiner_detection(self) -> SearchRLStep:
+        self.preflight()
+        raise AssertionError("unreachable")
+
+    def clip_observations(self) -> ClipRLStep:
+        self.preflight()
+        raise AssertionError("unreachable")
+
+
 @dataclass
 class EverestAttachmentFSMHandlers:
-    """Production integration surface for ADR-0003.
+    """ADR-0003's learned states, over an open robot session.
 
-    Every method deliberately refuses until its owning subsystem is integrated. Keeping
-    these stubs on the hardware adapter makes it impossible for orchestration to import a
-    camera, policy implementation, or motor driver directly.
+    ``SEARCH_RL`` and ``CLIP_RL`` are each one persistent
+    :class:`~everest_robot.robot.policy.PolicySession`. They stay separate even when both
+    are loaded from the same checkpoint, because classical vision physically intervenes
+    between them: an action chunk cached before CV moved the arm describes a pose the arm
+    has left. Entering either state re-seeds its own session and leaves the other alone.
+
+    Every step method performs at most one physical action, then reads the gate signals
+    fresh. The transition decision itself belongs to
+    :class:`~everest_robot.attachment_fsm.AttachmentFSM` and is deliberately not duplicated
+    here -- these methods report, they do not choose.
     """
 
     session: RobotSession
+    search_policy: PolicyHandle
+    clip_policy: PolicyHandle
+    perception: AttachmentPerception = field(default_factory=UnavailableAttachmentPerception)
+    task: str | None = None
+    fps: float | None = None
 
+    def __post_init__(self) -> None:
+        overrides: dict[str, object] = {"task": self.task}
+        if self.fps is not None:
+            overrides["fps"] = self.fps
+        self._sessions = {
+            AttachmentState.SEARCH_RL: self.session.policy_session(
+                self.search_policy, **overrides
+            ),
+            AttachmentState.CLIP_RL: self.session.policy_session(self.clip_policy, **overrides),
+        }
+
+    def policy_session_for(self, state: AttachmentState) -> PolicySession:
+        """The persistent session backing one learned state. For inspection and tests."""
+
+        return self._sessions[state]
+
+    # ── state entry ────────────────────────────────────────────────────────────────
     def enter_state(
         self, state: AttachmentState, previous: AttachmentState | None
     ) -> None:
+        """Re-seed the learned state being entered, from where the arm is standing now.
+
+        Nothing is commanded here, and the state being *left* is not held: on the paths
+        that leave a learned state, classical vision is about to command the arm, and an
+        interposed hold would fight it. The FSM holds on every terminal outcome and on any
+        exception, which is where a hold actually belongs.
+        """
+
         del previous
-        if state in {AttachmentState.SEARCH_RL, AttachmentState.CLIP_RL}:
-            raise NotImplementedError(
-                f"{state.value} entry needs a persistent one-action policy session that "
-                "resets from the current post-transition observation; do not emulate it "
-                "with PolicyRunner.run(max_steps=1)"
-            )
+        rollout = self._sessions.get(state)
+        if rollout is not None:
+            rollout.seed()
 
-    def observe_initial(self) -> InitialObservation:
-        raise NotImplementedError(
-            "INITIAL needs one coherent camera observation plus non-moving attachment "
-            "verification; integrate the detector and verifier here"
-        )
-
+    # ── the learned states ─────────────────────────────────────────────────────────
     def search_rl_step(self) -> SearchRLStep:
-        raise NotImplementedError(
-            "SEARCH_RL needs exactly one action from a persistent policy session followed "
-            "by a fresh carabiner detection; integrate the checkpoint loader and detector"
-        )
+        """One learned search action, then a fresh look for the carabiner."""
 
-    def search_cv_step(self) -> SearchCVStep:
-        raise NotImplementedError(
-            "SEARCH_CV needs one bounded VisualTracker tick driven by the calibrated pixel "
-            "map and must expose the CV follower's target_visible and followed signals"
-        )
+        step = self._advance(AttachmentState.SEARCH_RL)
+        detection = self.perception.carabiner_detection()
+        if step.termination is TerminationReason.COMPLETED and not detection.carabiner_detected:
+            # The search policy considers itself finished but nothing was found. Continuing
+            # would call a spent rollout until the budget ran out, which is a livelock
+            # dressed up as progress.
+            raise AttachmentAbort(
+                "the search policy signalled completion without detecting the carabiner"
+            )
+        return detection
 
     def clip_rl_step(self) -> ClipRLStep:
-        raise NotImplementedError(
-            "CLIP_RL needs one action from a freshly seeded persistent policy session, "
-            "then neutral-return, attachment, grasp, visibility, and alignment checks"
-        )
+        """One learned grasp/clip action, then fresh attachment and recovery checks.
+
+        UNVERIFIED ASSUMPTION -- confirm before running a trained checkpoint. This reads
+        "the policy returned to neutral" off :meth:`PolicyHandle.select_action` returning
+        ``None``, which the policy protocol already defines as "the policy considers the
+        task finished". The mapping was chosen so the FSM needs no second completion
+        channel, but it has not been confirmed against a real checkpoint on hardware, and a
+        scripted policy cannot confirm it: a fake exhibits whatever mapping its test
+        asserts. If the checkpoint signals neutral some other way, returns ``None`` for an
+        unrelated reason such as giving up, or returns to neutral silently, this is the line
+        to change. See ADR-0003, "Assumption pending verification", and the alternative it
+        names: a configured, measured neutral-pose tolerance read from joint feedback.
+        """
+
+        step = self._advance(AttachmentState.CLIP_RL)
+        if step.termination is TerminationReason.COMPLETED:
+            # ADR-0003 gives the neutral signal precedence over any same-step verification.
+            # The FSM goes back to INITIAL, which takes its own motion-free observation, so
+            # spending a perception call here would answer a question about to be asked
+            # again.
+            return ClipRLStep(attachment_verified=False, returned_to_neutral=True)
+        return self.perception.clip_observations()
 
     def hold(self, reason: str) -> None:
         del reason
         if self.session.port.lifecycle is ArmLifecycle.ENABLED:
             self.session.port.hold_current_position()
 
+    # ── helpers ────────────────────────────────────────────────────────────────────
+    def _advance(self, state: AttachmentState) -> PolicyStep:
+        """Take exactly one action, and turn a stopped rollout into an abort.
+
+        Cancellation and a motor fault are both ADR-0003 aborts rather than failures: the
+        attempt stopped for a reason outside the state machine's decisions, and the arm
+        needs a person to look at it before another attempt is authorized.
+        """
+
+        step = self._sessions[state].step()
+        if step.termination is TerminationReason.CANCELLED:
+            raise AttachmentAbort(f"{state.value} cancelled")
+        if step.termination is TerminationReason.FAILED:
+            detail = step.failure_detail or "no detail"
+            raise AttachmentAbort(f"{state.value} stopped: {step.failure_reason} -- {detail}")
+        return step
+
 
 @contextmanager
-def attachment_fsm_handlers(params: dict[str, Any]) -> Iterator[Any]:
-    """Build the standalone FSM handlers under the same deployment and lease boundary."""
+def attachment_fsm_handlers(
+    params: dict[str, Any],
+    *,
+    perception: AttachmentPerception | None = None,
+) -> Iterator[Any]:
+    """Build the standalone FSM handlers under the same deployment and lease boundary.
+
+    Ordering is the point, and it is the same ordering replay preflight uses: the policy
+    files are resolved and the perception gates are checked *before* the robot is claimed
+    or energized. A missing checkpoint, a malformed scripted policy or an unavailable
+    detector is a mistake anyone can make, and none of them should cost an energized arm to
+    discover.
+    """
 
     import os
 
@@ -196,11 +323,40 @@ def attachment_fsm_handlers(params: dict[str, Any]) -> Iterator[Any]:
     if backend != "hardware":
         raise ValueError(f"unknown robot backend {backend!r} (expected scaffold or hardware)")
 
+    from everest_robot.robot.policy import load_policy
+
+    search_path = params.get("search_policy")
+    clip_path = params.get("clip_policy")
+    missing = [
+        name
+        for name, value in (("search_policy", search_path), ("clip_policy", clip_path))
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            f"the hardware backend needs a policy file for each learned state; missing: "
+            f"{', '.join(missing)}"
+        )
+
+    # Search and clip are separate sessions even when this resolves to the same file
+    # twice: ADR-0003 requires separate carried state, not a shared handle.
+    search_policy = load_policy(search_path)
+    clip_policy = load_policy(clip_path)
+    checks = perception if perception is not None else UnavailableAttachmentPerception()
+    checks.preflight()
+
     from everest_robot.robot.deployment import open_session
 
     session = open_session()
     try:
-        yield EverestAttachmentFSMHandlers(session)
+        yield EverestAttachmentFSMHandlers(
+            session,
+            search_policy,
+            clip_policy,
+            perception=checks,
+            task=params.get("attachment_task"),
+            fps=None if params.get("policy_fps") is None else float(params["policy_fps"]),
+        )
     finally:
         session.close()
 

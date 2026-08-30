@@ -19,6 +19,21 @@ def main() -> None:
         action="store_true",
         help="scaffold only: INITIAL detects the carabiner before an RL search action",
     )
+    parser.add_argument(
+        "--search-policy",
+        help="SEARCH_RL policy file: a checkpoint, or a .json scripted policy (hardware only)",
+    )
+    parser.add_argument(
+        "--clip-policy",
+        help="CLIP_RL policy file: a checkpoint, or a .json scripted policy (hardware only)",
+    )
+    parser.add_argument(
+        "--policy-fps",
+        type=float,
+        default=None,
+        help="override the configured policy rate for both learned states",
+    )
+    parser.add_argument("--task", default=None, help="task string passed to both policies")
     parser.add_argument("--max-actions", type=int, default=1_000)
     parser.add_argument("--max-duration", type=float, default=180.0)
     args = parser.parse_args()
@@ -30,6 +45,10 @@ def main() -> None:
     params = {
         "backend": args.backend,
         "initial_detection": args.initial_detection,
+        "search_policy": args.search_policy,
+        "clip_policy": args.clip_policy,
+        "policy_fps": args.policy_fps,
+        "attachment_task": args.task,
     }
     with attachment_fsm_handlers(params) as handlers:
         result = AttachmentFSM(handlers, config).run()
