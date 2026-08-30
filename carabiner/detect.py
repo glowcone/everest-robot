@@ -86,7 +86,7 @@ def teal_score(bgr: np.ndarray) -> np.ndarray:
     # separates them -- measured L is ~148 on the anodised frame against ~38-57
     # on the fingers. The gate scales with the frame's own median so it tracks
     # exposure rather than pinning an absolute level.
-    return np.where(L > 0.55 * np.median(L), d, 0.0)
+    return np.where(0.55 * np.median(L) < L, d, 0.0)
 
 
 def chroma_mask(bgr: np.ndarray, hi: float = 5.0, lo: float = 3.0) -> np.ndarray:
@@ -230,7 +230,7 @@ def _spine(bgr, mask, outer, ap) -> tuple[tuple[float, float], float]:
 
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0]
-    dark = ((L < np.percentile(L[inside > 0], 25)) & (inside > 0) & (mask == 0)).astype(np.uint8)
+    dark = ((np.percentile(L[inside > 0], 25) > L) & (inside > 0) & (mask == 0)).astype(np.uint8)
     dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     # The gripper fingers are also dark and they overlap the hull on approach,
@@ -249,12 +249,9 @@ def _spine(bgr, mask, outer, ap) -> tuple[tuple[float, float], float]:
             best, best_area = i, st[i, cv2.CC_STAT_AREA]
 
     pts = outer.reshape(-1, 2).astype(np.float32)
-    if best is not None and best_area > 30:
-        gate = np.array(cent[best], np.float32)
-    else:
-        # No gate visible (occluded or blown out): fall back to the frame's
-        # long axis and take the side further from the aperture's short side.
-        gate = None
+    # None means no gate was visible (occluded or blown out); the caller then falls back
+    # to the aperture's offset from centre, which is a weaker cue for the same thing.
+    gate = np.array(cent[best], np.float32) if best is not None and best_area > 30 else None
 
     # Work in the carabiner's own axes. "Furthest from the gate centroid" picks
     # a diagonal corner, because the gate is a long bar whose centroid is also

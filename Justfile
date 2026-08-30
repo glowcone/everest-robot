@@ -122,8 +122,13 @@ cancel task_id:
         "SELECT absurd.cancel_task('${ROBOT_QUEUE:-robot}', '{{ task_id }}');"
 
 # ── replay ─────────────────────────────────────────────────────────────────────────
-# The numbered recipes are the ordered path to a powered replay. Run them in order;
-# docs/session-replay.md explains what each one proves.
+# The numbered recipes are the ordered path to a powered replay. Run them in order; step 0
+# is the smallest powered motion check, and docs/session-replay.md covers the rest.
+
+# 0. Raise one joint a little from its measured pose. Pass dry="--dry-run" to plan only.
+[group('replay')]
+raise delta="0.10" speed="0.25" dry="":
+    uv run robot-raise --delta-rad {{ delta }} --speed-scale {{ speed }} {{ dry }}
 
 # 1. Print the preflight report locally. Claims nothing, energizes nothing, needs no worker.
 [group('replay')]
