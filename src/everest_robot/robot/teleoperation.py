@@ -204,10 +204,12 @@ class TeleoperationController:
 
     def _run(self) -> None:
         period = 1.0 / self.rate_hz
+        last_step = time.perf_counter()
         try:
             while not self._stop.is_set() and self.follower.lifecycle is ArmLifecycle.ENABLED:
                 started = time.perf_counter()
                 if self.paused:
+                    last_step = started
                     self._stop.wait(min(period, 0.05))
                     continue
                 now = time.monotonic()
@@ -223,7 +225,13 @@ class TeleoperationController:
                 if lost:
                     raise RuntimeError(f"Star leader readings lost for servo(s) {lost}")
                 desired = self._mapped_targets(readings)
-                max_step = self.max_velocity_rad_s * period
+                # Clamp velocity against the measured tick time, not the nominal period:
+                # a tick that overran its period (bus contention with the TUI thread)
+                # must not slow the arm below the configured velocity. The cap keeps a
+                # stalled tick from turning into a jump.
+                dt = min(started - last_step, 4.0 * period)
+                last_step = started
+                max_step = self.max_velocity_rad_s * dt
                 command = tuple(
                     current + max(-max_step, min(max_step, target - current))
                     for current, target in zip(self._command, desired, strict=True)

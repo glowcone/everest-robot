@@ -39,10 +39,10 @@ config:
 # `goto-list` reads the configuration, `goto-dry` claims and validates without energizing,
 # and only `goto` moves.
 
-# Follow the Star leader at bounded speed while watching follower encoders. POWERED.
+# Follow the Star leader at bounded speed (rad/s) while watching follower encoders. POWERED.
 [group('robot')]
-monitor poll_hz="10":
-    uv run robot-monitor --poll-hz {{ poll_hz }}
+monitor poll_hz="10" max_velocity="0.25":
+    uv run robot-monitor --poll-hz {{ poll_hz }} --max-velocity {{ max_velocity }}
 
 # Watch encoders with follower torque disabled and no Star leader.
 [group('robot')]
