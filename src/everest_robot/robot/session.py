@@ -20,7 +20,7 @@ from everest_robot.robot.lease import InMemoryLease, RobotLease
 from everest_robot.robot.lerobot_bridge import JointFrame, RobotBridgeCore
 from everest_robot.robot.motion import JointMotionController
 from everest_robot.robot.parameters import RobotParameters
-from everest_robot.robot.policy import PolicyRunner
+from everest_robot.robot.policy import PolicyHandle, PolicyRunner, PolicySession
 from everest_robot.robot.ports import ArmPort
 from everest_robot.robot.recording import SessionRecorder
 
@@ -164,6 +164,23 @@ class RobotSession:
                 recorder=self.recorder,
             )
         return self._policy
+
+    def policy_session(self, handle: PolicyHandle, **overrides: object) -> PolicySession:
+        """Open a rollout this session's caller advances one action at a time.
+
+        Not cached: a state machine that alternates between learned states needs one
+        session per state, because each has its own carried policy state. Seeding and
+        closing belong to whoever asked for it.
+        """
+
+        self._require_open()
+        settings: dict[str, object] = {
+            "clock": self.clock,
+            "heartbeat": self.heartbeat,
+            "cancel": self.cancel,
+        }
+        settings.update(overrides)
+        return PolicySession(self.bridge, self.parameters, handle, **settings)  # type: ignore[arg-type]
 
     def snapshot(self) -> JointState:
         """Current joint state, for deciding whether a physical effect already happened.
