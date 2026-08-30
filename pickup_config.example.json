@@ -1,0 +1,26 @@
+{
+  "image_points_px": [
+    [735.5, 426.4],
+    [1299.6, 435.3],
+    [1302.1, 889.8],
+    [740.0, 887.0]
+  ],
+  "robot_points_m": [
+    [0.30, -0.10],
+    [0.30, 0.10],
+    [0.50, 0.10],
+    [0.50, -0.10]
+  ],
+  "carabiner_center_from_marker_midpoint_m": [0.0, 0.0],
+  "grasp_offset_from_carabiner_m": [0.0, -0.030],
+  "grasp_yaw_offset_deg": 90.0,
+  "z_pregrasp_m": 0.120,
+  "z_grasp_m": 0.025,
+  "z_lift_m": 0.140,
+  "canonical_pose": {
+    "x": 0.400,
+    "y": 0.000,
+    "z": 0.140,
+    "yaw_deg": 0.0
+  }
+}

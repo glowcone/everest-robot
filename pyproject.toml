@@ -11,6 +11,7 @@ dependencies = [
     # robot control host just to read joint angles.
     "huggingface-hub>=0.30",
     "numpy>=2.0",
+    "opencv-python>=5.0",
     "pyarrow>=17.0",
     "pyyaml>=6.0",
 ]
@@ -33,6 +34,8 @@ robot-replay-preflight = "everest_robot.client:replay_preflight"
 robot-config = "everest_robot.client:show_config"
 robot-monitor = "everest_robot.monitor:main"
 robot-db-init = "everest_robot.database:init"
+robot-two-white-black-debug = "everest_robot.two_white_black_debug:main"
+robot-two-white-black-live = "everest_robot.two_white_black_live:main"
 
 [dependency-groups]
 dev = [

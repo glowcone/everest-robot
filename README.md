@@ -34,6 +34,14 @@ just config     # what this deployment will actually do
 result. It touches no hardware and no database, so it is the first thing to run when
 something is configured but not behaving.
 
+### Carabiner marker vision
+
+The fixed overhead camera can locate the carabiner from two white tape markers and its
+black gate. The debug commands only read the camera and print or draw image-space points;
+they never command the robot. See [`docs/carabiner-marker-vision.md`](docs/carabiner-marker-vision.md)
+for the one-frame and continuous commands, ROI setup, output meanings, and optional
+pixel-to-robot configuration.
+
 ### The two workflows
 
 | Task | Spawn it with | What it does |
@@ -220,7 +228,8 @@ The hardware backend is intentionally partial. It currently provides the exclusi
 lease and session, Maker Arm connection, bounded motion to approved named positions, and
 the policy rollout runner. It does **not** yet provide:
 
-- carabiner CV localization or GraspNet pickup;
+- integration of the standalone carabiner CV target into the hardware workflow, or
+  GraspNet pickup;
 - a policy factory that loads the requested RL/VLA checkpoint; or
 - attachment verification using sensors, CV, or a VLM.
 
