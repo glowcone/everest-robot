@@ -65,6 +65,13 @@ def main() -> None:
         default=None,
         help="override the configured policy rate for both learned states",
     )
+    parser.add_argument(
+        "--search-cv",
+        choices=("fixed", "wrist"),
+        default=None,
+        help="which camera SEARCH_CV closes its loop on: the bench camera's pixel map or "
+        "the wrist camera's image Jacobian (default from EVEREST_SEARCH_CV, else fixed)",
+    )
     parser.add_argument("--task", default=None, help="task string passed to both policies")
     parser.add_argument("--max-actions", type=int, default=1_000)
     parser.add_argument("--max-duration", type=float, default=180.0)
@@ -83,6 +90,7 @@ def main() -> None:
         "clip_policy": args.clip_policy,
         "policy_fps": args.policy_fps,
         "attachment_task": args.task,
+        "search_cv": args.search_cv,
         "policy_device": args.device,
         "temporal_ensemble_coeff": None if args.no_temporal_ensemble else 0.01,
         "allow_unverified_attachment": args.no_attachment_verification,

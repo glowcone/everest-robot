@@ -1,22 +1,54 @@
-"""Lease-local Star 102 leader following for the calibration monitor.
+"""Lease-local Star 102 leader following, and the park that has to follow it.
 
 The caller owns the follower's :class:`RobotSession` and therefore its lease.  This
 module opens only the leader bus and drives that already-claimed follower; it must never
 construct a second arm or claim.  Leader positions are mapped with maker-arm-sdk's
 private-protocol Star mapping, not LeRobot's MIT/degree frame.
+
+:func:`park_at_start_pose` belongs here rather than in either CLI because it is the other
+half of :meth:`TeleoperationController.connect_and_measure`: that method is the only thing
+that records where the arm was before it was energized, and every caller that enables the
+follower owes the operator a drive back to it before torque comes off.  Both
+``robot-monitor`` and ``robot-pixel-map collect`` call it; a third caller that follows a
+leader must too.
 """
 
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from everest_robot.robot.contracts import ArmLifecycle
-from everest_robot.robot.ports import ArmPort
+from everest_robot.robot.contracts import ArmLifecycle, MotionProfile
+from everest_robot.robot.ports import ArmPort, clip_to_limits
+
+if TYPE_CHECKING:
+    from everest_robot.robot.session import RobotSession
+
+# Every powered session ends by driving the follower back to the pose it was measured at
+# before it was enabled, and only then releasing torque. Reduced speed for `robot-goto`'s
+# reason: the leader may have walked the arm a long way from where it started, and this
+# interpolation is a direct one with no obstacle avoidance behind it.
+PARK_SPEED_SCALE = 0.25
+PARK_TARGET_NAME = "teleoperation-start"
+
+# How far outside the soft limits a start pose may sit and still be parked at the nearest
+# in-limit pose instead of being refused outright.
+#
+# It is not slack in the limits: nothing is ever commanded outside them. It is the width of
+# the disagreement the drivers already contain. `RobstrideMitPort.enable()` accepts a joint
+# reading up to WRAP_GRACE_DEG (20 deg, mirroring MakerFollower) outside its soft limits
+# before it looks for a whole-turn wrap, so an arm resting under gravity -- shoulder_lift
+# and elbow_flex drooped past their bounds -- energizes normally and then reports a pose
+# `JointMotionController` must refuse as a target. That refusal used to cost the whole park.
+# Beyond this width the pose is not a droop and is refused as before: 20 deg of gravity is a
+# resting arm, 4 rad is a joint that no longer means what the calibration says it means.
+PARK_LIMIT_TOLERANCE_RAD = math.radians(20.0)
 
 
 class LeaderPort(Protocol):
@@ -136,6 +168,8 @@ class TeleoperationController:
         self._command: tuple[float, ...] = ()
         self._start_pose: tuple[float, ...] = ()
         self._clamped: tuple[str, ...] = ()
+        self._sustained: tuple[str, ...] = ()
+        self._excursion_joints: tuple[str, ...] = ()
         self._out_of_range_since: float | None = None
         self.error: str | None = None
 
@@ -154,6 +188,33 @@ class TeleoperationController:
         """
 
         return self._clamped
+
+    @property
+    def sustained_excursions(self) -> tuple[str, ...]:
+        """Clamped joints that have stayed clamped for ``out_of_range_timeout_s``.
+
+        A louder grade of :attr:`clamped_joints`, not a different condition, and never a
+        reason to stop: the follower is held inside its own limits either way. It exists
+        because a leader joint parked past the follower's travel looks exactly like a dead
+        joint -- the follower simply does not move -- and an operator who has been pushing
+        for two seconds deserves to be told which joint is not coming with them.
+
+        Live, like :attr:`clamped_joints`: it empties when the leader comes back.
+        :attr:`excursion_joints` is the record that survives.
+        """
+
+        return self._sustained
+
+    @property
+    def excursion_joints(self) -> tuple[str, ...]:
+        """Every joint that has had a sustained excursion this session, in first-seen order.
+
+        Reported once when the session ends. A joint that appears here repeatedly across
+        sessions is the Star mapping, not the operator: see the wrist_flex note in
+        :meth:`_mapped_targets`.
+        """
+
+        return self._excursion_joints
 
     @property
     def running(self) -> bool:
@@ -220,6 +281,7 @@ class TeleoperationController:
         else:
             self._paused.set()
             self._clamped = ()
+            self._sustained = ()
             self._out_of_range_since = None
             self.follower.hold_current_position()
             state = self.follower.read_state()
@@ -275,12 +337,13 @@ class TeleoperationController:
                 self._clamped = out_of_range
                 if not out_of_range:
                     self._out_of_range_since = None
+                    self._sustained = ()
                 elif self._out_of_range_since is None:
                     self._out_of_range_since = now
                 elif now - self._out_of_range_since > self.out_of_range_timeout_s:
-                    raise RuntimeError(
-                        "Star mapping stayed outside follower limits for "
-                        f"{self.out_of_range_timeout_s:g}s: {', '.join(out_of_range)}"
+                    self._sustained = out_of_range
+                    self._excursion_joints = tuple(
+                        dict.fromkeys(self._excursion_joints + out_of_range)
                     )
                 # Clamp velocity against the measured tick time, not the nominal period:
                 # a tick that overran its period (bus contention with the TUI thread)
@@ -306,6 +369,7 @@ class TeleoperationController:
             self._stop.set()
         finally:
             self._clamped = ()
+            self._sustained = ()
             if self.follower.lifecycle is ArmLifecycle.ENABLED:
                 self.follower.hold_current_position()
 
@@ -317,11 +381,18 @@ class TeleoperationController:
         Every joint is clamped into the follower's limits; the second element names the
         arm joints that needed it, and the callers decide what that means. Before the
         follower is enabled a single excursion is fatal -- the fixed Star mapping should
-        never produce one, so it means the mapping or the frame is wrong. Once following,
-        it is the operator: a leader arm has reach and a wrist range the follower does
-        not, so walking it past the edge is ordinary, and killing a calibration session
-        for it would be worse than holding the follower at the limit until the leader
-        comes back. A sustained excursion is still the mapping, so the loop times it.
+        never produce one from the pose the arms are actually standing in, so it means the
+        mapping or the frame is wrong. Once following, an excursion is ordinary and never
+        stops the session, however long it lasts: the follower is held at the soft limit
+        until the leader comes back, and the loop only escalates how loudly it says so
+        (:attr:`clamped_joints`, then :attr:`sustained_excursions`).
+
+        It is ordinary because the fixed mapping does not give every joint headroom on
+        both sides. wrist_flex is the worst: its ``base_rad`` (2.122) is *exactly* the
+        follower's upper soft limit, so every Star reading below the mapping's zero_deg
+        maps out of range from the first degree. Half that joint's leader travel is
+        unreachable by construction, and treating it as evidence of a broken mapping ended
+        calibration sessions over a pose the arm could hold perfectly well.
 
         Joints in ``clamp_joints`` (the gripper) are clamped without being reported:
         closing a MakerMod gripper deliberately commands a position past the object so
@@ -350,3 +421,171 @@ class TeleoperationController:
                     out_of_range.append(limit.name)
             targets.append(target)
         return tuple(targets), tuple(out_of_range)
+
+
+# ── parking the arm before torque comes off ────────────────────────────────────────
+def park_at_start_pose(session: RobotSession, controller: TeleoperationController) -> None:
+    """Drive the follower back to its pre-teleoperation pose before torque comes off.
+
+    :meth:`RobotSession.close` disables the arm on every exit path, so whichever pose the
+    leader left the follower in is the pose it goes limp from. That is fine where the
+    operator parked it and nowhere else, which is why this runs on the failure paths and
+    not only on a clean quit: a leader-loss or sustained-excursion stop is precisely when
+    the arm is somewhere it must not simply be dropped from.
+
+    Skipping this does not leave the arm where it was -- it leaves it wherever gravity
+    takes it, fast, and because ``start_pose`` was measured with the torque already off
+    that is *almost exactly this pose*. A missing park therefore looks like a working one
+    that happens to be instant, which is how ``robot-pixel-map collect`` went without one
+    for as long as it did. Any caller that enables the follower needs this.
+
+    Reported, never raised. The teleoperation error is the one the operator has to see,
+    and a park that could not run must not replace it in the traceback. Whatever happens
+    the arm is left held rather than moving -- ``JointMotionController`` holds on every
+    failure path of its own -- so a failure here costs the parking, not the safety.
+    """
+
+    from everest_robot.robot.contracts import FailureReason
+
+    start = controller.start_pose
+    if not start:
+        return  # the leader was never measured, so the arm was never enabled
+    if session.port.lifecycle is not ArmLifecycle.ENABLED:
+        # Disabled or faulted under the driver's own policy. There is nothing to command,
+        # and saying so beats a silent skip: the arm is wherever it stopped.
+        print(
+            f"not returning to the starting pose: the arm is {session.port.lifecycle.value}",
+            file=sys.stderr,
+        )
+        return
+
+    start = _parkable(session, start)
+    profile = _park_profile(session, controller, start)
+    print(
+        "returning the arm to the pose it started from at "
+        f"{profile.max_velocity_rad_s:.3f} rad/s "
+        f"(about {_planned_park_s(session, start, profile):.0f}s)...",
+        file=sys.stderr,
+    )
+    try:
+        # speed_scale is already baked into the profile; scaling twice would halve it again.
+        result = session.motion.go_to_joint_target(PARK_TARGET_NAME, start, profile=profile)
+    except BaseException as error:  # including a second Ctrl-C during the park
+        print(
+            f"return to the starting pose FAILED  {type(error).__name__}: {error}\n"
+            "the arm is held where it is and torque is about to come off; support it.",
+            file=sys.stderr,
+        )
+        return
+
+    if result.failure_reason is not None:
+        detail = result.failure_detail
+        if result.failure_reason is FailureReason.LIMIT_VIOLATION:
+            # `_parkable` already accepted everything within PARK_LIMIT_TOLERANCE_RAD, so
+            # this pose is further out than a resting arm can droop: a re-zeroed or wrapped
+            # joint. Not something to clamp our way past.
+            detail = (
+                f"{detail} -- further outside them than a resting arm can droop, so the "
+                "arm's limits are not the ones it started under"
+            )
+        print(
+            f"return to the starting pose FAILED  {result.failure_reason}: {detail}\n"
+            "the arm is held where it is and torque is about to come off; support it.",
+            file=sys.stderr,
+        )
+    elif result.already_at_target:
+        print("already at the pose it started from; the arm did not move.", file=sys.stderr)
+    else:
+        print(
+            f"back at the starting pose after {result.elapsed_s:.2f}s "
+            f"(max tracking error {result.max_tracking_error_rad:.4f} rad).",
+            file=sys.stderr,
+        )
+
+
+def _parkable(session: RobotSession, start: Sequence[float]) -> tuple[float, ...]:
+    """The start pose, or the nearest in-limit pose to it, or the start pose unchanged.
+
+    The pose the arm was measured at is not necessarily a pose the arm may be *commanded*
+    to: `enable()` admits a joint drooped up to its wrap grace past a soft limit, and
+    `JointMotionController` refuses any target outside them. A gravity-loaded arm is the
+    ordinary case, not an exotic one, so refusing the whole park over it means the powered
+    session ends with no park at all -- the arm going limp from wherever the leader left it,
+    which is the failure this module exists to prevent.
+
+    So park at the limit instead, and say so. The arm then settles the last few degrees when
+    torque comes off, landing where it started: a short, bounded drop from a held pose, and
+    strictly better than the full one. Past PARK_LIMIT_TOLERANCE_RAD nothing is clamped and
+    the pose is returned untouched, for the motion controller to refuse and report.
+    """
+
+    command = clip_to_limits(start, session.port.limits())
+    if not command.clipped_joints:
+        return tuple(float(value) for value in start)
+
+    excess = max(
+        abs(clipped - measured)
+        for clipped, measured in zip(command.targets, start, strict=True)
+    )
+    if excess > PARK_LIMIT_TOLERANCE_RAD:
+        return tuple(float(value) for value in start)
+
+    print(
+        f"the pose it started from is {math.degrees(excess):.1f} deg outside the soft "
+        f"limits on {', '.join(command.clipped_joints)}; parking at the nearest in-limit "
+        "pose instead -- the arm settles the rest of the way when torque comes off.",
+        file=sys.stderr,
+    )
+    return command.targets
+
+
+def _park_profile(
+    session: RobotSession,
+    controller: TeleoperationController,
+    start: Sequence[float],
+) -> MotionProfile:
+    """The bounds the park runs under: slow, and given the time to actually be slow.
+
+    Two ceilings, whichever is lower. ``PARK_SPEED_SCALE`` of the configured motion
+    defaults is ``robot-goto``'s reason -- this is a direct joint-space interpolation with
+    nothing avoiding obstacles, and the leader may have walked the arm a long way from
+    where it started. The controller's own ``max_velocity_rad_s`` is the second: it is the
+    speed the operator has watched this arm move at for the whole session, and the park is
+    not the moment to exceed it.
+
+    The timeout is derived from the planned trajectory rather than taken from the file.
+    Scaling a profile scales its velocity and acceleration and leaves ``timeout_s`` alone,
+    so a slow-enough park is one the fixed timeout cannot finish: at 0.125 rad/s a 10 s
+    budget buys about 1.2 rad of travel, and a longer park would fail partway and then be
+    disabled wherever it had got to. That would make speed and completion trade against
+    each other, and the speed is the part that is not negotiable.
+    """
+
+    defaults = session.parameters.motion_defaults
+    # scaled() rejects anything above 1.0, so the controller's cap can only slow this down.
+    scale = min(PARK_SPEED_SCALE, controller.max_velocity_rad_s / defaults.max_velocity_rad_s)
+    profile = defaults.scaled(min(1.0, max(scale, 1e-3)))
+    planned = _planned_park_s(session, start, profile)
+    # Half again over the plan, plus the settle window and a second of slack, so the budget
+    # still catches an arm that is not tracking rather than one that is merely taking the
+    # time it was told to take.
+    return replace(
+        profile,
+        timeout_s=max(defaults.timeout_s, 1.5 * planned + profile.settle_time_s + 1.0),
+    )
+
+
+def _planned_park_s(
+    session: RobotSession, start: Sequence[float], profile: MotionProfile
+) -> float:
+    """How long the park is supposed to take from where the arm is standing now."""
+
+    from everest_robot.robot.motion import TrapezoidPath
+
+    state = session.port.read_state()
+    if not state.all_finite:
+        return 0.0
+    displacement = max(
+        abs(target - current) for target, current in zip(start, state.positions, strict=True)
+    )
+    return TrapezoidPath.plan(displacement, profile).duration_s

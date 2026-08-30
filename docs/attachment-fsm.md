@@ -14,9 +14,9 @@ just attach-fsm-fake --skip-cv
 
 `just attach-fsm` selects the hardware adapter. Every state now has an implementation:
 the learned states load a policy (`--search-policy`, `--clip-policy`) and step it one action
-at a time through a persistent `PolicySession`; `SEARCH_CV` drives the fixed camera and the
-calibrated pixel map; and `INITIAL` plus the gate signals `CLIP_RL` reads come from the
-wrist-camera detector behind `CarabinerVisionPerception`.
+at a time through a persistent `PolicySession`; `SEARCH_CV` drives one of two cameras
+(`--search-cv fixed|wrist`, below); and `INITIAL` plus the gate signals `CLIP_RL` reads come
+from the wrist-camera detector behind `CarabinerVisionPerception`.
 
 Two things it still cannot do, and says so rather than guessing:
 
@@ -166,8 +166,8 @@ The reader is strict for the same reason `ReplayRequest.from_json` is: a misspel
 that silently took a default would move a real arm along a sequence nobody wrote. Unknown
 fields are rejected, every action must match `action_features` exactly, and non-finite
 values are refused. Both files are resolved **before** the robot is claimed, so a missing or
-malformed policy costs no lease. The pixel map `SEARCH_CV` servos on is loaded and checked
-against the connected arm in the same window, for the same reason.
+malformed policy costs no lease. Whichever calibration `SEARCH_CV` servos on is loaded and
+checked against the connected arm in the same window, for the same reason.
 
 ## Handler contract
 
@@ -187,8 +187,11 @@ Implemented. Entry into `SEARCH_RL` and `CLIP_RL` re-seeds that state's own
 select the same checkpoint, but they are separate sessions because CV physically moves the
 arm between them, and entering one leaves the other alone.
 
-Entry into `SEARCH_CV` builds a fresh `CarabinerFollower` and calls `start()` on it, and
-entry into anything else stops and discards the one that was running. The follower's
+Entry into `SEARCH_CV` builds a fresh follower -- whichever of the two is configured -- and
+calls `start()` on it, and entry into anything else stops and discards the one that was
+running. `VisualTracker.start()` is re-callable and enables only from `CONNECTED`, because
+the arm is still energized from the state just left and both drivers refuse `enable()` from
+`ENABLED`. The follower's
 lock-on count and its tracker command are seeded from joint feedback, and both are stale
 the moment a policy moves the arm, so this is a rebuild rather than a resume. The fixed
 camera itself is opened once per attempt and released by `close()`; re-opening it would
@@ -252,8 +255,28 @@ progress.
 
 ### `search_cv_step()`
 
-Implemented. One step is one `CarabinerFollower.step()`
-(`robot/carabiner_follower.py`), which is one detector/calibration/servo tick:
+Implemented, in two interchangeable forms. One step is one `step()` on whichever follower
+is configured, and both return the same `FollowTick`, so the handler and the FSM cannot
+tell them apart. Pick one with `--search-cv` or `EVEREST_SEARCH_CV`; exactly one
+calibration is loaded, and supplying both is refused.
+
+| | `fixed` (default) | `wrist` |
+| --- | --- | --- |
+| camera | bench camera, bolted down | wrist camera, moves with the arm |
+| calibration | `robot-pixel-map`, `EVEREST_PIXEL_MAP` | `robot-wrist-servo`, `EVEREST_WRIST_SERVO` |
+| evidence | ~30 taught (pixel, pre-grasp pose) pairs | one image Jacobian bumped out at the goal pose |
+| loop | open loop onto a looked-up pose | closed loop on the image |
+| valid where | inside the taught convex hull | anywhere the wrist camera can see the carabiner |
+| watch it alone | `just pixel-track` | `just wrist-centre`, then `just wrist-track` |
+
+Choose `wrist` when no bench camera can be placed, or when the carabiner lands outside the
+region somebody taught. Choose `fixed` when it does not: the map encodes pre-grasp directly,
+so there is no image loop to converge and arrival is one move rather than several.
+
+#### `fixed` -- the bench camera and the pixel map
+
+One `CarabinerFollower.step()` (`robot/carabiner_follower.py`), which is one
+detector/calibration/servo tick:
 
 1. Read the fixed camera and detect the carabiner in that frame.
 2. Convert the accepted centroid through the calibrated pixel map
@@ -294,6 +317,62 @@ that pixel, so it reads as *the gripper is standing where a carabiner this many 
 would have put it*, in the same units as the hull margin and the jump gate. It is derived
 from the fit and inherits the fit's errors; it is not independent evidence about where the
 gripper physically is.
+
+#### `wrist` -- the wrist camera and the image Jacobian
+
+One `WristCarabinerFollower.step()` (`robot/wrist_follower.py`). There is no map to look a
+pose up in, because a wrist pixel names a direction relative to the gripper rather than a
+place on the bench, so the loop is closed in the image instead:
+
+1. Read the wrist camera **through the session's `CameraRuntime`** -- never a second
+   `VideoCapture`; the policy already holds that device -- and run
+   `everest_robot.carabiner_detect` on the frame.
+2. Reduce the detection to four features: the insertion point `u, v`, `scale_px`
+   (`sqrt(area)`, the only proxy a monocular camera has for range), and `spine_deg`.
+3. Difference against the goal image taught by `robot-wrist-servo teach`, and ask
+   `WristServoCalibration.solve()` for the joint step that removes the difference: damped
+   least squares in tolerance-normalized feature space, so the stopping test and the
+   objective agree and pixels are not silently weighed against degrees.
+4. Apply that step over the measured pose -- untaught joints hold -- and pass it, or `None`,
+   to one `VisualTracker.tick()`.
+
+The calibration is a derivative measured at one pose, so away from the goal it gives a
+direction rather than a step. That is enough for a servo whose step size the tracker clamps
+anyway, and a solve asking for more than `max_delta_rad` on any joint is **refused** rather
+than clamped: a clamp would turn "this Jacobian cannot answer that" into a small, confident
+move in a possibly wrong direction. A refused solve holds the arm and stays *visible*, the
+same standing an out-of-hull detection has on the fixed path.
+
+The three judgements are the same three, with two differing in substance:
+
+- **Loss.** Identical rule. But handing back to `SEARCH_RL` *means* something here: the
+  wrist camera lost the carabiner because of where the arm is pointing, and moving the arm
+  is precisely the remedy. On the fixed path it is closer to a formality.
+- **`followed`.** The *image* is inside tolerance on every feature for `settle_ticks`
+  consecutive ticks. Stronger than the fixed path's version, not weaker: there, arrival is
+  the arm reaching a pose the map predicted, and whether that pose is above the carabiner is
+  the fit's problem. Here the servo error is a direct measurement. A frame with no detection
+  cannot support the claim and resets the count.
+- **Pacing.** Identical, and for the identical reason.
+
+At the goal the commanded target is `None` -- a hold. Nudging at the detector's noise floor
+would walk the handed-over pose around while reporting that it had arrived.
+
+`confidence` is `None` for the same reason as on the fixed path. `pixel_error` here is
+simply the distance from the goal insertion point, measured rather than inverted through a
+fit, and `hull_margin_px` is `None` because a derivative has no sampled region to be inside
+of.
+
+To debug this loop in isolation, use `just wrist-centre` before `just wrist-track`: it
+servos the spine midpoint to the frame centre with range and rotation held out, which is
+the form whose result can be checked by eye against the detector's overlay. See
+`docs/wrist-servo-calibration.md`.
+
+The calibration is verified against the connected arm and against `EVEREST_CAMERAS` when
+the handlers are built -- after the claim, because the camera runtime does not exist before
+it, but before anything is energized.
+
+#### Both forms
 
 An arm fault, lost feedback or a refused command raises `TrackerStopped` out of the tracker
 after it has held the arm, and the handler turns that into `AttachmentAbort`.

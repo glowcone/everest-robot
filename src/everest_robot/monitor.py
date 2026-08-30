@@ -9,7 +9,8 @@ However a powered session ends -- ``q``, Ctrl-C, or a teleoperation failure -- t
 driven back to the pose it was measured at before it was enabled and only then disabled.
 Cutting torque wherever the leader happened to leave the follower drops the arm from an
 arbitrary pose; the pose the operator parked it at is the one place it is known to rest
-under no power.  See :func:`_return_to_start`.
+under no power.  See :func:`~everest_robot.robot.teleoperation.park_at_start_pose`, which
+``robot-pixel-map collect`` shares.
 
 It does claim the robot lease, and that is not incidental. Reading feedback from a merely
 connected arm makes the driver poll the bus (``MakerArmPort.read_state`` refreshes when
@@ -56,13 +57,6 @@ _NEEDS_TEMP = _NEEDS_VEL + _TEMP_W
 _NEEDS_TORQUE = _NEEDS_TEMP + _TORQUE_W
 _BAR_W = 18
 _NEEDS_BAR = _NEEDS_TORQUE + _BAR_W
-
-# Every powered session ends by driving the follower back to the pose it was measured at
-# before it was enabled, and only then releasing torque. Reduced speed for `robot-goto`'s
-# reason: the leader may have walked the arm a long way from where it started, and this
-# interpolation is a direct one with no obstacle avoidance behind it.
-RETURN_SPEED_SCALE = 0.25
-RETURN_TARGET_NAME = "teleoperation-start"
 
 # The keys, once. The footer is derived from the short labels and the help overlay from
 # the long ones, so a binding cannot be added to the loop and forgotten in the guide.
@@ -238,6 +232,7 @@ def _draw(
     paused: bool,
     captured: int | None = None,
     clamped: Sequence[str] = (),
+    unreachable: Sequence[str] = (),
 ) -> None:
     screen.erase()
     _, width = screen.getmaxyx()
@@ -270,7 +265,15 @@ def _draw(
         screen,
         2,
         0,
-        _status_line(monitor, sample, context, paused=paused, captured=captured, clamped=clamped),
+        _status_line(
+            monitor,
+            sample,
+            context,
+            paused=paused,
+            captured=captured,
+            clamped=clamped,
+            unreachable=unreachable,
+        ),
         palette.warn
         if paused
         or clamped
@@ -297,6 +300,7 @@ def _status_line(
     paused: bool,
     captured: int | None,
     clamped: Sequence[str],
+    unreachable: Sequence[str] = (),
 ) -> str:
     """The line under the header: what the session is doing, right now.
 
@@ -304,6 +308,11 @@ def _status_line(
     they meant to keep was taken; a clamped joint is likewise invisible, because the
     follower simply stops moving while the leader keeps going. Naming the joint is the
     difference between "the arm is stuck" and "that joint is at the end of its travel".
+
+    A joint that has been clamped for seconds rather than an instant is promoted from
+    CLAMPED to OUT OF REACH, and CLAMPED drops it: the operator is no longer overshooting,
+    they are somewhere the follower cannot follow, and saying it twice in one line only
+    makes the important half harder to find.
     """
 
     reference = "reference marked" if monitor.reference is not None else "no reference"
@@ -315,8 +324,11 @@ def _status_line(
     ]
     if paused:
         parts.append("FOLLOW PAUSED")
-    if clamped:
-        parts.append(f"CLAMPED: {', '.join(clamped)}")
+    still_moving = [name for name in clamped if name not in set(unreachable)]
+    if still_moving:
+        parts.append(f"CLAMPED: {', '.join(still_moving)}")
+    if unreachable:
+        parts.append(f"OUT OF REACH: {', '.join(unreachable)}")
     if captured is not None:
         parts.append(f"POSE HELD (sample {captured})")
     return "  ·  ".join(parts)
@@ -380,7 +392,8 @@ def _mode_guide(context: MonitorContext) -> tuple[str, ...]:
             "This process holds the robot lease, so no worker can run.",
             "A leader pose the follower cannot reach is held at the soft limit and",
             "named as CLAMPED above; bring the leader back and following resumes.",
-            "Staying out of range stops the session, because that is the mapping.",
+            "Stay there and it becomes OUT OF REACH: that joint's leader travel is",
+            "wider than this arm's, which is normal and never stops the session.",
             "HOWEVER following ends -- q, a stop, or Ctrl-C -- the arm is then driven",
             "back to the pose it was measured at before it was enabled, at reduced",
             "speed and in a straight joint-space line with nothing avoiding obstacles.",
@@ -493,6 +506,7 @@ def run_tui(
                 paused=paused,
                 captured=None if captured is None else captured.index,
                 clamped=() if controller is None else controller.clamped_joints,
+                unreachable=() if controller is None else controller.sustained_excursions,
             )
             if controller is not None and controller.error:
                 return captured
@@ -578,8 +592,8 @@ def main() -> None:
         "--out-of-range-timeout",
         type=float,
         default=2.0,
-        help="seconds the leader may map outside the follower's soft limits before "
-        "following stops; shorter excursions are clamped and shown as CLAMPED",
+        help="seconds a joint may map outside the follower's soft limits before it is "
+        "called out as OUT OF REACH rather than CLAMPED. Never stops following.",
     )
     parser.add_argument("--sync-threshold", type=float, default=0.8)
     parser.add_argument(
@@ -643,6 +657,7 @@ def _run_session(
             Star102LeaderPort,
             TeleoperationController,
             load_star_mapper,
+            park_at_start_pose,
         )
 
         star_port = args.star_port or os.environ.get("EVEREST_STAR_PORT")
@@ -681,73 +696,29 @@ def _run_session(
             try:
                 controller.close()
             finally:
-                _return_to_start(session, controller)
-        if controller.error:
-            raise SystemExit(f"teleoperation stopped: {controller.error}")
+                park_at_start_pose(session, controller)
+        _report_teleoperation(controller)
         return captured
 
 
-def _return_to_start(session: RobotSession, controller: TeleoperationController) -> None:
-    """Drive the follower back to its pre-teleoperation pose before torque comes off.
+def _report_teleoperation(controller: TeleoperationController) -> None:
+    """Say how following ended, and never turn that into the process's exit.
 
-    ``RobotSession.close()`` disables the arm on every exit path, so whichever pose the
-    leader left the follower in is the pose it goes limp from. That is fine where the
-    operator parked it and nowhere else, which is why this runs on the failure paths and
-    not only on ``q``: a leader-loss or sustained-excursion stop is precisely when the arm
-    is somewhere it must not simply be dropped from.
-
-    Reported, never raised. The teleoperation error is the one the operator has to see,
-    and a return that could not run must not replace it in the traceback. Whatever happens
-    the arm is left held rather than moving -- ``JointMotionController`` holds on every
-    failure path of its own -- so a failure here costs the parking, not the safety.
+    A stop is not a failed session. The arm has already been parked and is about to be
+    released, and a pose captured with ``p`` before the stop is exactly as good as one
+    captured after it -- so raising here would throw away the operator's work and the
+    save prompt along with it. The message goes to stderr and the caller carries on.
     """
 
-    from everest_robot.robot.contracts import FailureReason
-
-    start = controller.start_pose
-    if not start:
-        return  # the leader was never measured, so the arm was never enabled
-    if session.port.lifecycle is not ArmLifecycle.ENABLED:
-        # Disabled or faulted under the driver's own policy. There is nothing to command,
-        # and saying so beats a silent skip: the arm is wherever it stopped.
+    if controller.excursion_joints:
         print(
-            f"not returning to the starting pose: the arm is {session.port.lifecycle.value}",
+            "out of the follower's reach at times this session: "
+            f"{', '.join(controller.excursion_joints)}. The follower was held at the soft "
+            "limit; the leader has travel this arm does not.",
             file=sys.stderr,
         )
-        return
-
-    print("returning the arm to the pose it started from...", file=sys.stderr)
-    try:
-        result = session.motion.go_to_joint_target(
-            RETURN_TARGET_NAME, start, speed_scale=RETURN_SPEED_SCALE
-        )
-    except BaseException as error:  # including a second Ctrl-C during the return
-        print(
-            f"return to the starting pose FAILED  {type(error).__name__}: {error}\n"
-            "the arm is held where it is and torque is about to come off; support it.",
-            file=sys.stderr,
-        )
-        return
-
-    if result.failure_reason is not None:
-        detail = result.failure_detail
-        if result.failure_reason is FailureReason.LIMIT_VIOLATION:
-            # The pose was inside the limits when it was read, so the limits have moved:
-            # a re-zeroed or wrapped joint. Not something to clamp our way past.
-            detail = f"{detail} -- the arm's limits are not the ones it started under"
-        print(
-            f"return to the starting pose FAILED  {result.failure_reason}: {detail}\n"
-            "the arm is held where it is and torque is about to come off; support it.",
-            file=sys.stderr,
-        )
-    elif result.already_at_target:
-        print("already at the pose it started from; the arm did not move.", file=sys.stderr)
-    else:
-        print(
-            f"back at the starting pose after {result.elapsed_s:.2f}s "
-            f"(max tracking error {result.max_tracking_error_rad:.4f} rad).",
-            file=sys.stderr,
-        )
+    if controller.error:
+        print(f"teleoperation stopped: {controller.error}", file=sys.stderr)
 
 
 def _present(

@@ -13,7 +13,7 @@ from everest_robot.monitor import (
     MonitorContext,
     _header_row,
     _prompt_save,
-    _return_to_start,
+    _report_teleoperation,
     _row,
     _state_of,
     _status_line,
@@ -26,7 +26,6 @@ from everest_robot.robot.contracts import ArmLifecycle, JointLimit, RobotIdentit
 from everest_robot.robot.fake_arm import FakeArm
 from everest_robot.robot.monitor import JointMonitor, format_table
 from everest_robot.robot.parameters import RobotParameters
-from everest_robot.robot.session import RobotSession
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "gripper")
 LIMITS = (
@@ -413,6 +412,28 @@ def test_the_status_line_says_nothing_about_clamping_when_nothing_is_clamped() -
     line = _status_line(monitor, sample, capture_context(), paused=False, captured=None, clamped=())
 
     assert "CLAMPED" not in line
+    assert "OUT OF REACH" not in line
+
+
+def test_a_joint_that_stays_clamped_is_promoted_out_of_the_clamped_list() -> None:
+    """Two names for one joint on one line reads as two problems. It is one."""
+
+    clock = ManualClock()
+    monitor = JointMonitor(connected_arm(clock), clock=clock)
+    sample = monitor.sample()
+
+    line = _status_line(
+        monitor,
+        sample,
+        capture_context(),
+        paused=False,
+        captured=None,
+        clamped=("shoulder_pan", "wrist_flex"),
+        unreachable=("wrist_flex",),
+    )
+
+    assert "CLAMPED: shoulder_pan" in line
+    assert "OUT OF REACH: wrist_flex" in line
     assert "no reference" in line
 
 
@@ -500,7 +521,8 @@ def test_the_powered_guide_explains_what_a_clamped_joint_means() -> None:
     body = "\n".join(help_lines(capture_context(powered=True)))
 
     assert "CLAMPED" in body
-    assert "Staying out of range stops the session" in body
+    assert "OUT OF REACH" in body
+    assert "never stops the session" in body
 
 
 def test_the_guide_points_at_the_validation_that_makes_a_preset_safe() -> None:
@@ -516,156 +538,28 @@ def test_the_guide_fits_a_standard_terminal() -> None:
             assert len(line) <= 78, line
 
 
-# ── parking the arm before torque comes off ────────────────────────────────────────
-
-START_POSE = (0.5, -1.0, -0.5)
+# ── how a stop is reported ─────────────────────────────────────────────────────────
 
 
-class StubController:
-    """Only what ``_return_to_start`` reads: where the arm was before it was enabled."""
+class StoppedController:
+    """Only what ``_report_teleoperation`` reads."""
 
-    def __init__(self, start_pose: tuple[float, ...] = START_POSE) -> None:
-        self.start_pose = start_pose
-
-
-def return_parameters() -> RobotParameters:
-    return RobotParameters.from_mapping(
-        {
-            "schema_version": 1,
-            "robot": {
-                "id": "maker-arm-02",
-                "model": "maker-arm-v1",
-                "calibration_id": "cal-2026-08-20",
-                "joint_order": list(JOINTS),
-                "units": "radians",
-            },
-            "motion_defaults": {
-                "max_velocity_rad_s": 0.5,
-                "max_acceleration_rad_s2": 2.0,
-                "tolerance_rad": 0.02,
-                "settle_time_s": 0.05,
-                "timeout_s": 30.0,
-                "control_rate_hz": 50,
-            },
-            "named_positions": {},
-            "named_transitions": {},
-            "policy": {"default_controller": "vla", "fps": 10, "max_duration_s": 5.0},
-            "replay": {
-                "require_matching_robot_id": True,
-                "require_matching_calibration_id": True,
-                "safe_start_position": None,
-                "max_speed_scale": 1.0,
-            },
-        },
-        config_digest="sha256:test",
-        source="test.yaml",
-    )
+    def __init__(self, error: str | None = None, excursions: tuple[str, ...] = ()) -> None:
+        self.error = error
+        self.excursion_joints = excursions
 
 
-@pytest.fixture
-def teleoperated():
-    """A claimed arm parked at START_POSE, as robot-monitor has when following begins.
+def test_a_teleoperation_stop_is_reported_and_does_not_end_the_process(capsys) -> None:
+    """It used to raise SystemExit, which threw away the pose the operator had captured."""
 
-    Yields the session and arm and always closes, so one failing assertion cannot leave
-    the in-process lease held for every test after it.
-    """
+    _report_teleoperation(StoppedController("RuntimeError: Star leader readings lost"))
 
-    clock = ManualClock()
-    arm = FakeArm(IDENTITY, LIMITS, clock=clock, positions=list(START_POSE))
-    session = RobotSession(arm, return_parameters(), clock=clock, cameras=None).open()
-    try:
-        yield session, arm, clock
-    finally:
-        session.close()
+    assert "teleoperation stopped: RuntimeError" in capsys.readouterr().err
 
 
-def walk_away(arm: FakeArm, clock: ManualClock, pose: tuple[float, ...]) -> None:
-    """Leave the arm where the leader put it: enabled, and nowhere near where it started."""
+def test_joints_the_follower_could_not_reach_are_named_once_at_the_end(capsys) -> None:
+    _report_teleoperation(StoppedController(excursions=("wrist_flex",)))
 
-    arm.enable()
-    arm.send_targets(pose)
-    clock.advance(10.0)
-    assert arm.read_state().positions == pytest.approx(pose, abs=1e-6)
-
-
-def test_the_arm_is_driven_back_to_where_it_started_before_torque_comes_off(
-    teleoperated,
-) -> None:
-    """The whole point: it goes limp where the operator parked it, not where it stopped."""
-
-    session, arm, clock = teleoperated
-    walk_away(arm, clock, (-0.5, 0.0, -1.5))
-
-    _return_to_start(session, StubController())  # type: ignore[arg-type]
-
-    assert arm.read_state().positions == pytest.approx(START_POSE, abs=0.02)
-    # Still under power: releasing it is RobotSession.close()'s job, and only after this.
-    assert arm.lifecycle is ArmLifecycle.ENABLED
-
-
-def test_the_return_runs_after_a_teleoperation_failure_too(teleoperated, capsys) -> None:
-    """An out-of-range stop is exactly when the arm is somewhere it must not be dropped.
-
-    Nothing in the return consults ``controller.error``, which is what makes it run on
-    the failure paths as well as on ``q``; this pins that down.
-    """
-
-    session, arm, clock = teleoperated
-    walk_away(arm, clock, (-0.9, 0.4, -1.9))
-
-    _return_to_start(session, StubController())  # type: ignore[arg-type]
-
-    assert arm.read_state().positions == pytest.approx(START_POSE, abs=0.02)
-    assert "back at the starting pose" in capsys.readouterr().err
-
-
-def test_an_arm_already_at_its_starting_pose_is_not_moved(teleoperated, capsys) -> None:
-    session, arm, clock = teleoperated
-    arm.enable()
-
-    _return_to_start(session, StubController())  # type: ignore[arg-type]
-
-    assert arm.sent_commands == []
-    assert "already at the pose it started from" in capsys.readouterr().err
-
-
-def test_an_arm_that_was_never_enabled_is_neither_commanded_nor_complained_about(
-    teleoperated, capsys
-) -> None:
-    """No start pose means the leader was never measured, so nothing was ever energized."""
-
-    session, arm, _ = teleoperated
-
-    _return_to_start(session, StubController(()))  # type: ignore[arg-type]
-
-    assert arm.sent_commands == []
-    assert capsys.readouterr().err == ""
-
-
-def test_an_arm_that_is_no_longer_enabled_is_not_commanded_but_is_reported(
-    teleoperated, capsys
-) -> None:
-    """It is wherever it stopped, under the driver's policy; a silent skip would hide that."""
-
-    session, arm, _ = teleoperated
-
-    _return_to_start(session, StubController())  # type: ignore[arg-type]
-
-    assert arm.sent_commands == []
-    assert "not returning to the starting pose" in capsys.readouterr().err
-
-
-def test_a_return_that_cannot_run_is_reported_rather_than_raised(teleoperated, capsys) -> None:
-    """The teleoperation error is the one the operator needs; this must not replace it."""
-
-    session, arm, clock = teleoperated
-    walk_away(arm, clock, (-0.5, 0.0, -1.5))
-
-    # A start pose outside the limits the arm is running under now: refused, not clamped.
-    _return_to_start(session, StubController((5.0, -1.0, -0.5)))  # type: ignore[arg-type]
-
-    error = capsys.readouterr().err
-    assert "FAILED" in error
-    assert "limits are not the ones it started under" in error
-    assert "support it" in error
-    assert arm.lifecycle is ArmLifecycle.ENABLED
+    report = capsys.readouterr().err
+    assert "out of the follower's reach at times this session: wrist_flex" in report
+    assert "teleoperation stopped" not in report

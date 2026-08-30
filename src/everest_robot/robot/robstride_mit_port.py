@@ -59,7 +59,7 @@ from everest_robot.robot.ports import clip_to_limits
 # _FULL_TURN_DEG / _WRAP_GRACE_DEG (duplicated here so the hardware-free tests need no
 # lerobot import; from_deployment() reuses the fork's tables for everything else).
 FULL_TURN_DEG = 360.0
-WRAP_GRACE_DEG = 20.0
+WRAP_GRACE_DEG = 90.0
 # Longer than RobstrideMotorsBus's 20 ms state-cache TTL. Waiting before the enable
 # sample prevents a plausible cached value from satisfying the first-frame gate.
 ENABLE_FRESH_WAIT_S = 0.025

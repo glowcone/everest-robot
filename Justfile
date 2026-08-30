@@ -101,16 +101,25 @@ goto position speed="0.25":
 # ── calibration ────────────────────────────────────────────────────────────────────
 # The fixed camera's pixels to joint positions, in the order they are run. Bolt the camera
 # before step 0 and do not move it afterwards: moving it voids every sample and the whole
-# procedure repeats. Steps 0 and 4 hold the arm lease and MOVE the arm -- 0 follows the
-# Star leader, 4 servos to the detection at a locked speed and holds still whenever it
-# sees nothing. Steps 1-3 touch no hardware. The full procedure, including the wrist-roll
-# model and the two hard limits, is in src/everest_robot/calibrate_pixel_map.py.
+# procedure repeats. Step 4 holds the arm lease and MOVES the arm: it servos to the
+# detection at a locked speed and holds still whenever it sees nothing. Step 0 comes in two
+# forms that produce the same samples -- `pixel-collect` follows the Star leader under
+# power, `pixel-collect-manual` leaves torque off and you place the arm by hand. Steps 1-3
+# touch no hardware. The full procedure, including the wrist-roll model and the two hard
+# limits, is in src/everest_robot/calibrate_pixel_map.py.
 
 # 0. POWERED: teleoperate to ~30 pre-grasp poses, pairing each with the object's pixel.
+# Ends by driving the arm back to where it started, at reduced speed, before releasing it.
 [group('calibration')]
 pixel-collect camera x y w h speed="0.375":
     uv run robot-pixel-map collect --camera {{ camera }} \
         --roi {{ x }} {{ y }} {{ w }} {{ h }} --max-velocity {{ speed }}
+
+# 0b. Same samples, no leader and no torque: place the arm by hand and capture. Holds the lease.
+[group('calibration')]
+pixel-collect-manual camera x y w h:
+    uv run robot-pixel-map collect --camera {{ camera }} \
+        --roi {{ x }} {{ y }} {{ w }} {{ h }} --no-teleop
 
 # 1. Refit the stored samples and print the held-out joint error. Moves nothing.
 [group('calibration')]
@@ -136,6 +145,55 @@ pixel-track-dry speed="0.15":
 [group('calibration')]
 pixel-track speed="0.15" rate="15":
     uv run robot-pixel-map track --max-velocity {{ speed }} --rate {{ rate }}
+
+# The wrist camera's alternative to the pixel map above, for the same `SEARCH_CV` state.
+# Nothing here is registered to the bench, so no camera has to be bolted and the carabiner
+# does not have to lie inside a taught region -- but the wrist camera only sees what the arm
+# is pointed at, so losing the target genuinely means "move the arm". Step 0 MOVES the arm:
+# it bumps each joint either way from the pre-grasp pose you leave it in and measures how the
+# image responds, which is the whole calibration. Steps 1-2 move nothing; steps 3-4 servo.
+# Debug at step 3, not step 4: `wrist-centre` servos translation only, onto the spine marker
+# the detector already draws, so a Jacobian column with the wrong sign shows up at once as
+# the arm going the wrong way. `wrist-track` mixes translation, range, rotation and the
+# taught goal, so a failure there rules nothing out. Pick which form the FSM uses with
+# EVEREST_SEARCH_CV=fixed|wrist. The procedure is in
+# src/everest_robot/calibrate_wrist_servo.py.
+
+# 0. POWERED: from the pre-grasp pose, record the goal image and bump out the Jacobian.
+[group('calibration')]
+wrist-teach approved_by delta="0.08" speed="0.3":
+    uv run robot-wrist-servo teach --approved-by {{ approved_by }} \
+        --delta {{ delta }} --speed-scale {{ speed }}
+
+# 1. Print the wrist calibration: goal image, per-joint columns, residuals, return check.
+[group('calibration')]
+wrist-check:
+    uv run robot-wrist-servo check
+
+# 2. Print what the wrist camera sees now and the joint step that would centre it. No motion.
+[group('calibration')]
+wrist-look:
+    uv run robot-wrist-servo look
+
+# 3a. The centring loop with the arm never energized: watch which way it would go.
+[group('calibration')]
+wrist-centre-dry speed="0.06":
+    uv run robot-wrist-servo centre --max-velocity {{ speed }} --dry-run
+
+# 3. POWERED: slowly bring the carabiner's spine to the frame centre. Debug SEARCH_CV here.
+[group('calibration')]
+wrist-centre speed="0.06" rate="15":
+    uv run robot-wrist-servo centre --max-velocity {{ speed }} --rate {{ rate }}
+
+# 4a. The full servo loop with the arm never energized: watch what it would command.
+[group('calibration')]
+wrist-track-dry speed="0.15":
+    uv run robot-wrist-servo track --max-velocity {{ speed }} --dry-run
+
+# 4. POWERED: servo the wrist camera onto the whole taught goal image at a locked speed.
+[group('calibration')]
+wrist-track speed="0.15" rate="15":
+    uv run robot-wrist-servo track --max-velocity {{ speed }} --rate {{ rate }}
 
 # ── database ───────────────────────────────────────────────────────────────────────
 # Docker is optional. `robot-db` uses compose.yaml when Docker Compose and its daemon are
@@ -176,11 +234,16 @@ psql:
 # ── workflows ──────────────────────────────────────────────────────────────────────
 # `attach-fsm` is the local real-time orchestrator from ADR-0003. It holds one robot lease
 # for the complete attempt and does not require Absurd or PostgreSQL. The learned states
-# (SEARCH_RL, CLIP_RL) load a checkpoint or a scripted policy, SEARCH_CV drives the fixed
-# camera and the pixel map from `pixel-fit`, and INITIAL plus the CLIP_RL gates come from
-# the wrist-camera detector. Everything -- checkpoints, feature mapping, perception, pixel
-# map -- resolves before the robot is claimed. Use `attach-fsm-fake` to exercise the state
-# machine with no hardware at all, and `pixel-track` to watch the CV follower alone.
+# (SEARCH_RL, CLIP_RL) load a checkpoint or a scripted policy, and INITIAL plus the CLIP_RL
+# gates come from the wrist-camera detector. Everything -- checkpoints, feature mapping,
+# perception, calibration -- resolves before the robot is claimed. Use `attach-fsm-fake` to
+# exercise the state machine with no hardware at all.
+#
+# SEARCH_CV comes in two forms, chosen with EVEREST_SEARCH_CV or `--search-cv`, and exactly
+# one calibration is loaded: `fixed` (default) drives the bench camera and the pixel map from
+# `pixel-fit`, watchable alone with `pixel-track`; `wrist` drives the wrist camera and the
+# image Jacobian from `wrist-teach`, watchable alone with `wrist-track`. Use `wrist` when no
+# bench camera can be placed or the carabiner lands outside the taught region.
 #
 # `attach-fsm-act` passes one checkpoint to both learned states, which is the loop as
 # designed: search until the carabiner is found, hand to classical CV to place the gripper,
@@ -207,10 +270,10 @@ attach-fsm search_policy clip_policy flags="":
 
 # Run the ACT loop: one checkpoint for both learned states, CV in between. POWERED.
 [group('workflow')]
-attach-fsm-act checkpoint device="auto" flags="":
+attach-fsm-act checkpoint device="auto" search_cv="fixed" flags="":
     uv run robot-attach-fsm --backend hardware \
         --search-policy {{ checkpoint }} --clip-policy {{ checkpoint }} \
-        --device {{ device }} \
+        --device {{ device }} --search-cv {{ search_cv }} \
         --no-attachment-verification --allow-unverified-lerobot-frame {{ flags }}
 
 # Run the ACT loop with SEARCH_CV skipped: one checkpoint owns the whole approach. POWERED.

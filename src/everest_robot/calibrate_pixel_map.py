@@ -27,6 +27,13 @@ the camera's obliquity or the arm's kinematics, which is the point --
 Both ``collect`` and ``track`` claim the robot lease and own the arm for the duration.
 Never run either alongside a worker or a monitor: they would be two participants on one
 CAN bus.
+
+However a teleoperated ``collect`` ends -- ``q``, Ctrl-C, a leader stop, or a fit that
+raised -- the arm is driven back to the pose it was measured at before it was enabled and
+only then released, by the same
+:func:`~everest_robot.robot.teleoperation.park_at_start_pose` ``robot-monitor`` uses.
+Teaching walks the arm a long way from where it started; releasing torque there drops it.
+``--no-teleop`` never enables, so there is nothing to park.
 """
 
 from __future__ import annotations
@@ -283,6 +290,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
         if not args.no_teleop and not args.fake:
             controller = _start_teleoperation(session, args)
+        elif not args.fake:
+            # The session connects but never enables, so the arm is already limp. Say so:
+            # from the operator's side "hand-teaching" and "the leader is not responding"
+            # look identical until they push on it.
+            print(
+                "HAND-TEACHING: torque is off and stays off. Move the arm by hand to each\n"
+                "pre-grasp pose and capture; nothing here will energize it. Support the arm\n"
+                "before you let go -- it holds nothing under no power.\n"
+            )
 
         samples = list(calibration.samples)
         print(
@@ -370,11 +386,16 @@ def cmd_collect(args: argparse.Namespace) -> int:
         else:
             _print_fit(calibration)
     finally:
-        # Torque off, without a parting hold command. Ctrl-C during a teaching session
-        # should leave the arm limp and movable by hand, not snapped to wherever it was
-        # last told to go.
+        # Stop following without a parting hold command: that only snaps the arm toward
+        # its last leader target. Then park it, on every path including Ctrl-C and a fit
+        # that raised. Teaching walks the arm a long way from where it started, and
+        # `session.close()` releases torque unconditionally -- so skipping the park does
+        # not leave the arm where it is, it drops it, fast, from wherever teaching ended.
         if controller is not None:
+            from everest_robot.robot.teleoperation import park_at_start_pose
+
             controller.close(hold=False)
+            park_at_start_pose(session, controller)
         session.close()
     return 0
 

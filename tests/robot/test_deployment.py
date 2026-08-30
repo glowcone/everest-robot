@@ -37,3 +37,41 @@ def test_an_absent_slcan_serial_port_is_refused(tmp_path) -> None:
             parameters(),
             {"EVEREST_CAN_PORT": str(absent), "EVEREST_CAN_BACKEND": "slcan"},
         )
+
+
+# ── which camera SEARCH_CV closes its loop on ──────────────────────────────────────
+def test_the_search_cv_backend_defaults_to_the_fixed_camera():
+    from everest_robot.robot.deployment import search_cv_backend
+
+    assert search_cv_backend({}) == "fixed"
+
+
+def test_an_unknown_search_cv_backend_names_both_choices():
+    from everest_robot.robot.deployment import search_cv_backend
+
+    with pytest.raises(ValueError, match="pixel map or 'wrist'"):
+        search_cv_backend({"EVEREST_SEARCH_CV": "both"})
+
+
+def test_a_wrist_calibration_with_no_bump_trials_is_refused_before_the_claim(tmp_path):
+    """A draft saved before any joint was bumped has no measured Jacobian, so it has no
+    opinion about which way to move. Better to say so than to servo on zeros."""
+
+    import numpy as np
+
+    from everest_robot.pixel_map import RobotStamp
+    from everest_robot.robot.deployment import load_wrist_servo
+    from everest_robot.robot.wrist_servo import WristServoCalibration, WristServoError
+
+    path = tmp_path / "wrist_servo.json"
+    WristServoCalibration(
+        robot=RobotStamp("maker-arm-02", "cal-1"),
+        camera_name="wrist",
+        joint_names=("shoulder_pan", "shoulder_lift"),
+        servo_joints=("shoulder_pan",),
+        goal=(320.0, 240.0, 150.0, 10.0),
+        jacobian=np.array([[-220.0], [8.0], [1.0], [0.5]]),
+    ).save(path)
+
+    with pytest.raises(WristServoError, match="no bump trials"):
+        load_wrist_servo({"EVEREST_WRIST_SERVO": str(path)})

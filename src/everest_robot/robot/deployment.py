@@ -26,6 +26,14 @@ Environment:
   (default ``config/pixel_map.json``). It is not a policy observation and deliberately
   does not go through ``EVEREST_CAMERAS``: the camera id it uses is part of the
   calibration, because moving that camera voids every sample in the file.
+* ``EVEREST_SEARCH_CV`` -- which camera the attachment FSM's ``SEARCH_CV`` closes its loop
+  on: ``fixed`` (default, the pixel map above) or ``wrist``. They are alternatives, never
+  both, and exactly one calibration is loaded.
+* ``EVEREST_WRIST_SERVO`` -- path to the wrist camera's image-Jacobian calibration
+  (default ``config/wrist_servo.json``), read only when ``EVEREST_SEARCH_CV=wrist``.
+  Unlike the pixel map this one *does* name a camera from ``EVEREST_CAMERAS``, by name:
+  the wrist camera is a policy observation and the follower shares the session's already
+  open device rather than taking a second one.
 * ``EVEREST_POLICY_DEVICE`` -- torch device for checkpoint inference: ``auto`` (default;
   CUDA, then Apple's Metal backend, then the CPU), or an explicit ``cuda``/``mps``/``cpu``,
   which is never silently downgraded.
@@ -61,9 +69,11 @@ from everest_robot.robot.ports import ArmPort
 from everest_robot.robot.replay import ReplayRunner
 from everest_robot.robot.robstride_mit_port import RobstrideMitPort
 from everest_robot.robot.session import RobotSession
+from everest_robot.robot.wrist_servo import WristServoCalibration, WristServoError
 
 DEFAULT_PARAMETERS_PATH = "config/maker_arm_v1.yaml"
 DEFAULT_PIXEL_MAP_PATH = "config/pixel_map.json"
+DEFAULT_WRIST_SERVO_PATH = "config/wrist_servo.json"
 
 
 def parameters_path(environ: Mapping[str, str] | None = None) -> Path:
@@ -101,6 +111,49 @@ def load_pixel_map(environ: Mapping[str, str] | None = None) -> PixelJointMap:
             f"{path} stored no detector ROI; re-run `robot-pixel-map collect --roi X Y W H`"
         )
     return calibration
+
+
+def wrist_servo_path(environ: Mapping[str, str] | None = None) -> Path:
+    """Which wrist-camera image-Jacobian calibration the wrist follower uses."""
+
+    environ = os.environ if environ is None else environ
+    return Path(environ.get("EVEREST_WRIST_SERVO", DEFAULT_WRIST_SERVO_PATH))
+
+
+def load_wrist_servo(environ: Mapping[str, str] | None = None) -> WristServoCalibration:
+    """Load the wrist calibration and refuse one that cannot drive anything.
+
+    A draft saved before any joint was bumped has no Jacobian and no opinion about which
+    way to move; that refusal belongs here, before the claim, for the same reason the
+    pixel map's does.
+    """
+
+    path = wrist_servo_path(environ)
+    calibration = WristServoCalibration.load(path)
+    if not calibration.trials:
+        raise WristServoError(
+            f"{path} records no bump trials, so its Jacobian was not measured on an arm; "
+            "re-teach it with `robot-wrist-servo teach`"
+        )
+    return calibration
+
+
+def search_cv_backend(environ: Mapping[str, str] | None = None) -> str:
+    """Which camera ``SEARCH_CV`` closes its loop on: ``fixed`` or ``wrist``.
+
+    One or the other, never both. They are two different instruments answering the same
+    question -- get the gripper to the carabiner -- and running them together would mean
+    two calibrations commanding one arm with no arbiter between them.
+    """
+
+    environ = os.environ if environ is None else environ
+    backend = environ.get("EVEREST_SEARCH_CV", "fixed")
+    if backend not in ("fixed", "wrist"):
+        raise ValueError(
+            f"unknown EVEREST_SEARCH_CV {backend!r} (expected 'fixed' for the bench camera's "
+            "pixel map or 'wrist' for the wrist camera's image Jacobian)"
+        )
+    return backend
 
 
 def policy_device(environ: Mapping[str, str] | None = None) -> str:

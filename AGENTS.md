@@ -6,8 +6,9 @@ read-only `camera-scan`, `camera-scan-json`, `camera-show`), `robot`
 (`monitor` -- powered calibration teleoperation; `goto` -- powered named-position motion;
 `goto-list`, `goto-dry`, `monitor-read-only`, `monitor-once`, `monitor-fake` -- no motion),
 `database`
-(`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `calibration` (the numbered
-`pixel-*` path that teaches and then uses the fixed camera's pixel-to-joint map),
+(`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `calibration` (two numbered paths
+for the same `SEARCH_CV` state -- `pixel-*` teaches the fixed camera's pixel-to-joint map,
+`wrist-*` teaches the wrist camera's image Jacobian),
 `workflow` (`attach-fsm-fake`, `attach-fsm`, `worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
@@ -48,13 +49,16 @@ which exercises every state and prints the JSON result with no hardware, camera,
 database -- this is the command to reach for when changing the FSM. `--skip-cv`
 (`AttachmentFSMConfig(use_search_cv=False)`, `just attach-fsm-rl`) removes `SEARCH_CV` from
 the graph so a learned policy can be measured without visual following: detections hand
-straight to `CLIP_RL`, a degraded alignment stays there, and no pixel map is read. It gives
+straight to `CLIP_RL`, a degraded alignment stays there, and neither calibration is read. It gives
 up the guarantee the state exists for -- that the measured pose settled on the taught
 pre-grasp target before clipping began -- so keep it an option, never the default. `just attach-fsm
 <search-policy> <clip-policy>` is the hardware form, and `just attach-fsm-act <checkpoint>`
 is the intended shape: one model in both learned states with classical CV between them,
 still as two separate `PolicySession`s. Every state is implemented -- `INITIAL` and the
-`CLIP_RL` gates come from `robot/carabiner_perception.py` over the wrist camera. Two signals
+`CLIP_RL` gates come from `robot/carabiner_perception.py` over the wrist camera. `SEARCH_CV`
+comes in two interchangeable forms selected by `EVEREST_SEARCH_CV` / `--search-cv`: `fixed`
+(the bench camera's pixel map) and `wrist` (the wrist camera's image Jacobian). Exactly one
+calibration is loaded; supplying both is refused rather than ranked. Two signals
 are still refused rather than invented: attachment verification (behind
 `AttachmentVerifier`; without it `SUCCESS` is unreachable, so it must be acknowledged with
 `--no-attachment-verification`) and grasp detection (needs a measured
@@ -150,21 +154,45 @@ Absurd checkpoints store.
   A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
   backend, parameters path -- `parameters_path()`, which is also where a captured preset is
-  written back; the pixel-map path -- `EVEREST_PIXEL_MAP`, loaded and refused up front by
-  `load_pixel_map()`). Do not read the environment anywhere else in the runtime.
+  written back; the two `SEARCH_CV` calibration paths -- `EVEREST_PIXEL_MAP` and
+  `EVEREST_WRIST_SERVO`, loaded and refused up front by `load_pixel_map()` and
+  `load_wrist_servo()`, with `search_cv_backend()` (`EVEREST_SEARCH_CV`) choosing between
+  them). Do not read the environment anywhere else in the runtime.
 - `visual_tracking.py` is the bounded servo loop for a target that changes every frame. It
   takes a full joint target or `None` per tick and clamps the commanded step, so the arm's
   speed is bounded by construction and a missing detection holds rather than coasting.
-  Where the target comes from is the caller's problem: `pixel_map.py` fits the fixed
-  camera's pixels to taught pre-grasp poses and refuses to extrapolate outside their convex
-  hull, and `calibrate_pixel_map.py` (`robot-pixel-map`) is the operator's CLI over both.
-- `robot/carabiner_follower.py` is that caller: the fixed camera, the two-white-tape
-  detector and the map, stepped one tracker tick at a time. It owns the three judgements
-  neither the tracker nor the FSM can make -- how many consecutive misses mean the target
-  is lost, what "followed" means (the *measured* pose settled, not one tick that moved),
-  and the pacing that keeps the per-tick clamp equal to `max_velocity_rad_s`. It never
-  chooses a next state. `calibrate_pixel_map.py` re-exports its camera and detector, so the
-  `track` subcommand and the FSM's `SEARCH_CV` run the same loop minus the arbitration.
+  `start()` is re-callable and enables only from `CONNECTED`, because the FSM re-enters
+  `SEARCH_CV` on an arm the clip policy left energized and both drivers refuse `enable()`
+  from `ENABLED`. Where the target comes from is the caller's problem, and there are two
+  callers because there are two cameras. Do not merge them and do not let either become
+  the other's special case.
+- **Fixed camera.** `pixel_map.py` fits the bench camera's pixels to taught pre-grasp poses
+  and refuses to extrapolate outside their convex hull; `calibrate_pixel_map.py`
+  (`robot-pixel-map`) is the operator's CLI. `robot/carabiner_follower.py` is the caller:
+  camera, two-white-tape detector and map, one tracker tick at a time. It owns the three
+  judgements neither the tracker nor the FSM can make -- how many consecutive misses mean
+  the target is lost, what "followed" means (the *measured* pose settled, not one tick that
+  moved), and the pacing that keeps the per-tick clamp equal to `max_velocity_rad_s`. It
+  never chooses a next state. `calibrate_pixel_map.py` re-exports its camera and detector,
+  so the `track` subcommand and the FSM run the same loop minus the arbitration.
+- **Wrist camera.** `robot/wrist_servo.py` holds an image Jacobian measured *on the arm* --
+  a wrist pixel names a direction relative to the gripper, not a place on the bench, so
+  there is nothing to sample and no pose to look up. `robot/wrist_follower.py` closes the
+  loop in the image against a taught goal, owns the same three judgements, and returns the
+  same `FollowTick` so the handler cannot tell the two apart. It reads frames through the
+  session's `CameraRuntime` -- the wrist camera is a policy observation and is already
+  open. `calibrate_wrist_servo.py` (`robot-wrist-servo`) teaches it by bumping one joint at
+  a time, using the *measured* displacement, and refuses the whole teach if the goal image
+  has drifted by the end -- that check is what catches a carabiner nudged mid-procedure,
+  which nothing in the fitted numbers would reveal. A solve past `max_delta_rad` is refused,
+  never clamped. `robot-wrist-servo centre` is the debug loop and the one to reach for
+  first: it retargets the stored calibration **in memory** onto the frame centre, servoing
+  the spine midpoint with `scale_px` and `spine_deg` set to `IGNORED_TOLERANCE`, so a
+  Jacobian column with the wrong sign shows up at once as the arm going the wrong way. Keep
+  it writing nothing, and keep "ignore this feature" expressed as a loose tolerance rather
+  than a branch in the solve. Read `docs/wrist-servo-calibration.md` before changing the
+  model, the feature set or the tolerances; the tolerances are also the solve's weights, so
+  they are not free to retune in isolation.
 - `robot/monitor.py` remains the read-only feedback view model. The `robot-monitor` CLI
   defaults to a powered, lease-local calibration session: `robot/teleoperation.py` owns the
   Star leader and commands the already-claimed follower while the same process renders that
@@ -230,8 +258,10 @@ state.
 
 The CLI entry points are `src/everest_robot/client.py`,
 `src/everest_robot/worker.py`, `src/everest_robot/database.py`,
-`src/everest_robot/monitor.py`, `src/everest_robot/goto.py`, and
-`src/everest_robot/jog.py`, plus the local `src/everest_robot/fsm_cli.py` and the
+`src/everest_robot/monitor.py`, `src/everest_robot/goto.py`,
+`src/everest_robot/jog.py`, the two calibration CLIs
+`src/everest_robot/calibrate_pixel_map.py` and `src/everest_robot/calibrate_wrist_servo.py`,
+plus the local `src/everest_robot/fsm_cli.py` and the
 hardware-free `src/everest_robot/policy_check.py` and
 `src/everest_robot/cameras_cli.py`. Keep hardware-specific
 configuration out of these modules; pass selection and tuning data through validated task

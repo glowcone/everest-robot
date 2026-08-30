@@ -45,6 +45,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from everest_robot.robot.policy import PolicyHandle, PolicySession, PolicyStep
     from everest_robot.robot.replay import ReplayControl
     from everest_robot.robot.session import RobotSession
+    from everest_robot.robot.wrist_follower import WristCarabinerFollower
+    from everest_robot.robot.wrist_servo import WristServoCalibration
 
 
 @dataclass
@@ -192,7 +194,6 @@ class UnavailableAttachmentPerception:
         self.preflight()
         raise AssertionError("unreachable")
 
-
     def clip_observations(self) -> ClipRLStep:
         self.preflight()
         raise AssertionError("unreachable")
@@ -208,11 +209,24 @@ class EverestAttachmentFSMHandlers:
     between them: an action chunk cached before CV moved the arm describes a pose the arm
     has left. Entering either state re-seeds its own session and leaves the other alone.
 
-    ``SEARCH_CV`` is that intervening vision: it drives :class:`CarabinerFollower`, which
-    is the fixed camera, the two-tape detector, the calibrated pixel map and a speed-locked
-    ``VisualTracker``. Its ``calibration`` is optional only so the learned states can be
-    brought up and rehearsed without a camera; the hardware backend always supplies one,
-    and entering ``SEARCH_CV`` without it refuses rather than servos blind.
+    ``SEARCH_CV`` is that intervening vision, and it comes in two forms that this class
+    treats as interchangeable because they present the same interface and return the same
+    ``FollowTick``:
+
+    * ``calibration`` -- the fixed bench camera. :class:`CarabinerFollower` puts the
+      two-tape detection through the taught pixel-to-joint map and servos to the pose it
+      names. Wins when the carabiner lies inside the taught region: the map encodes
+      *pre-grasp* directly, so there is no image loop to converge.
+    * ``wrist_servo`` -- the wrist camera. :class:`WristCarabinerFollower` runs the
+      :mod:`everest_robot.carabiner_detect` segmentation and closes an image loop through a
+      measured Jacobian. Wins when the carabiner is somewhere nobody taught, or when the
+      bench camera cannot be placed at all, because nothing in it is registered to the
+      bench.
+
+    Exactly one is supplied. Both being set is a configuration with two calibrations
+    commanding one arm and no arbiter, and is refused. Both being *unset* is how the
+    learned states are brought up and rehearsed without a camera; entering ``SEARCH_CV``
+    then refuses rather than servoing blind.
 
     Every step method performs at most one physical action, then reads the gate signals
     fresh. The transition decision itself belongs to
@@ -224,6 +238,7 @@ class EverestAttachmentFSMHandlers:
     search_policy: PolicyHandle
     clip_policy: PolicyHandle
     calibration: PixelJointMap | None = None
+    wrist_servo: WristServoCalibration | None = None
     perception: AttachmentPerception = field(default_factory=UnavailableAttachmentPerception)
     task: str | None = None
     fps: float | None = None
@@ -245,20 +260,27 @@ class EverestAttachmentFSMHandlers:
         from everest_robot.pixel_map import PixelMapError, RobotStamp
 
         self._capture: Any = None
-        self._follower: CarabinerFollower | None = None
-        if self.calibration is not None:
-            identity = self.session.port.identity
-            # A fit only means anything for the arm and the zeroing it was taught on, and
-            # SEARCH_CV is reachable straight out of INITIAL. Refuse now, not three states
-            # in with the arm already moving.
-            self.calibration.robot.verify(
-                RobotStamp(identity.robot_id, identity.calibration_id)
+        self._follower: CarabinerFollower | WristCarabinerFollower | None = None
+        if self.calibration is not None and self.wrist_servo is not None:
+            raise PixelMapError(
+                "SEARCH_CV was given both a fixed-camera pixel map and a wrist servo "
+                "calibration. They are alternatives: pass one, and select it with "
+                "EVEREST_SEARCH_CV=fixed or EVEREST_SEARCH_CV=wrist"
             )
+        # A calibration only means anything for the arm and the zeroing it was taught on,
+        # and SEARCH_CV is reachable straight out of INITIAL. Refuse now, not three states
+        # in with the arm already moving.
+        identity = self.session.port.identity
+        stamp = RobotStamp(identity.robot_id, identity.calibration_id)
+        if self.calibration is not None:
+            self.calibration.robot.verify(stamp)
             if self.calibration.joint_names != tuple(self.session.port.joint_names):
                 raise PixelMapError(
                     f"calibration joints {', '.join(self.calibration.joint_names)} do not "
                     f"match this arm's {', '.join(self.session.port.joint_names)}"
                 )
+        if self.wrist_servo is not None:
+            self._verify_wrist_servo(stamp)
         overrides: dict[str, object] = {
             "task": self.task,
             "allow_non_identity_frame": self.allow_unverified_lerobot_frame,
@@ -294,7 +316,9 @@ class EverestAttachmentFSMHandlers:
         # SEARCH_CV and build a fresh one on the way back in, rather than resuming it.
         if state is not AttachmentState.SEARCH_CV:
             self._release_follower()
-        elif self._follower is None and self.calibration is not None:
+        elif self._follower is None and (
+            self.calibration is not None or self.wrist_servo is not None
+        ):
             self._follower = self._build_follower()
             self._follower.start()
         self.perception.enter_state(state, previous)
@@ -337,12 +361,14 @@ class EverestAttachmentFSMHandlers:
         from everest_robot.robot.visual_tracking import TrackerStopped
 
         if self._follower is None:
-            if self.calibration is None:
+            if self.calibration is None and self.wrist_servo is None:
                 from everest_robot.pixel_map import PixelMapError
 
                 raise PixelMapError(
-                    "SEARCH_CV needs a calibrated pixel map; these handlers were built "
-                    "without one (`robot-pixel-map fit`, then EVEREST_PIXEL_MAP)"
+                    "SEARCH_CV needs a calibration and these handlers were built without "
+                    "one. Either the fixed camera's pixel map (`robot-pixel-map fit`, then "
+                    "EVEREST_PIXEL_MAP) or the wrist camera's image Jacobian "
+                    "(`robot-wrist-servo teach`, then EVEREST_SEARCH_CV=wrist)"
                 )
             raise RuntimeError(
                 "search_cv_step() was called outside SEARCH_CV; the follower is built on "
@@ -420,7 +446,34 @@ class EverestAttachmentFSMHandlers:
         return step
 
     # ── the CV subsystem ───────────────────────────────────────────────────────────
-    def _build_follower(self) -> CarabinerFollower:
+    def _verify_wrist_servo(self, stamp: Any) -> None:
+        """Refuse a wrist calibration that does not fit this arm or this camera set.
+
+        The camera check has to wait for the session -- the runtime that owns the wrist
+        camera only exists once the robot is claimed -- but it still lands here, before
+        anything is energized, rather than at the first servo tick.
+        """
+
+        from everest_robot.robot.wrist_servo import WristServoError
+
+        servo = self.wrist_servo
+        assert servo is not None  # guarded by the caller
+        servo.verify(stamp)
+        if servo.joint_names != tuple(self.session.port.joint_names):
+            raise WristServoError(
+                f"wrist servo joints {', '.join(servo.joint_names)} do not match this arm's "
+                f"{', '.join(self.session.port.joint_names)}"
+            )
+        names = self.session.bridge.cameras.names
+        if servo.camera_name not in names:
+            configured = ", ".join(names) or "none"
+            raise WristServoError(
+                f"the wrist servo calibration was taught through camera "
+                f"{servo.camera_name!r}, which is not configured (EVEREST_CAMERAS has: "
+                f"{configured})"
+            )
+
+    def _build_follower(self) -> CarabinerFollower | WristCarabinerFollower:
         from everest_robot.pixel_map import PixelMapError
         from everest_robot.robot.carabiner_follower import (
             CarabinerFollower,
@@ -429,10 +482,13 @@ class EverestAttachmentFSMHandlers:
         )
         from everest_robot.robot.visual_tracking import VisualTracker
 
+        if self.wrist_servo is not None:
+            return self._build_wrist_follower()
         if self.calibration is None:
             raise PixelMapError(
-                "SEARCH_CV needs a calibrated pixel map; build the handlers with one "
-                "(`robot-pixel-map fit`, then EVEREST_PIXEL_MAP)"
+                "SEARCH_CV needs a calibration; build the handlers with the fixed camera's "
+                "pixel map (`robot-pixel-map fit`) or the wrist camera's image Jacobian "
+                "(`robot-wrist-servo teach`)"
             )
         camera = self.calibration.camera
         roi = self.calibration.detector.roi_xywh
@@ -453,6 +509,39 @@ class EverestAttachmentFSMHandlers:
             ),
             frames=lambda: read_frame(capture, camera),
             detect=lambda frame: detect_carabiner(frame, roi),
+            clock=self.session.clock,
+        )
+
+    def _build_wrist_follower(self) -> WristCarabinerFollower:
+        """The wrist-camera form of ``SEARCH_CV``, over the session's own camera runtime.
+
+        No capture is opened here, and that is the whole difference from the fixed-camera
+        path: the wrist camera is a policy observation, so it is already connected and is
+        read through ``CameraRuntime`` rather than through a second device handle.
+        """
+
+        from everest_robot.robot.visual_tracking import VisualTracker
+        from everest_robot.robot.wrist_follower import (
+            WristCarabinerFollower,
+            detect_carabiner_wrist,
+            wrist_frames,
+        )
+
+        servo = self.wrist_servo
+        assert servo is not None  # guarded by _build_follower
+        return WristCarabinerFollower(
+            calibration=servo,
+            tracker=VisualTracker(
+                self.session.port,
+                rate_hz=self.rate_hz,
+                max_velocity_rad_s=self.max_velocity_rad_s,
+                lock_frames=self.lock_frames,
+                clock=self.session.clock,
+            ),
+            frames=wrist_frames(
+                self.session.bridge.cameras, servo.camera_name, servo.color_mode
+            ),
+            detect=detect_carabiner_wrist,
             clock=self.session.clock,
         )
 
@@ -547,8 +636,10 @@ def attachment_fsm_handlers(
     from everest_robot.robot.deployment import (
         build_attachment_perception,
         load_pixel_map,
+        load_wrist_servo,
         open_session,
         policy_device,
+        search_cv_backend,
     )
 
     device = params.get("policy_device") or policy_device()
@@ -577,14 +668,22 @@ def attachment_fsm_handlers(
             f"{neutral_name!r} before it can verify policy reset; available: {known}"
         )
 
-
-    # The pixel map is read and refused here for the same reason the policies are: a stale
-    # or missing calibration is not worth an energized arm to discover. With SEARCH_CV
-    # routed around it is not read at all -- nothing servos on it, and requiring a
+    # SEARCH_CV's calibration is read and refused here for the same reason the policies
+    # are: a stale or missing one is not worth an energized arm to discover. Exactly one is
+    # loaded, so choosing the wrist camera never requires a fixed camera to also be
+    # calibrated -- which is most of the point of having the alternative. With SEARCH_CV
+    # routed around, neither is read -- nothing servos on either, and requiring a
     # calibration for a state the FSM will never enter would be a refusal about nothing.
     # The handlers still carry no follower, so a SEARCH_CV step reached by any other path
     # refuses rather than servoing blind.
-    calibration = None if params.get("skip_cv") else load_pixel_map()
+    calibration = None
+    wrist_servo = None
+    if not params.get("skip_cv"):
+        which = str(params.get("search_cv") or search_cv_backend())
+        if which not in ("fixed", "wrist"):
+            raise ValueError(f"unknown search_cv {which!r} (expected 'fixed' or 'wrist')")
+        calibration = load_pixel_map() if which == "fixed" else None
+        wrist_servo = load_wrist_servo() if which == "wrist" else None
 
     session = open_session()
     try:
@@ -598,6 +697,7 @@ def attachment_fsm_handlers(
             search_policy,
             clip_policy,
             calibration=calibration,
+            wrist_servo=wrist_servo,
             perception=checks,
             task=params.get("attachment_task"),
             fps=None if params.get("policy_fps") is None else float(params["policy_fps"]),

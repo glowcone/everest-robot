@@ -434,3 +434,95 @@ def test_holding_leaves_the_arm_enabled_and_stationary(tmp_path) -> None:
 
     assert arm.lifecycle is ArmLifecycle.ENABLED
     session.close()
+
+
+# ── choosing which camera SEARCH_CV closes its loop on ─────────────────────────────
+def wrist_calibration(**overrides):
+    """A wrist servo calibration for this arm, stamped to match ``IDENTITY``."""
+
+    import numpy as np
+
+    from everest_robot.pixel_map import RobotStamp
+    from everest_robot.robot.wrist_servo import BumpTrial, WristServoCalibration
+
+    servo = ("shoulder_pan", "shoulder_lift")
+    goal = (320.0, 240.0, 150.0, 10.0)
+    settings = dict(
+        robot=RobotStamp(IDENTITY.robot_id, IDENTITY.calibration_id),
+        camera_name="wrist",
+        joint_names=tuple(IDENTITY.joint_names),
+        servo_joints=servo,
+        goal=goal,
+        jacobian=np.array([[-220.0, 10.0], [8.0, 180.0], [1.0, 40.0], [0.5, 0.0]]),
+        trials=(BumpTrial("shoulder_pan", 0.08, goal, goal),),
+    )
+    settings.update(overrides)
+    return WristServoCalibration(**settings)
+
+
+def refused(tmp_path, **overrides):
+    """Build handlers that are expected to refuse, releasing the claim either way.
+
+    ``make_handlers`` leaves the session open for the test to drive. These cases raise
+    inside the constructor, after the session is open, so the lease has to be released
+    here or the next test in the process finds the robot busy.
+    """
+
+    clock = ManualClock()
+    arm = FakeArm(
+        identity=IDENTITY, joint_limits=LIMITS, clock=clock, positions=[0.0, -1.0, -0.1]
+    )
+    session = RobotSession(
+        arm, parameters(), lease=InMemoryLease(IDENTITY.robot_id), clock=clock
+    ).open()
+    try:
+        return EverestAttachmentFSMHandlers(
+            session,
+            load_policy(write_policy(tmp_path, "search.json")),
+            load_policy(write_policy(tmp_path, "clip.json")),
+            perception=ScriptedPerception(),
+            neutral_position=tuple(arm.positions),
+            **overrides,
+        )
+    finally:
+        session.close()
+
+
+def test_supplying_both_calibrations_is_refused_rather_than_silently_ranked(tmp_path) -> None:
+    """Two calibrations commanding one arm with nothing arbitrating between them is not a
+    configuration to pick a winner from; it is one nobody meant to be in."""
+
+    from everest_robot.pixel_map import PixelMapError
+
+    with pytest.raises(PixelMapError, match="They are alternatives"):
+        refused(tmp_path, calibration=object(), wrist_servo=wrist_calibration())
+
+
+def test_a_wrist_calibration_taught_on_another_arm_is_refused_before_anything_moves(
+    tmp_path,
+) -> None:
+    from everest_robot.pixel_map import RobotStamp
+    from everest_robot.robot.wrist_servo import WristServoError
+
+    with pytest.raises(WristServoError, match="Re-teach it"):
+        refused(tmp_path, wrist_servo=wrist_calibration(robot=RobotStamp("maker-arm-99", "x")))
+
+
+def test_a_wrist_calibration_naming_an_unconfigured_camera_is_refused(tmp_path) -> None:
+    """The camera check needs the session -- the runtime only exists once the robot is
+    claimed -- but it still lands before anything is energized."""
+
+    from everest_robot.robot.wrist_servo import WristServoError
+
+    with pytest.raises(WristServoError, match="not configured"):
+        refused(tmp_path, wrist_servo=wrist_calibration(camera_name="wrist"))
+
+
+def test_search_cv_without_any_calibration_names_both_ways_to_get_one(tmp_path) -> None:
+    from everest_robot.pixel_map import PixelMapError
+
+    handlers, _, session, _ = make_handlers(tmp_path)
+
+    with pytest.raises(PixelMapError, match="robot-wrist-servo teach"):
+        handlers.search_cv_step()
+    session.close()

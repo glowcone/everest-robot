@@ -107,7 +107,14 @@ class VisualTracker:
         return self._locked >= self.lock_frames
 
     def start(self) -> tuple[float, ...]:
-        """Seed the command from measured feedback and energize, unless this is a dry run."""
+        """Seed the command from measured feedback and energize, unless this is a dry run.
+
+        Re-callable, and callers rely on it: the attachment FSM re-enters ``SEARCH_CV``
+        every time the clip policy hands control back, and the arm is still energized from
+        the state it just left. Enabling is therefore conditional on the lifecycle, the
+        same guard the motion controller and the policy runner use, because both drivers
+        refuse ``enable()`` from ``ENABLED`` rather than treating it as a no-op.
+        """
 
         state = self.port.read_state()
         if not state.all_finite:
@@ -115,7 +122,7 @@ class VisualTracker:
         if state.has_fault:
             raise TrackerStopped(f"the arm is in fault: {state.fault_reason or state.fault_bits}")
         self._command = tuple(state.positions)
-        if not self.dry_run:
+        if not self.dry_run and self.port.lifecycle is ArmLifecycle.CONNECTED:
             self.port.enable()
         self._started = True
         return self._command

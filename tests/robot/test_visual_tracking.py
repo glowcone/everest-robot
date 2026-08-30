@@ -44,6 +44,21 @@ def test_start_seeds_the_command_from_measured_feedback_and_enables():
     assert hardware.lifecycle is ArmLifecycle.ENABLED
 
 
+def test_start_is_re_callable_on_an_arm_that_is_already_energized():
+    """The attachment FSM re-enters SEARCH_CV every time the clip policy hands control
+    back, and the arm is still enabled from the state it just left. Both drivers refuse
+    enable() from ENABLED rather than treating it as a no-op, so this has to be guarded."""
+
+    hardware = arm(ManualClock())
+    servo = tracker(hardware)
+    servo.start()
+
+    seed = servo.start()
+
+    assert seed == (0.0, 0.0, -1.0)
+    assert hardware.lifecycle is ArmLifecycle.ENABLED
+
+
 def test_a_missing_detection_holds_and_commands_nothing():
     hardware = arm(ManualClock())
     running = tracker(hardware)
