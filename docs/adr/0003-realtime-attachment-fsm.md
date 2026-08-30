@@ -113,6 +113,42 @@ Search and clip may use the same checkpoint, but they are separate policy sessio
 physically intervened between them, so cached actions and recurrent state from before CV
 are stale. Entering either RL state resets or reseeds the policy from a fresh observation.
 
+## Assumption pending verification: how a policy reports its return to neutral
+
+**Status: UNVERIFIED. Implemented as described below; not yet confirmed against a trained
+checkpoint on hardware.**
+
+The decision above requires `CLIP_RL` to observe "the policy reports that it has returned to
+neutral", but does not say what that report physically is. The implementation reads it from
+the existing policy boundary: `PolicyHandle.select_action` returning `None`, which the
+protocol already defines as "the policy considers the task finished". A `PolicySession` step
+that terminates with `COMPLETED` is therefore reported as `returned_to_neutral=True`, and
+the FSM resets to `INITIAL`.
+
+This is a mapping chosen to avoid inventing a second completion channel, not an observed
+property of the policy that will run here. It is wrong if any of the following turns out to
+be true of the trained checkpoint:
+
+- the policy signals neutral some other way -- an action-space flag, a terminal action, a
+  pose the caller is expected to recognize -- and returns `None` for a different reason, or
+  never returns `None` at all;
+- the policy returns `None` on outcomes that are *not* a return to neutral, such as giving
+  up or losing the carabiner, in which case the FSM resets to `INITIAL` and re-observes when
+  it should be failing or recovering; or
+- the policy returns to neutral without reporting anything, in which case the reset never
+  fires and the attempt spends its lifetime budget in `CLIP_RL`.
+
+None of these is detectable without hardware, because a scripted policy exhibits whatever
+mapping the test asserts. Verifying it requires observing a real checkpoint's terminal
+behaviour on the arm and confirming that `select_action` returning `None` coincides with the
+end effector actually being at neutral.
+
+Until that is confirmed, the alternative this ADR already names remains open: a configured,
+measured neutral-pose tolerance, evaluated against the arm's own joint feedback rather than
+against anything the policy says. That option needs no cooperation from the checkpoint and
+would replace the mapping rather than supplement it. Do not infer neutral from elapsed steps
+under either option.
+
 All active states have explicit action and wall-clock budgets. Cancellation and any
 `BaseException` unwind through the robot session after holding the arm. A process crash is
 not automatically resumable from a recorded FSM state: the hardware must be observed and
@@ -131,6 +167,7 @@ The trace is diagnostic evidence, not a physical-effect checkpoint.
 - CV following can reuse `VisualTracker`, but detection, pixel-to-joint targeting, and the
   definition of `followed` remain behind an integration handler.
 - The orchestrator never commands a known-position/neutral stage. It observes the RL
-  policy's normal return to neutral and uses that event to reset for another cycle.
+  policy's normal return to neutral and uses that event to reset for another cycle. How that
+  event is observed is an unverified assumption; see the section above.
 - Outer durability is optional. If added, one attempt is one non-retryable physical stage,
   not one durable checkpoint per FSM action.
