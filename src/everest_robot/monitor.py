@@ -50,7 +50,45 @@ _NEEDS_TORQUE = _NEEDS_TEMP + _TORQUE_W
 _BAR_W = 18
 _NEEDS_BAR = _NEEDS_TORQUE + _BAR_W
 
-_HELP = "q quit+hold · p capture pose · z mark reference · Z clear · space pause follow"
+# The keys, once. The footer is derived from the short labels and the help overlay from
+# the long ones, so a binding cannot be added to the loop and forgotten in the guide.
+_KEY_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("q", "quit+hold"),
+    ("p", "capture pose"),
+    ("z", "mark reference"),
+    ("Z", "clear"),
+    ("space", "pause"),
+    ("?", "help"),
+)
+_HELP = " · ".join(f"{key} {label}" for key, label in _KEY_BINDINGS)
+
+_KEY_GUIDE: tuple[tuple[str, str], ...] = (
+    ("q", "stop, hold position, release the arm, and exit"),
+    ("p", "capture this pose; you are offered it as a named position on exit"),
+    ("z", "mark this pose as the reference the d deg column measures from"),
+    ("Z", "clear that reference"),
+    ("space", "pause and resume"),
+    ("?", "this guide"),
+)
+
+_COLUMN_GUIDE: tuple[tuple[str, str], ...] = (
+    ("rad", "calibrated joint angle -- the unit presets are stored in"),
+    ("deg", "the same angle in degrees"),
+    ("d deg", "change since the pose marked with z, or -- when none is marked"),
+    ("deg/s", "joint velocity"),
+    ("degC", "motor temperature"),
+    ("torque", "the torque the driver reports for this joint"),
+    ("state", "ok, or why this joint's reading cannot be trusted"),
+    ("soft limits", "the driver's limit span, o where the joint sits, ! outside it"),
+)
+
+_STATE_GUIDE: tuple[tuple[str, str], ...] = (
+    ("ok", "reporting fresh feedback, inside its soft limits"),
+    ("QUIET 1.2s", "the feedback counter has not advanced for that long"),
+    ("OUT OF RANGE", "outside the driver's soft limits; motion refuses to go there"),
+    ("NO FEEDBACK", "the motor reported nothing, so this joint is not measured"),
+    ("FAULT 0x2", "the driver's fault bits for this joint"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +222,7 @@ def _draw(
     palette: _Palette,
     *,
     paused: bool,
+    captured: int | None = None,
 ) -> None:
     screen.erase()
     _, width = screen.getmaxyx()
@@ -213,12 +252,16 @@ def _draw(
         palette.dim,
     )
     reference = "reference marked" if monitor.reference is not None else "no reference"
+    # Pressing p is otherwise invisible, which leaves the operator unsure whether the pose
+    # they meant to keep was taken.
+    held = f"  ·  POSE HELD (sample {captured})" if captured is not None else ""
     _put(
         screen,
         2,
         0,
         f"lifecycle {sample.lifecycle.value.upper()}  ·  {context.poll_hz:g} Hz  ·  "
-        f"sample {sample.index}  ·  {reference}{'  ·  FOLLOW PAUSED' if paused else ''}",
+        f"sample {sample.index}  ·  {reference}"
+        f"{'  ·  FOLLOW PAUSED' if paused else ''}{held}",
         palette.warn
         if paused or sample.lifecycle not in (ArmLifecycle.CONNECTED, ArmLifecycle.ENABLED)
         else palette.dim,
@@ -233,6 +276,69 @@ def _draw(
     _put(screen, footer + 1, 0, _HELP, palette.dim)
     screen.noutrefresh()
     curses.doupdate()
+
+
+def help_lines(context: MonitorContext) -> list[str]:
+    """The on-screen guide, as plain text so it can be checked without a terminal.
+
+    An operator reading unfamiliar numbers off a powered arm should not have to leave the
+    session to find out what a column means, so everything needed to trust or distrust a
+    reading is here: the keys, the columns, the per-joint states, and what this particular
+    mode is doing to the hardware.
+    """
+
+    lines = [f"everest joint monitor -- guide  ({context.robot_id})", ""]
+
+    lines.append("WHAT THIS SESSION IS DOING")
+    lines.extend(f"  {line}" for line in _mode_guide(context))
+    lines.append("")
+
+    lines.append("KEYS")
+    lines.extend(f"  {key:<7} {description}" for key, description in _KEY_GUIDE)
+    lines.append("")
+
+    lines.append("COLUMNS")
+    lines.extend(f"  {name:<12} {description}" for name, description in _COLUMN_GUIDE)
+    lines.append("  narrow terminals drop columns from the right; rad and deg always stay")
+    lines.append("")
+
+    lines.append("STATE")
+    lines.extend(f"  {name:<13} {description}" for name, description in _STATE_GUIDE)
+    lines.append("")
+
+    lines.append("CAPTURING A NAMED POSITION")
+    lines.extend(
+        f"  {line}"
+        for line in (
+            "Move the arm to the pose, press p, then q. The pose is printed and",
+            "offered as a named position; `just goto <name>` drives back to it.",
+            "Measure it three times from different directions first -- a pose that",
+            "does not repeat is a fixture or calibration problem, not a preset.",
+            "Saving does not make it safe: docs/named-position-capture.md step 3 is",
+            "the reduced-speed ladder that does.",
+        )
+    )
+    return lines
+
+
+def _mode_guide(context: MonitorContext) -> tuple[str, ...]:
+    """What this mode is doing to the arm. The one thing that must never be ambiguous."""
+
+    if context.fake:
+        return (
+            "FAKE ARM. Every number below is generated by a deterministic stand-in.",
+            "No CAN bus, no claim, nothing measured. A pose cannot be saved from here.",
+        )
+    if context.powered:
+        return (
+            "POWERED. The follower is enabled and tracking the Star leader at a",
+            "bounded velocity. space pauses following and holds; q stops, holds and",
+            "releases. This process holds the robot lease, so no worker can run.",
+        )
+    return (
+        "READ ONLY. The arm is never enabled, so you can position it by hand.",
+        "space freezes the display. This process still holds the robot lease.",
+    )
 
 
 def _summary(sample: MonitorSample) -> str:
@@ -256,6 +362,58 @@ def _summary_attr(sample: MonitorSample, palette: _Palette) -> int:
     return palette.ok
 
 
+def _show_help(
+    screen: curses.window,
+    context: MonitorContext,
+    palette: _Palette,
+    controller: TeleoperationController | None,
+) -> None:
+    """Draw the guide until a key dismisses it, scrolling when it does not fit.
+
+    Never blocks: ``getch`` keeps the poll timeout, so a teleoperation failure ends the
+    guide instead of waiting behind it. The controller holds the arm itself either way,
+    but an operator reading help should not be the last to hear that following stopped.
+    """
+
+    lines = help_lines(context)
+    top = 0
+    while True:
+        height, _ = screen.getmaxyx()
+        body = max(1, height - 1)
+        top = max(0, min(top, max(0, len(lines) - body)))
+        scrollable = len(lines) > body
+
+        screen.erase()
+        for offset in range(min(body, len(lines) - top)):
+            line = lines[top + offset]
+            heading = line[:1].isupper() and line == line.upper() and not line.startswith(" ")
+            _put(screen, offset, 0, line, palette.head if heading else 0)
+        if scrollable:
+            shown = f"{top + 1}-{min(top + body, len(lines))} of {len(lines)}"
+            hint = f"up/down scroll · any other key returns  ({shown})"
+        else:
+            hint = "any key returns"
+        _put(screen, height - 1, 0, hint, palette.dim)
+        screen.noutrefresh()
+        curses.doupdate()
+
+        key = screen.getch()
+        if controller is not None and controller.error:
+            return
+        if key in (-1, curses.KEY_RESIZE):
+            continue
+        if key in (curses.KEY_DOWN, ord("j")):
+            top += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            top -= 1
+        elif key == curses.KEY_NPAGE:
+            top += body
+        elif key == curses.KEY_PPAGE:
+            top -= body
+        else:
+            return
+
+
 def run_tui(
     monitor: JointMonitor,
     context: MonitorContext,
@@ -274,7 +432,15 @@ def run_tui(
         captured: MonitorSample | None = None
         sample = monitor.sample()
         while True:
-            _draw(screen, monitor, sample, context, palette, paused=paused)
+            _draw(
+                screen,
+                monitor,
+                sample,
+                context,
+                palette,
+                paused=paused,
+                captured=None if captured is None else captured.index,
+            )
             if controller is not None and controller.error:
                 return captured
             key = screen.getch()
@@ -289,6 +455,8 @@ def run_tui(
                 sample = captured
             elif key == ord(" "):
                 paused = controller.toggle_pause() if controller is not None else not paused
+            elif key in (ord("?"), ord("h"), curses.KEY_F1):
+                _show_help(screen, context, palette, controller)
             elif key == curses.KEY_RESIZE:
                 continue
             if not paused or controller is not None:

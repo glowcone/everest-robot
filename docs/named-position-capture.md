@@ -14,7 +14,8 @@ positions, and one operator has a hand on the e-stop for every step below.
    This one process owns the follower lease, follows the leader at a conservative velocity,
    and renders the follower's measured encoders. It is a POWERED operation.
 2. Move the leader until the follower reaches the target pose. Press space to pause following
-   and hold the follower at the measured pose. Do not type the pose in.
+   and hold the follower at the measured pose. Do not type the pose in. `?` opens an
+   on-screen guide to the columns, the joint states, and this procedure.
 3. Press `p` to capture the current follower state, then `q`. Once the TUI restores the
    terminal it prints the pose in canonical radians with robot, calibration, and
    configuration identity, then offers to save it -- see step 2. Support the arm while the

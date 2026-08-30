@@ -1,13 +1,23 @@
+import inspect
 import math
+import re
 
 import pytest
 
 from everest_robot.monitor import (
+    _COLUMN_GUIDE,
+    _HELP,
+    _KEY_BINDINGS,
+    _KEY_GUIDE,
+    _STATE_GUIDE,
     MonitorContext,
     _header_row,
     _prompt_save,
     _row,
+    _state_of,
     _unsaveable,
+    help_lines,
+    run_tui,
 )
 from everest_robot.robot.clock import ManualClock
 from everest_robot.robot.contracts import ArmLifecycle, JointLimit, RobotIdentity
@@ -368,3 +378,94 @@ def test_a_pose_outside_the_soft_limits_is_not_offered() -> None:
     reason = _unsaveable(sample_of(arm, clock), capture_context())
 
     assert reason is not None and "shoulder_lift outside" in reason
+
+
+# ── the on-screen guide ────────────────────────────────────────────────────────────
+
+
+def test_the_footer_and_the_guide_describe_the_same_keys() -> None:
+    """One table drives both, so a new binding cannot be documented in only one place."""
+
+    assert [key for key, _ in _KEY_BINDINGS] == [key for key, _ in _KEY_GUIDE]
+    for key, _label in _KEY_BINDINGS:
+        assert f"{key} " in _HELP
+
+
+def test_every_key_the_loop_handles_is_in_the_guide() -> None:
+    source = inspect.getsource(run_tui)
+    handled = {match.group(1) for match in re.finditer(r'ord\("(.)"\)', source)}
+    documented = {key for key, _ in _KEY_GUIDE} | {" "}
+
+    # 'h' is an alias for '?', and 'Q' for 'q'; neither needs its own guide entry.
+    assert handled - documented <= {"h", "Q"}
+
+
+def test_the_guide_explains_every_column_the_table_can_draw() -> None:
+    headers = set(re.split(r"\s{2,}", _header_row(200).strip()))
+    explained = {name for name, _ in _COLUMN_GUIDE}
+
+    assert headers - {"joint"} <= explained
+
+
+def test_the_guide_explains_every_state_a_joint_can_report() -> None:
+    clock = ManualClock()
+    faulted = connected_arm(clock)
+    faulted.inject_fault("injected motor fault")
+    stale = connected_arm(clock, stale_after_commands=0)
+    quiet_monitor = JointMonitor(stale, clock=clock)
+    quiet_monitor.sample()
+    clock.advance(5.0)
+    missing = connected_arm(clock)
+    missing.positions[0] = math.nan
+    outside = connected_arm(clock)
+    outside.positions[0] = -9.0
+
+    reported = set()
+    for sample in (
+        sample_of(connected_arm(clock), clock),
+        JointMonitor(faulted, clock=clock).sample(),
+        quiet_monitor.sample(),
+        sample_of(missing, clock),
+        sample_of(outside, clock),
+    ):
+        reported.update(_state_of(reading) for reading in sample.readings)
+
+    explained = {name for name, _ in _STATE_GUIDE}
+    for state in reported:
+        assert any(state.startswith(name.split()[0]) for name in explained), state
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"powered": True}, "POWERED"),
+        ({"powered": False}, "READ ONLY"),
+        ({"fake": True, "powered": False}, "FAKE ARM"),
+    ],
+)
+def test_the_guide_leads_with_what_this_mode_does_to_the_arm(kwargs, expected) -> None:
+    lines = help_lines(capture_context(**kwargs))
+
+    body = "\n".join(lines)
+    assert expected in body
+    # Before anything else a reader might skim past.
+    assert lines.index("WHAT THIS SESSION IS DOING") < lines.index("KEYS")
+
+
+def test_the_fake_guide_says_a_pose_cannot_be_saved_from_it() -> None:
+    body = "\n".join(help_lines(capture_context(fake=True, powered=False)))
+
+    assert "cannot be saved" in body
+
+
+def test_the_guide_points_at_the_validation_that_makes_a_preset_safe() -> None:
+    body = "\n".join(help_lines(capture_context()))
+
+    assert "just goto" in body
+    assert "named-position-capture.md" in body
+
+
+def test_the_guide_fits_a_standard_terminal() -> None:
+    for context in (capture_context(), capture_context(fake=True, powered=False)):
+        for line in help_lines(context):
+            assert len(line) <= 78, line

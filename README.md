@@ -148,8 +148,10 @@ just monitor-once     # one snapshot as plain text; redirect it next to a captur
 just monitor-fake     # the display against the deterministic fake arm, no hardware
 ```
 
-Keys: `q` stop and hold, `p` capture a copyable pose, `z` mark the current pose as the
-reference, `Z` clear it, and `space` pause/resume leader following.
+Keys: `q` stop and hold, `p` capture a pose, `z` mark the current pose as the reference,
+`Z` clear it, `space` pause/resume leader following, and `?` for the on-screen guide — what
+this mode is doing to the arm, what every column and joint state means, and how a capture
+becomes a named position. A held capture is shown as `POSE HELD` in the status line.
 
 Set `EVEREST_STAR_PORT` before using powered mode. Startup reads all seven leader servos,
 compares the mapped pose with the follower, and requires confirmation for a large difference

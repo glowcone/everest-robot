@@ -87,7 +87,11 @@ Absurd checkpoints store.
   processes or allow either to bypass the robot lease. Pressing `p` captures a pose; the
   save prompt for it runs in `monitor.py` after the session has closed, so the arm is held,
   disabled and released before anyone is waiting on a keyboard. Do not move that prompt
-  inside the session or into the curses loop.
+  inside the session or into the curses loop. `_KEY_BINDINGS` is the one key table: the
+  footer and the `?` guide are both derived from it, and tests assert the guide covers
+  every key the loop handles, every column the table can draw and every state a joint can
+  report. The guide's overlay never blocks on input -- a teleoperation failure has to be
+  able to end it.
 - `goto.py` (`robot-goto`) and `jog.py` (`robot-raise`) are the only motion commands outside
   the durable workflow, and both are thin: they resolve a destination and hand it to
   `JointMotionController`. Keep it that way -- no second path to the motors. `goto.py`
