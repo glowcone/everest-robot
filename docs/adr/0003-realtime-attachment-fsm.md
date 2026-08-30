@@ -90,9 +90,11 @@ The state machine is:
                  Any active state -- action or time budget exhausted --> FAILED
 ```
 
-`INITIAL` performs validation and one coherent observation before any motion. It always
-appears in the transition trace, even when that observation immediately selects another
-state. There is no automatic move to a neutral pose.
+`INITIAL` performs validation and one coherent observation before any motion. With torque
+off it requires multiple advancing, finite, fault-free, in-limit and stationary feedback
+samples plus configured camera shapes. It always appears in the transition trace, even
+when that observation immediately selects another state. There is no automatic move to a
+neutral pose.
 
 `SEARCH_RL` executes one learned action and then gives the detector an opportunity to take
 over. A detection transitions to `SEARCH_CV`; otherwise it remains in `SEARCH_RL` until its
@@ -122,8 +124,9 @@ The decision above requires `CLIP_RL` to observe "the policy reports that it has
 neutral", but does not say what that report physically is. The implementation reads it from
 the existing policy boundary: `PolicyHandle.select_action` returning `None`, which the
 protocol already defines as "the policy considers the task finished". A `PolicySession` step
-that terminates with `COMPLETED` is therefore reported as `returned_to_neutral=True`, and
-the FSM resets to `INITIAL`.
+that terminates with `COMPLETED` is therefore a neutral candidate. The handler reports
+`returned_to_neutral=True` only after fresh feedback confirms the operator-captured neutral
+pose and stationarity, and then the FSM resets to `INITIAL`.
 
 This is a mapping chosen to avoid inventing a second completion channel, not an observed
 property of the policy that will run here. It is wrong if any of the following turns out to
@@ -133,8 +136,8 @@ be true of the trained checkpoint:
   pose the caller is expected to recognize -- and returns `None` for a different reason, or
   never returns `None` at all;
 - the policy returns `None` on outcomes that are *not* a return to neutral, such as giving
-  up or losing the carabiner, in which case the FSM resets to `INITIAL` and re-observes when
-  it should be failing or recovering; or
+  up or losing the carabiner; measured confirmation prevents a false reset, but the attempt
+  aborts instead of selecting a more specific recovery; or
 - the policy returns to neutral without reporting anything, in which case the reset never
   fires and the attempt spends its lifetime budget in `CLIP_RL`.
 
@@ -143,11 +146,9 @@ mapping the test asserts. Verifying it requires observing a real checkpoint's te
 behaviour on the arm and confirming that `select_action` returning `None` coincides with the
 end effector actually being at neutral.
 
-Until that is confirmed, the alternative this ADR already names remains open: a configured,
-measured neutral-pose tolerance, evaluated against the arm's own joint feedback rather than
-against anything the policy says. That option needs no cooperation from the checkpoint and
-would replace the mapping rather than supplement it. Do not infer neutral from elapsed steps
-under either option.
+Measured neutral-pose confirmation is mandatory even while checkpoint completion remains
+the trigger. It uses an operator-captured named position in robot configuration, never
+hand-written joint values. Do not infer neutral from elapsed steps or action count.
 
 All active states have explicit action and wall-clock budgets. Cancellation and any
 `BaseException` unwind through the robot session after holding the arm. A process crash is

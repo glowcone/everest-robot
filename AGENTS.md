@@ -56,7 +56,9 @@ after a learned action has already moved the arm.
 `CLIP_RL` reads "the policy returned to neutral" from `select_action()` returning `None`.
 That mapping is marked UNVERIFIED in ADR-0003 and in `clip_rl_step`'s docstring, and a
 scripted policy cannot confirm it. Do not delete the marker or write a test that claims to
-verify it; confirming it needs a trained checkpoint on the arm.
+verify it; confirming it needs a trained checkpoint on the arm. Completion is only a
+candidate: reset also requires fresh stationary feedback within the operator-captured
+`neutral` named-position tolerance. Never reset from the policy signal alone.
 
 ## The robot SDK layer
 
@@ -97,6 +99,10 @@ Absurd checkpoints store.
   absolute schedule because it owns an uninterrupted rollout, while a session sets each
   deadline from when the previous action went out and absorbs a late step rather than making
   it up -- the same rule replay follows for a late frame. Do not unify them.
+- `robot/readiness.py` owns INITIAL's passive admission check. It runs with torque off and
+  requires advancing finite feedback, no faults, in-limit positions, stationarity, and
+  configured camera shapes. `RobstrideMitPort.enable()` obtains another fresh sample and
+  seeds the first MIT goal from that measured pose. Never weaken freshness to accept cache.
 - `policy.load_policy()` is the only place a file path becomes a `PolicyHandle`. A checkpoint
   directory or suffix routes to the guarded `LeRobotPolicyHandle`; a `.json` scripted policy
   is read strictly and is for rehearsal, never a trained policy. Both are resolved before the

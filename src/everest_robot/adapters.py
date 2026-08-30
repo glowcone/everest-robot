@@ -15,6 +15,7 @@ never names a backend.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -150,6 +151,8 @@ class AttachmentPerception(Protocol):
     def preflight(self) -> None:
         """Raise unless every gate below can be served. Called before the robot is claimed."""
 
+    def initial_observation(self) -> InitialObservation: ...
+
     def carabiner_detection(self) -> SearchRLStep: ...
 
     def clip_observations(self) -> ClipRLStep: ...
@@ -173,6 +176,10 @@ class UnavailableAttachmentPerception:
         )
 
     def carabiner_detection(self) -> SearchRLStep:
+        self.preflight()
+        raise AssertionError("unreachable")
+
+    def initial_observation(self) -> InitialObservation:
         self.preflight()
         raise AssertionError("unreachable")
 
@@ -213,6 +220,10 @@ class EverestAttachmentFSMHandlers:
     rate_hz: float = 15.0
     max_velocity_rad_s: float = 0.15
     lock_frames: int = 3
+    neutral_position: tuple[float, ...] | None = None
+    neutral_tolerance_rad: float = 0.05
+    neutral_velocity_rad_s: float = 0.05
+    last_readiness: Any = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         from everest_robot.pixel_map import PixelMapError, RobotStamp
@@ -272,13 +283,21 @@ class EverestAttachmentFSMHandlers:
         if rollout is not None:
             rollout.seed()
 
-    def observe_initial(self) -> InitialObservation:
-        raise NotImplementedError(
-            "INITIAL needs one coherent camera observation plus non-moving attachment "
-            "verification; integrate the detector and verifier here"
-        )
-
     # ── the learned states ─────────────────────────────────────────────────────────
+    def observe_initial(self) -> InitialObservation:
+        """Prove passive hardware readiness, then take one coherent scene observation."""
+
+        self.last_readiness = self.session.initial_readiness(
+            neutral_position=self.neutral_position,
+            neutral_tolerance_rad=self.neutral_tolerance_rad,
+        )
+        if not self.last_readiness.ready:
+            raise AttachmentAbort(
+                "INITIAL passive readiness refused: "
+                + "; ".join(self.last_readiness.problems)
+            )
+        return self.perception.initial_observation()
+
     def search_rl_step(self) -> SearchRLStep:
         """One learned search action, then a fresh look for the carabiner."""
 
@@ -335,14 +354,15 @@ class EverestAttachmentFSMHandlers:
         task finished". The mapping was chosen so the FSM needs no second completion
         channel, but it has not been confirmed against a real checkpoint on hardware, and a
         scripted policy cannot confirm it: a fake exhibits whatever mapping its test
-        asserts. If the checkpoint signals neutral some other way, returns ``None`` for an
-        unrelated reason such as giving up, or returns to neutral silently, this is the line
-        to change. See ADR-0003, "Assumption pending verification", and the alternative it
-        names: a configured, measured neutral-pose tolerance read from joint feedback.
+        asserts. Completion is only a candidate; fresh stationary feedback must also match
+        the operator-captured neutral pose. If the checkpoint signals neutral some other
+        way or returns to neutral silently, this is the line to change. See ADR-0003,
+        "Assumption pending verification".
         """
 
         step = self._advance(AttachmentState.CLIP_RL)
         if step.termination is TerminationReason.COMPLETED:
+            self._require_measured_neutral()
             # ADR-0003 gives the neutral signal precedence over any same-step verification.
             # The FSM goes back to INITIAL, which takes its own motion-free observation, so
             # spending a perception call here would answer a question about to be asked
@@ -436,6 +456,32 @@ class EverestAttachmentFSMHandlers:
             # Hold: the arm is about to be handed to a policy that seeds from feedback.
             follower.stop()
 
+    def _require_measured_neutral(self) -> None:
+        if self.neutral_position is None:
+            raise AttachmentAbort(
+                "clip policy completed but no operator-captured neutral pose is configured"
+            )
+        state = self.session.snapshot()
+        if state.has_fault or not state.all_finite:
+            raise AttachmentAbort("clip policy completed without valid neutral feedback")
+        max_velocity = max((abs(value) for value in state.velocities), default=0.0)
+        if not math.isfinite(max_velocity) or max_velocity > self.neutral_velocity_rad_s:
+            raise AttachmentAbort(
+                f"clip policy completed while arm was moving at {max_velocity:.3f} rad/s"
+            )
+        if len(state.positions) != len(self.neutral_position):
+            raise AttachmentAbort("configured neutral pose has the wrong joint count")
+        error = max(
+            abs(actual - target)
+            for actual, target in zip(
+                state.positions, self.neutral_position, strict=True
+            )
+        )
+        if error > self.neutral_tolerance_rad:
+            raise AttachmentAbort(
+                f"clip policy completed {error:.3f} rad from neutral; "
+                f"tolerance is {self.neutral_tolerance_rad:.3f} rad"
+            )
 
 @contextmanager
 def attachment_fsm_handlers(
@@ -463,6 +509,7 @@ def attachment_fsm_handlers(
     if backend != "hardware":
         raise ValueError(f"unknown robot backend {backend!r} (expected scaffold or hardware)")
 
+    from everest_robot.robot.deployment import load_parameters
     from everest_robot.robot.policy import load_policy
 
     search_path = params.get("search_policy")
@@ -485,6 +532,16 @@ def attachment_fsm_handlers(
     checks = perception if perception is not None else UnavailableAttachmentPerception()
     checks.preflight()
 
+    parameters = load_parameters()
+    neutral_name = str(params.get("neutral_position") or "neutral")
+    neutral = parameters.named_positions.get(neutral_name)
+    if neutral is None:
+        known = ", ".join(sorted(parameters.named_positions)) or "none captured"
+        raise ValueError(
+            f"the hardware FSM requires an operator-captured neutral named position "
+            f"{neutral_name!r} before it can verify policy reset; available: {known}"
+        )
+
     from everest_robot.robot.deployment import load_pixel_map, open_session
 
     # The pixel map is read and refused here for the same reason the policies are: a stale
@@ -501,6 +558,8 @@ def attachment_fsm_handlers(
             perception=checks,
             task=params.get("attachment_task"),
             fps=None if params.get("policy_fps") is None else float(params["policy_fps"]),
+            neutral_position=neutral.joints,
+            neutral_tolerance_rad=neutral.profile.tolerance_rad,
         )
         try:
             yield handlers

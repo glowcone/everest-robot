@@ -50,6 +50,7 @@ class StubBus:
     # slcan line garbage: python-can's parser raises ValueError on a torn frame.
     garbled: set[str] = field(default_factory=set)
     fail_writes: bool = False
+    advance_feedback: bool = True
     flushes: int = 0
     goal_writes: list[dict[str, float]] = field(default_factory=list)
     gain_writes: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -96,6 +97,9 @@ class StubBus:
     def read(self, data_name: str, motor: str) -> float:
         self._check(motor)
         if data_name == "Present_Position":
+            if self.advance_feedback:
+                current = self.last_feedback_time[motor] or 0.0
+                self.last_feedback_time[motor] = current + 1.0
             return self.positions[motor]
         if data_name == "Present_Velocity":
             return 90.0  # deg/s
@@ -214,6 +218,26 @@ def test_enable_writes_the_follow_gains_before_torque() -> None:
     assert port._bus.gain_writes["Kd"] == {name: kd for name, (_, kd) in GAINS.items()}
 
 
+def test_enable_seeds_the_first_goal_from_fresh_measured_positions() -> None:
+    port = enabled_port()
+
+    assert port._bus.goal_writes[0] == {
+        "shoulder_pan": pytest.approx(-110.0),
+        "shoulder_lift": pytest.approx(-40.0),
+        "gripper": pytest.approx(-5.0),
+    }
+
+
+def test_enable_refuses_feedback_that_did_not_advance() -> None:
+    port = make_port(advance_feedback=False)
+    port.connect()
+
+    with pytest.raises(RuntimeError, match="fresh feedback"):
+        port.enable()
+
+    assert port._bus.torque_enabled is False
+
+
 # ── enable limit gating and full-turn correction ──────────────────────────────────
 def test_enable_refuses_a_pose_outside_limits_and_not_by_a_whole_turn() -> None:
     port = make_port(
@@ -262,12 +286,10 @@ def test_send_targets_round_trips_through_the_frame() -> None:
     targets = FRAME.to_radians([-100.0, -60.0, -10.0])
 
     assert port.send_targets(targets) is True
-    assert port._bus.goal_writes == [
-        {
-            name: pytest.approx(deg)
-            for name, deg in zip(JOINTS, [-100.0, -60.0, -10.0], strict=True)
-        }
-    ]
+    assert port._bus.goal_writes[-1] == {
+        name: pytest.approx(deg)
+        for name, deg in zip(JOINTS, [-100.0, -60.0, -10.0], strict=True)
+    }
     assert port.last_command.clipped_joints == ()
 
 
@@ -286,10 +308,11 @@ def test_limits_are_the_mit_tables_in_calibrated_radians() -> None:
 # ── command validation ─────────────────────────────────────────────────────────────
 def test_malformed_targets_never_reach_the_bus() -> None:
     port = enabled_port()
+    writes = len(port._bus.goal_writes)
 
     assert port.send_targets([0.1, 0.2]) is False
     assert port.send_targets([0.1, math.nan, 0.0]) is False
-    assert port._bus.goal_writes == []
+    assert len(port._bus.goal_writes) == writes
 
 
 def test_out_of_limit_targets_are_clipped_and_reported() -> None:
@@ -317,16 +340,17 @@ def test_hold_current_position_resends_the_last_read_pose() -> None:
 
 def test_hold_refuses_without_a_finite_pose() -> None:
     port = enabled_port()
+    writes = len(port._bus.goal_writes)
     port._bus.silent.add("shoulder_lift")
     port.read_state()  # shoulder_lift yields nan
 
     assert port.hold_current_position() is False
-    assert port._bus.goal_writes == []
+    assert len(port._bus.goal_writes) == writes
 
 
 # ── feedback freshness and faults ──────────────────────────────────────────────────
 def test_sequence_advances_only_on_fresh_feedback() -> None:
-    port = make_port()
+    port = make_port(advance_feedback=False)
     port.connect()
 
     first = port.read_state()

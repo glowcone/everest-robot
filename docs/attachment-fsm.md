@@ -109,7 +109,11 @@ terminal outcome and on any exception, which is where a hold belongs.
 
 ### `observe_initial()`
 
-Capture one coherent, motion-free scene observation. Run:
+The hardware half is implemented by `InitialReadinessChecker`. With torque off it requires
+three advancing feedback samples, finite telemetry, no faults, in-limit positions, a
+stationary arm, and every configured camera name and shape. The handler retains the report
+for diagnosis. The perception half remains behind
+`AttachmentPerception.initial_observation()`: capture one coherent, motion-free scene and run:
 
 - attachment verification, producing `already_attached`;
 - carabiner detection, producing `carabiner_detected` and measured confidence.
@@ -117,6 +121,9 @@ Capture one coherent, motion-free scene observation. Run:
 Attachment wins if both are true. This handler must not enable the arm or move to a named
 or neutral position. Detector thresholds and camera selection belong in validated robot
 configuration, not in the FSM or CLI.
+
+The hardware entrypoint requires an operator-captured `neutral` named position (or the name
+passed as `neutral_position`) before claiming the arm. Never hand-write its joint values.
 
 ### `search_rl_step()`
 
@@ -193,7 +200,7 @@ The action and `returned_to_neutral` are implemented; the remaining evidence is 
 evidence is needed for:
 
 - `attachment_verified` -- **not implemented**, behind `AttachmentPerception`;
-- `returned_to_neutral` -- implemented, but on an **unverified assumption**; see below;
+- `returned_to_neutral` -- implemented from policy completion plus measured pose;
 - `carabiner_grasped` -- **not implemented**;
 - `carabiner_visible` -- **not implemented**;
 - `alignment_degraded` -- **not implemented**;
@@ -208,24 +215,32 @@ the FSM re-observes on arrival at `INITIAL`, the handler short-circuits on this 
 does not spend a perception call answering a question that is about to be asked again.
 
 > **Unverified assumption -- confirm before running a trained checkpoint.**
-> `returned_to_neutral` is read from `PolicyHandle.select_action` returning `None`, which the
+> A neutral candidate is read from `PolicyHandle.select_action` returning `None`, which the
 > policy protocol already defines as "the policy considers the task finished": a
 > `PolicySession` step terminating with `COMPLETED` is reported as
-> `returned_to_neutral=True`. This mapping was chosen to avoid inventing a second completion
-> channel. It has **not** been confirmed against a real checkpoint on hardware, and a
+> completion signal. Fresh feedback must then show a stationary arm within the captured
+> neutral pose's tolerance before `returned_to_neutral=True` is reported. The trigger has
+> **not** been confirmed against a real checkpoint on hardware, and a
 > scripted policy cannot confirm it -- a fake exhibits whatever mapping the test asserts.
 >
 > It is wrong if the policy signals neutral some other way, returns `None` for unrelated
-> reasons such as giving up (the FSM would reset and re-observe instead of failing), or
+> reasons such as giving up (measured confirmation prevents reset but aborts the attempt), or
 > returns to neutral silently (the reset would never fire and the attempt would spend its
 > lifetime budget in `CLIP_RL`). Verify by observing a trained checkpoint's terminal
 > behaviour on the arm and confirming `None` coincides with the end effector actually being
 > at neutral. Rationale and the alternative are in
 > [ADR-0003](adr/0003-realtime-attachment-fsm.md#assumption-pending-verification-how-a-policy-reports-its-return-to-neutral).
 
-Do not infer neutral from elapsed steps. The alternative to the mapping above is a
-configured, measured neutral-pose tolerance evaluated against the arm's own joint feedback,
-which needs no cooperation from the checkpoint.
+Do not infer neutral from elapsed steps. Measured neutral-pose confirmation against the
+arm's own joint feedback is mandatory, not an alternative to the completion trigger.
+
+## First enable gate
+
+`RobstrideMitPort.enable()` waits past the bus cache TTL, requires a new feedback stamp from
+every motor, reconciles only an explainable full-turn wrap, and refuses non-finite or
+out-of-limit feedback. It enables torque and immediately seeds every MIT goal with that
+same measured pose; a partial failure disables torque before propagating. Preserve this
+ordering so the first target can never be a zero, cache entry, or previous process command.
 
 ### `hold(reason)`
 

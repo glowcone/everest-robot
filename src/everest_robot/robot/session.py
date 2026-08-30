@@ -22,6 +22,7 @@ from everest_robot.robot.motion import JointMotionController
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.policy import PolicyHandle, PolicyRunner, PolicySession
 from everest_robot.robot.ports import ArmPort
+from everest_robot.robot.readiness import InitialReadinessChecker, InitialReadinessReport
 from everest_robot.robot.recording import SessionRecorder
 
 
@@ -190,6 +191,24 @@ class RobotSession:
 
         self._require_open()
         return self.port.read_state()
+
+    def initial_readiness(
+        self,
+        *,
+        neutral_position: tuple[float, ...] | None = None,
+        neutral_tolerance_rad: float = 0.05,
+    ) -> InitialReadinessReport:
+        """Gather passive INITIAL evidence while the arm remains torque-free."""
+
+        self._require_open()
+        return InitialReadinessChecker(
+            self.port,
+            camera_observation=self.bridge.cameras.observation,
+            expected_camera_shapes=self.bridge.cameras.features(),
+            neutral_position=neutral_position,
+            neutral_tolerance_rad=neutral_tolerance_rad,
+            clock=self.clock,
+        ).check()
 
     def _require_open(self) -> None:
         if not self._open:

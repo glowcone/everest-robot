@@ -37,17 +37,21 @@ from robot.test_policy_session import ACTION_KEYS, IDENTITY, LIMITS, act, parame
 class ScriptedPerception:
     """The gate signals, queued. Stands in for the detector and the attachment checks."""
 
-    def __init__(self, detections=(), clips=()) -> None:
+    def __init__(self, detections=(), clips=(), initial=None) -> None:
         self.detections = list(detections)
         self.clips = list(clips)
         self.detection_calls = 0
         self.clip_calls = 0
+        self.initial = initial or InitialObservation(False, False)
 
     def preflight(self) -> None: ...
 
     def carabiner_detection(self) -> SearchRLStep:
         self.detection_calls += 1
         return self.detections.pop(0) if self.detections else SearchRLStep(False)
+
+    def initial_observation(self) -> InitialObservation:
+        return self.initial
 
     def clip_observations(self) -> ClipRLStep:
         self.clip_calls += 1
@@ -84,11 +88,13 @@ def make_handlers(tmp_path, perception=None, **overrides):
         lease=InMemoryLease(IDENTITY.robot_id),
         clock=clock,
     ).open()
+    neutral_position = overrides.pop("neutral_position", tuple(arm.positions))
     handlers = EverestAttachmentFSMHandlers(
         session,
         load_policy(write_policy(tmp_path, "search.json")),
         load_policy(write_policy(tmp_path, "clip.json")),
         perception=perception or ScriptedPerception(),
+        neutral_position=neutral_position,
         **overrides,
     )
     return handlers, arm, session, clock
@@ -102,6 +108,19 @@ def test_entering_a_learned_state_seeds_only_that_state(tmp_path) -> None:
 
     assert handlers.policy_session_for(AttachmentState.SEARCH_RL).seeded
     assert not handlers.policy_session_for(AttachmentState.CLIP_RL).seeded
+    session.close()
+
+
+def test_initial_is_passive_and_runs_readiness_before_perception(tmp_path) -> None:
+    perception = ScriptedPerception(initial=InitialObservation(False, True, 0.9))
+    handlers, arm, session, _ = make_handlers(tmp_path, perception)
+
+    observation = handlers.observe_initial()
+
+    assert observation == InitialObservation(False, True, 0.9)
+    assert handlers.last_readiness.ready
+    assert arm.lifecycle is ArmLifecycle.CONNECTED
+    assert arm.sent_commands == []
     session.close()
 
 
@@ -158,7 +177,11 @@ def test_a_policy_returning_to_neutral_is_reported_without_asking_perception(tmp
     """
 
     perception = ScriptedPerception()
-    handlers, _, session, _ = make_handlers(tmp_path, perception)
+    handlers, _, session, _ = make_handlers(
+        tmp_path,
+        perception,
+        neutral_position=tuple(act(0.05).values()),
+    )
     handlers.enter_state(AttachmentState.CLIP_RL, None)
     for _ in range(8):
         handlers.clip_rl_step()
@@ -278,6 +301,23 @@ def test_perception_is_checked_before_the_robot_is_claimed(tmp_path, monkeypatch
     with pytest.raises(
         NotImplementedError, match="attachment perception"
     ), attachment_fsm_handlers(params):
+        pass
+
+
+def test_missing_named_neutral_is_refused_before_robot_claim(tmp_path, monkeypatch) -> None:
+    def explode(*args, **kwargs):
+        raise AssertionError("the robot must not be claimed without a measured neutral pose")
+
+    monkeypatch.setattr("everest_robot.robot.deployment.open_session", explode)
+    params = {
+        "backend": "hardware",
+        "search_policy": str(write_policy(tmp_path, "search.json")),
+        "clip_policy": str(write_policy(tmp_path, "clip.json")),
+    }
+
+    with pytest.raises(ValueError, match="operator-captured neutral"), attachment_fsm_handlers(
+        params, perception=ScriptedPerception()
+    ):
         pass
 
 
