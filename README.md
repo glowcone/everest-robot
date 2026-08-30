@@ -42,6 +42,11 @@ they never command the robot. See [`docs/carabiner-marker-vision.md`](docs/carab
 for the one-frame and continuous commands, ROI setup, output meanings, and optional
 pixel-to-robot configuration.
 
+Cartesian arm conversion is implemented through the adjacent Maker Arm SDK checkout, but
+requires the real six-axis Maker Arm URDF before its results are physically meaningful.
+See [`docs/cartesian-kinematics.md`](docs/cartesian-kinematics.md) for recorded-joint FK,
+read-only camera calibration capture, offline IK, and the hardware acceptance procedure.
+
 ### The two workflows
 
 | Task | Spawn it with | What it does |

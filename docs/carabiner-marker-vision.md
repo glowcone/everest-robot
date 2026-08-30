@@ -72,11 +72,36 @@ actual camera and robot:
 cp pickup_config.example.json pickup_config.json
 ```
 
-`image_points_px` and `robot_points_m` must list the same four table points in the same
-order. `robot_points_m` must be measured in the robot base frame; they cannot be inferred
-from camera pixels alone. The example image points are the four black tape centers captured
-from the current KD-USB setup in top-left, top-right, bottom-right, bottom-left order. The
-example robot coordinates are placeholders and must not be used to command the arm.
+`image_points_px` and `robot_points_m` must list the same table points in the same order.
+Use at least four non-collinear points spread across the pickup area. More measured pairs
+are supported and give the matrix solver a least-squares fit that is less sensitive to
+clicking and measurement noise. `robot_points_m` must be measured in the robot base frame;
+they cannot be inferred from camera pixels alone. The example image points are the four
+black tape centers captured from the current KD-USB setup in top-left, top-right,
+bottom-right, bottom-left order. The example robot coordinates are placeholders and must
+not be used to command the arm.
+
+The solver computes a 3x3 homography `H`:
+
+```text
+[rx, ry, w]^T = H [u, v, 1]^T
+x = rx / w
+y = ry / w
+```
+
+Check a camera point without opening the camera or commanding the robot:
+
+```bash
+just camera-to-xy 1000 650 pickup_config.json
+```
+
+The command prints the solved matrix and the resulting robot-base `x` and `y` in meters.
+You can also convert several points in one invocation:
+
+```bash
+uv run robot-camera-to-xy --config pickup_config.json \
+    --point 1000 650 --point 1100 700
+```
 
 Once calibrated, pass the file to print the calculated pregrasp target alongside each
 detection:

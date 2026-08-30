@@ -47,8 +47,8 @@ class PickupPlan:
 
 @dataclass(frozen=True)
 class PickupConfig:
-    image_points_px: tuple[Point2, Point2, Point2, Point2]
-    robot_points_m: tuple[Point2, Point2, Point2, Point2]
+    image_points_px: tuple[Point2, ...]
+    robot_points_m: tuple[Point2, ...]
     carabiner_center_from_marker_midpoint_m: Point2
     grasp_offset_from_carabiner_m: Point2
     grasp_yaw_offset_rad: float
@@ -68,27 +68,80 @@ def rotation2(theta_rad: float) -> np.ndarray:
     return np.array([[c, -s], [s, c]], dtype=float)
 
 
+def _normalized_points(points: list[Point2], *, label: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return Hartley-normalized homogeneous points and their normalization matrix."""
+
+    coordinates = np.array([[point.x, point.y] for point in points], dtype=float)
+    if not np.all(np.isfinite(coordinates)):
+        raise ValueError(f"{label} points must contain only finite coordinates.")
+    if np.linalg.matrix_rank(coordinates - coordinates.mean(axis=0)) < 2:
+        raise ValueError(f"{label} points must span a 2D area and cannot all be collinear.")
+
+    center = coordinates.mean(axis=0)
+    centered = coordinates - center
+    mean_distance = float(np.mean(np.linalg.norm(centered, axis=1)))
+    if mean_distance < 1e-12:
+        raise ValueError(f"{label} points are too close together to calibrate.")
+
+    scale = math.sqrt(2.0) / mean_distance
+    normalization = np.array(
+        [
+            [scale, 0.0, -scale * center[0]],
+            [0.0, scale, -scale * center[1]],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    homogeneous = np.column_stack((coordinates, np.ones(len(points), dtype=float)))
+    return (normalization @ homogeneous.T).T, normalization
+
+
 def find_homography(image_points: Iterable[Point2], robot_points: Iterable[Point2]) -> np.ndarray:
-    """Return H such that [x, y, 1] ~= H @ [u, v, 1]."""
+    """Solve the camera-pixel to robot-table matrix.
+
+    Returns ``H`` such that ``[x, y, w] = H @ [u, v, 1]`` and the robot coordinates
+    are ``(x / w, y / w)``. Four point pairs give an exact solution; additional pairs
+    produce a least-squares fit that is normally less sensitive to measurement noise.
+    """
 
     src = list(image_points)
     dst = list(robot_points)
-    if len(src) != 4 or len(dst) != 4:
-        raise ValueError("Planar homography calibration requires exactly four point pairs.")
+    if len(src) != len(dst):
+        raise ValueError("Camera and robot calibration point counts must match.")
+    if len(src) < 4:
+        raise ValueError("Planar homography calibration requires at least four point pairs.")
+
+    normalized_src, source_normalization = _normalized_points(src, label="Camera")
+    normalized_dst, destination_normalization = _normalized_points(dst, label="Robot")
 
     rows: list[list[float]] = []
-    for image_point, robot_point in zip(src, dst, strict=True):
-        u, v = image_point.x, image_point.y
-        x, y = robot_point.x, robot_point.y
+    for image_point, robot_point in zip(normalized_src, normalized_dst, strict=True):
+        u, v = image_point[:2]
+        x, y = robot_point[:2]
         rows.append([-u, -v, -1.0, 0.0, 0.0, 0.0, x * u, x * v, x])
         rows.append([0.0, 0.0, 0.0, -u, -v, -1.0, y * u, y * v, y])
 
-    _, _, vh = np.linalg.svd(np.array(rows, dtype=float))
-    h = vh[-1].reshape(3, 3)
-    return h / h[2, 2]
+    calibration_matrix = np.array(rows, dtype=float)
+    if np.linalg.matrix_rank(calibration_matrix) < 8:
+        raise ValueError("Calibration point layout is degenerate; choose points across the table.")
+
+    _, _, vh = np.linalg.svd(calibration_matrix)
+    normalized_homography = vh[-1].reshape(3, 3)
+    homography = (
+        np.linalg.inv(destination_normalization)
+        @ normalized_homography
+        @ source_normalization
+    )
+    if abs(homography[2, 2]) > 1e-12:
+        return homography / homography[2, 2]
+    return homography / np.linalg.norm(homography)
 
 
 def pixel_to_robot(homography: np.ndarray, pixel: Point2) -> Point2:
+    if homography.shape != (3, 3) or not np.all(np.isfinite(homography)):
+        raise ValueError("Homography must be a finite 3x3 matrix.")
+    if not math.isfinite(pixel.x) or not math.isfinite(pixel.y):
+        raise ValueError("Camera point must contain only finite coordinates.")
     q = homography @ np.array([pixel.x, pixel.y, 1.0], dtype=float)
     if abs(q[2]) < 1e-9:
         raise ValueError("Homography produced an invalid point with near-zero scale.")

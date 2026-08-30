@@ -52,6 +52,22 @@ monitor-once:
 monitor-fake:
     uv run robot-monitor --fake
 
+# Convert one camera pixel into robot-base X/Y from a measured calibration; no hardware.
+[group('robot')]
+camera-to-xy u v config="pickup_config.json":
+    uv run robot-camera-to-xy --config {{ config }} --point {{ u }} {{ v }} --show-matrix
+
+# Convert one LeRobot seven-joint frame (degrees) into robot-base tool XYZ; no hardware.
+[group('robot')]
+dataset-fk q1 q2 q3 q4 q5 q6 gripper:
+    uv run robot-kinematics dataset-fk --joints-deg \
+        {{ q1 }} {{ q2 }} {{ q3 }} {{ q4 }} {{ q5 }} {{ q6 }} {{ gripper }}
+
+# Read encoders and emit one camera/robot calibration pair; connects but never enables.
+[group('robot')]
+capture-calibration-point u v:
+    uv run robot-kinematics capture --camera-u {{ u }} --camera-v {{ v }}
+
 # ── database ───────────────────────────────────────────────────────────────────────
 
 # Start Postgres and wait until it is healthy.

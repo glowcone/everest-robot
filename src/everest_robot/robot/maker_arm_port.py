@@ -69,6 +69,7 @@ class MakerArmPort:
         identity: RobotIdentity,
         *,
         profile_digest: str = "",
+        kinematics: Any = None,
     ) -> None:
         joint_count = len(arm.config.joints)
         if joint_count != len(identity.joint_names):
@@ -80,6 +81,14 @@ class MakerArmPort:
         self._arm = arm
         self._identity = identity
         self.profile_digest = profile_digest
+        self.kinematics = kinematics
+        if self.kinematics is not None:
+            expected = identity.joint_names[:-1]
+            if tuple(self.kinematics.joint_names) != expected:
+                raise ValueError(
+                    f"kinematic model joints {tuple(self.kinematics.joint_names)} do not "
+                    f"match the arm joints before the gripper {expected}"
+                )
 
     @classmethod
     def from_profile(
@@ -88,6 +97,9 @@ class MakerArmPort:
         *,
         config_path: str | Path | None = None,
         backend: str = "socketcan",
+        urdf_path: str | Path | None = None,
+        base_link: str = "base_link",
+        tool_link: str = "gripper_frame_link",
         **backend_kwargs: Any,
     ) -> MakerArmPort:
         """Build a port from a maker-arm hardware profile.
@@ -104,7 +116,21 @@ class MakerArmPort:
         path = Path(config_path)
         digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
         arm = maker_arm.Arm.from_yaml(str(path), backend=backend, **backend_kwargs)
-        return cls(arm, identity, profile_digest=digest)
+        kinematics = None
+        if urdf_path is not None:
+            solver_class = getattr(maker_arm, "SerialChainKinematics", None)
+            if solver_class is None:
+                raise HardwareUnavailableError(
+                    "the installed maker-arm SDK has no kinematics support; install the "
+                    "SDK revision containing SerialChainKinematics"
+                )
+            kinematics = solver_class.from_urdf(
+                urdf_path,
+                base_link=base_link,
+                tool_link=tool_link,
+                expected_joint_names=identity.joint_names[:-1],
+            )
+        return cls(arm, identity, profile_digest=digest, kinematics=kinematics)
 
     # ── identity and limits ────────────────────────────────────────────────────────
     @property
@@ -171,6 +197,23 @@ class MakerArmPort:
         lifecycle = self.lifecycle
         if lifecycle is not ArmLifecycle.ENABLED:
             self._arm.refresh()
+        return self._state_from_cache(lifecycle)
+
+    def read_fresh_state(self) -> JointState:
+        """Wait for new feedback from every motor without enabling or commanding it."""
+
+        lifecycle = self.lifecycle
+        fresh = self._arm.refresh(wait=True)
+        if fresh is not None and not all(fresh):
+            missing = [
+                name
+                for name, received in zip(self.joint_names, fresh, strict=True)
+                if not received
+            ]
+            raise RuntimeError("no fresh encoder feedback from: " + ", ".join(missing))
+        return self._state_from_cache(lifecycle)
+
+    def _state_from_cache(self, lifecycle: ArmLifecycle) -> JointState:
         arm = self._arm
         return JointState(
             names=self.joint_names,
@@ -197,3 +240,41 @@ class MakerArmPort:
         """The rate-limited command the driver is currently sending to the motors."""
 
         return tuple(self._arm.get_commanded_positions())
+
+    # ── Cartesian conversion ──────────────────────────────────────────────────────
+    def forward_kinematics(self, joints_rad: Sequence[float]) -> Any:
+        """Return the base-to-tool transform for one full arm joint vector."""
+
+        if self.kinematics is None:
+            raise RuntimeError(
+                "no Maker Arm URDF is configured; set EVEREST_ARM_URDF to a validated model"
+            )
+        values = tuple(float(value) for value in joints_rad)
+        if len(values) != len(self.joint_names):
+            raise ValueError(f"expected {len(self.joint_names)} joints, got {len(values)}")
+        return self.kinematics.forward(values[:-1])
+
+    def inverse_kinematics(
+        self,
+        desired_pose: Any,
+        seed_joints_rad: Sequence[float],
+        *,
+        orientation_weight: float = 0.1,
+    ) -> Any:
+        """Solve a nearby six-joint tool pose; the gripper is excluded from IK."""
+
+        if self.kinematics is None:
+            raise RuntimeError(
+                "no Maker Arm URDF is configured; set EVEREST_ARM_URDF to a validated model"
+            )
+        seed = tuple(float(value) for value in seed_joints_rad)
+        if len(seed) != len(self.joint_names):
+            raise ValueError(f"expected {len(self.joint_names)} seed joints, got {len(seed)}")
+        limits = self.limits()[:-1]
+        return self.kinematics.inverse(
+            desired_pose,
+            seed[:-1],
+            [limit.lower_rad for limit in limits],
+            [limit.upper_rad for limit in limits],
+            orientation_weight=orientation_weight,
+        )

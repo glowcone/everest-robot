@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 .env
 pickup_config.json
+.firecrawl/

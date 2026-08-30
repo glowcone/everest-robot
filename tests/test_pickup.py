@@ -43,6 +43,51 @@ def test_homography_maps_calibration_corners() -> None:
         assert mapped.y == pytest_approx(robot_point.y)
 
 
+def test_homography_least_squares_maps_more_than_four_points() -> None:
+    expected = np.array(
+        [
+            [0.0004, 0.00002, 0.12],
+            [-0.00001, 0.0003, -0.18],
+            [0.0000005, -0.0000003, 1.0],
+        ]
+    )
+    image_points = tuple(
+        Point2(u, v)
+        for u, v in (
+            (100, 100),
+            (600, 100),
+            (600, 500),
+            (100, 500),
+            (350, 180),
+            (260, 390),
+        )
+    )
+    robot_points = tuple(pixel_to_robot(expected, point) for point in image_points)
+
+    solved = find_homography(image_points, robot_points)
+
+    mapped = pixel_to_robot(solved, Point2(420, 310))
+    expected_point = pixel_to_robot(expected, Point2(420, 310))
+    assert mapped.x == pytest_approx(expected_point.x)
+    assert mapped.y == pytest_approx(expected_point.y)
+
+
+def test_homography_rejects_mismatched_or_collinear_calibration() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="counts must match"):
+        find_homography(
+            [Point2(0, 0), Point2(1, 0), Point2(1, 1), Point2(0, 1)],
+            [Point2(0, 0), Point2(1, 0), Point2(1, 1)],
+        )
+
+    with pytest.raises(ValueError, match="cannot all be collinear"):
+        find_homography(
+            [Point2(0, 0), Point2(1, 0), Point2(2, 0), Point2(3, 0)],
+            [Point2(0, 0), Point2(1, 0), Point2(1, 1), Point2(0, 1)],
+        )
+
+
 def test_grasp_offset_rotates_with_carabiner_yaw() -> None:
     grasp = compute_grasp_pose(
         carabiner_pose=type("Pose", (), {"x": 0.40, "y": 0.0, "yaw": math.pi / 2})(),

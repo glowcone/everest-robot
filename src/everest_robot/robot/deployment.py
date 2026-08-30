@@ -13,6 +13,10 @@ Environment:
 * ``EVEREST_CAN_PORT`` -- interface name (``can0``) or serial port (``/dev/ttyACM0``).
 * ``EVEREST_ARM_PROFILE`` -- maker-arm hardware profile path; defaults to the one shipped
   with the installed SDK, which is what its limits and gains were captured against.
+* ``EVEREST_ARM_URDF`` -- physically validated six-axis Maker Arm URDF. Required only for
+  Cartesian FK/IK and camera calibration capture.
+* ``EVEREST_ARM_BASE_LINK`` / ``EVEREST_ARM_TOOL_LINK`` -- URDF chain endpoints; default
+  to ``base_link`` and ``gripper_frame_link``.
 * ``EVEREST_LEASE_BACKEND`` -- ``postgres`` (default when ``ABSURD_DATABASE_URL`` is set)
   or ``file``.
 * ``EVEREST_CAMERAS`` / ``EVEREST_CAMERAS_FILE`` -- see
@@ -33,7 +37,7 @@ from everest_robot.robot.contracts import CancelCheck, Heartbeat
 from everest_robot.robot.datasets import HuggingFaceDatasetResolver
 from everest_robot.robot.lease import FileLease, PostgresAdvisoryLease, RobotLease
 from everest_robot.robot.lerobot_bridge import JointFrame
-from everest_robot.robot.maker_arm_port import MakerArmPort
+from everest_robot.robot.maker_arm_port import MakerArmPort, load_maker_arm
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.ports import ArmPort
 from everest_robot.robot.replay import ReplayRunner
@@ -88,14 +92,58 @@ def build_port(
         )
     backend = environ.get("EVEREST_CAN_BACKEND", "socketcan")
     profile = environ.get("EVEREST_ARM_PROFILE")
+    urdf = environ.get("EVEREST_ARM_URDF")
 
     backend_kwargs = {"channel": port} if backend == "socketcan" else {"port": port}
     return MakerArmPort.from_profile(
         parameters.identity,
         config_path=profile,
         backend=backend,
+        urdf_path=urdf,
+        base_link=environ.get("EVEREST_ARM_BASE_LINK", "base_link"),
+        tool_link=environ.get("EVEREST_ARM_TOOL_LINK", "gripper_frame_link"),
         **backend_kwargs,
     )
+
+
+def build_kinematics(
+    parameters: RobotParameters, environ: Mapping[str, str] | None = None
+) -> tuple[Any, tuple[tuple[float, float], ...]]:
+    """Load Cartesian geometry and joint limits without constructing a CAN backend."""
+
+    environ = os.environ if environ is None else environ
+    urdf = environ.get("EVEREST_ARM_URDF")
+    if not urdf:
+        raise ValueError(
+            "EVEREST_ARM_URDF is required for Cartesian FK/IK; point it at the "
+            "physically validated Maker Arm URDF"
+        )
+    maker_arm = load_maker_arm()
+    profile = environ.get("EVEREST_ARM_PROFILE")
+    if profile is None:
+        from maker_arm.profiles import DEFAULT_ARM_CONFIG
+
+        profile = str(DEFAULT_ARM_CONFIG)
+    config = maker_arm.ArmConfig.from_yaml(profile)
+    if len(config.joints) != len(parameters.identity.joint_names):
+        raise ValueError(
+            f"hardware profile has {len(config.joints)} joints but parameters declare "
+            f"{len(parameters.identity.joint_names)}"
+        )
+    solver_class = getattr(maker_arm, "SerialChainKinematics", None)
+    if solver_class is None:
+        raise RuntimeError(
+            "the installed maker-arm SDK has no kinematics support; install the SDK "
+            "revision containing SerialChainKinematics"
+        )
+    model = solver_class.from_urdf(
+        urdf,
+        base_link=environ.get("EVEREST_ARM_BASE_LINK", "base_link"),
+        tool_link=environ.get("EVEREST_ARM_TOOL_LINK", "gripper_frame_link"),
+        expected_joint_names=parameters.identity.joint_names[:-1],
+    )
+    limits = tuple((float(joint.lo), float(joint.hi)) for joint in config.joints[:-1])
+    return model, limits
 
 
 def open_session(

@@ -12,6 +12,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pytest
 
 from everest_robot.robot.contracts import ArmLifecycle, RobotIdentity
@@ -52,11 +53,12 @@ class StubArm:
     positions: list[float] = field(default_factory=lambda: [0.1, -0.2, 0.0])
     accepted: list[list[float]] = field(default_factory=list)
     refreshed: int = 0
+    fresh_result: list[bool] | None = None
     motors: list[StubMotor] = field(default_factory=lambda: [StubMotor(7) for _ in range(3)])
 
     def refresh(self, wait: bool = False, timeout: float = 0.05) -> Any:
         self.refreshed += 1
-        return None
+        return self.fresh_result
 
     def get_joint_positions(self) -> list[float]:
         return list(self.positions)
@@ -88,6 +90,16 @@ def make_port(**overrides: Any) -> MakerArmPort:
     for name, value in overrides.items():
         setattr(arm, name, value)
     return MakerArmPort(arm, IDENTITY, profile_digest="sha256:profile")
+
+
+@dataclass
+class StubKinematics:
+    joint_names: tuple[str, ...] = JOINTS[:-1]
+
+    def forward(self, joints):
+        transform = np.eye(4)
+        transform[:2, 3] = joints
+        return transform
 
 
 def test_a_joint_count_mismatch_is_refused_at_construction() -> None:
@@ -137,6 +149,16 @@ def test_state_carries_joint_names_feedback_counters_and_fault_reason() -> None:
     assert state.has_fault
 
 
+def test_fresh_state_waits_for_every_motor_and_reports_missing_joint() -> None:
+    port = make_port(fresh_result=[True, False, True])
+
+    with pytest.raises(RuntimeError, match="shoulder_lift"):
+        port.read_fresh_state()
+
+    port.arm.fresh_result = [True, True, True]
+    assert port.read_fresh_state().positions == (0.1, -0.2, 0.0)
+
+
 def test_malformed_targets_never_reach_the_driver() -> None:
     port = make_port()
 
@@ -146,6 +168,20 @@ def test_malformed_targets_never_reach_the_driver() -> None:
 
     assert port.send_targets([0.1, 0.2, 0.0]) is True
     assert port.arm.accepted == [[0.1, 0.2, 0.0]]
+
+
+def test_forward_kinematics_uses_arm_joints_and_excludes_gripper() -> None:
+    port = make_port()
+    port.kinematics = StubKinematics()
+
+    transform = port.forward_kinematics([0.25, -0.5, -1.2])
+
+    assert transform[:2, 3] == pytest.approx([0.25, -0.5])
+
+
+def test_forward_kinematics_refuses_without_a_validated_urdf() -> None:
+    with pytest.raises(RuntimeError, match="EVEREST_ARM_URDF"):
+        make_port().forward_kinematics([0.25, -0.5, -1.2])
 
 
 def test_the_real_driver_exposes_everything_the_port_translates() -> None:
