@@ -5,11 +5,10 @@ mode (the makermodslab teleop convention). It exists so the lease-local calibrat
 teleoperation monitor (``robot-monitor`` / ``just monitor``) can run against such an arm
 without the operator first switching every motor back to the private protocol.
 
-**Scope.** docs/adr/0001-production-motor-protocol.md rejected ``RobstrideMotorsBus`` as
-the production safety boundary, and that decision stands (see the ADR's addendum). This
-port is qualified for the calibration monitor only; replay and the durable workflow remain
-on :class:`~everest_robot.robot.maker_arm_port.MakerArmPort`. Known, accepted gaps versus
-maker-arm-sdk, per the ADR:
+**Scope.** docs/adr/0002-mit-protocol-motor-operation.md makes this the driver for
+maker-arm-02, with Everest owning the compensating controls; it is qualified for the
+calibration monitor only, and replay/workflow stay unqualified until that ADR's checklist
+is done. Known, accepted gaps versus maker-arm-sdk (the ADR's "gap" rows):
 
 * no motor-side CAN watchdog (a dead host leaves the last MIT command in force),
 * no host-side feedback-age watchdog,

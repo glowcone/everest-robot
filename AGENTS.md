@@ -40,13 +40,16 @@ the runtime's own durable results, while `domain.py` holds the workflow-visible 
 Absurd checkpoints store.
 
 - `ports.py` is the single hardware boundary. Nothing above it imports a driver.
-  `maker_arm_port.py` adapts `maker_arm.Arm`; `fake_arm.py` is the deterministic stand-in
-  every layer above is tested against. `robstride_mit_port.py` (`EVEREST_ARM_DRIVER=mit`)
-  drives motors provisioned in MIT protocol and is qualified for the calibration monitor
-  only -- never wire it into replay or workflow; see the ADR-0001 addendum.
-- Soft limits, watchdogs, velocity limiting, fault handling and coordinate conversion
-  belong to `maker-arm-sdk` and must not be re-implemented here. See
-  `docs/adr/0001-production-motor-protocol.md` for the ownership split.
+  `robstride_mit_port.py` (`EVEREST_ARM_DRIVER=mit`) is this arm's driver per
+  `docs/adr/0002-mit-protocol-motor-operation.md`; `maker_arm_port.py` adapts
+  `maker_arm.Arm` for private-protocol motors; `fake_arm.py` is the deterministic
+  stand-in every layer above is tested against. The MIT driver is qualified for the
+  calibration monitor only -- replay and workflow stay unqualified until ADR-0002's
+  checklist is done.
+- The ownership split for limits, watchdogs, velocity limiting, fault handling and
+  coordinate conversion is the ADR-0002 ownership table; do not re-implement a concern a
+  driver already owns, and treat the table's "gap" rows as real, accepted risk rather
+  than something to quietly patch.
 - `parameters.py` loads `config/maker_arm_v1.yaml` strictly: unknown fields are rejected,
   and a preset whose `calibration_id` does not match the file's robot is refused. Presets
   come from `docs/named-position-capture.md`, never from hand-edited joint values.

@@ -1,9 +1,12 @@
 """:class:`~everest_robot.robot.ports.ArmPort` over ``maker_arm.Arm``.
 
-The production driver, per docs/adr/0001-production-motor-protocol.md: the RobStride
-private protocol with maker-arm-sdk as the hardware safety boundary. This module is a
-translation layer and nothing more. It must not re-implement limits, watchdogs, velocity
-limiting or fault handling -- doing so would create a second, divergent safety story.
+The RobStride **private**-protocol driver, with maker-arm-sdk as the hardware safety
+boundary. ADR-0001 made this the production driver; ADR-0002 superseded that for
+maker-arm-02, whose motors are provisioned in MIT mode (see
+docs/adr/0002-mit-protocol-motor-operation.md and ``robstride_mit_port.py``). This port
+remains the path for private-protocol arms. It is a translation layer and nothing more:
+it must not re-implement limits, watchdogs, velocity limiting or fault handling -- doing
+so would create a second, divergent safety story.
 
 ``maker_arm`` is imported lazily so the rest of the runtime installs and tests without the
 ``hardware`` extra.

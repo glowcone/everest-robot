@@ -1,7 +1,12 @@
 # 0001. Production motor protocol
 
-- Status: Accepted
+- Status: Superseded by [0002-mit-protocol-motor-operation.md](0002-mit-protocol-motor-operation.md)
 - Date: 2026-08-29
+
+The driver code analysis below remains accurate and is referenced by ADR-0002; the
+decision itself was reversed after local rollouts on maker-arm-02 established that its
+motors are provisioned in MIT mode and that the MIT stack, with Everest-owned
+compensating controls, operates the arm correctly.
 
 ## Context
 
@@ -230,6 +235,9 @@ above because it is implemented in the same adapter layer, not inside `maker-arm
   since the underlying fault condition may still be physically present.
 
 ## Addendum (2026-08-29): MIT-mode calibration monitor port
+
+*(Historical: this addendum introduced the MIT port as a narrow exception; ADR-0002 has
+since made it this arm's driver and carries the current scope and qualification rules.)*
 
 The motors on this project's arm are currently provisioned in **MIT** mode (they answer
 the makermodslab teleop stack, and `maker_arm.Arm.connect()` reports "online: none"), and

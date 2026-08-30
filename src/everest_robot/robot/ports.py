@@ -2,8 +2,8 @@
 
 Everything above this line (motion, policy, replay, the LeRobot bridge) talks to
 :class:`ArmPort` and never to a driver directly. That keeps the driver choice recorded in
-docs/adr/0001-production-motor-protocol.md a single-file decision, and it lets every layer
-above be tested against :class:`~everest_robot.robot.fake_arm.FakeArm`.
+docs/adr/0002-mit-protocol-motor-operation.md a single-file decision, and it lets every
+layer above be tested against :class:`~everest_robot.robot.fake_arm.FakeArm`.
 
 The port is deliberately thin: it exposes the commands and feedback the workflow needs and
 nothing else. Soft limits, watchdogs, velocity limiting, fault handling and coordinate

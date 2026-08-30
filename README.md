@@ -267,10 +267,12 @@ every layer has a deterministic fake.
 lease and session lifecycle, a strictly validated robot parameters file, bounded motion
 between operator-approved named positions, LeRobot's `Robot` contract over the arm, a
 synchronous policy rollout runner, and the lease-local calibration teleoperator/monitor
-behind `just monitor`. The production driver decision is recorded in
-[`docs/adr/0001-production-motor-protocol.md`](docs/adr/0001-production-motor-protocol.md):
-the arm keeps running maker-arm-sdk's RobStride private protocol, which stays the hardware
-safety boundary.
+behind `just monitor`. The motor driver decision is recorded in
+[`docs/adr/0002-mit-protocol-motor-operation.md`](docs/adr/0002-mit-protocol-motor-operation.md):
+this arm's motors run RobStride's MIT protocol, driven by `RobstrideMitPort`
+(`EVEREST_ARM_DRIVER=mit`) with Everest-owned compensating controls; the superseded
+private-protocol analysis lives in
+[`docs/adr/0001-production-motor-protocol.md`](docs/adr/0001-production-motor-protocol.md).
 
 `maker-arm` and `lerobot` are pinned to commit SHAs behind the `hardware` extra
 (`just setup-hardware`) and imported lazily, so the package and its whole test suite run

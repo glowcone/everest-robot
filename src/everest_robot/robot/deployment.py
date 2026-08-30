@@ -11,11 +11,11 @@ Environment:
   (default ``config/maker_arm_v1.yaml``).
 * ``EVEREST_CAN_BACKEND`` -- ``socketcan`` (default) or ``slcan``.
 * ``EVEREST_CAN_PORT`` -- interface name (``can0``) or serial port (``/dev/ttyACM0``).
-* ``EVEREST_ARM_DRIVER`` -- ``maker-arm`` (default, the private-protocol production
-  driver) or ``mit`` for motors provisioned in RobStride's MIT protocol. The ``mit``
+* ``EVEREST_ARM_DRIVER`` -- ``maker-arm`` (default; private protocol, fails closed on
+  this arm) or ``mit`` for motors provisioned in RobStride's MIT protocol, which is what
+  maker-arm-02 runs per docs/adr/0002-mit-protocol-motor-operation.md. The ``mit``
   driver is qualified for the lease-local calibration monitor only; replay and the
-  workflow stay on ``maker-arm``. See the addendum in
-  docs/adr/0001-production-motor-protocol.md.
+  workflow stay unqualified until that ADR's checklist is done.
 * ``EVEREST_ARM_PROFILE`` -- maker-arm hardware profile path; defaults to the one shipped
   with the installed SDK, which is what its limits and gains were captured against.
 * ``EVEREST_LEASE_BACKEND`` -- ``postgres`` (default when ``ABSURD_DATABASE_URL`` is set)
