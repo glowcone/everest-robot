@@ -246,3 +246,30 @@ def test_persistent_leader_loss_stops_and_holds() -> None:
     assert "readings lost" in controller.error
     assert arm.lifecycle is ArmLifecycle.ENABLED
     controller.close()
+
+
+def test_stopping_without_a_hold_commands_nothing_on_the_way_out() -> None:
+    """The teardown that follows cuts torque, so a parting hold is only a lurch."""
+
+    arm = connected_arm()
+    controller = TeleoperationController(arm, FakeLeader(), IdentityMapper())
+    controller.connect_and_measure()
+    controller.start()
+    time.sleep(0.05)
+
+    commands = len(arm.sent_commands)
+    controller.close(hold=False)
+    assert len(arm.sent_commands) == commands
+
+
+def test_stopping_with_a_hold_still_freezes_the_follower() -> None:
+    arm = connected_arm()
+    controller = TeleoperationController(arm, FakeLeader(), IdentityMapper())
+    controller.connect_and_measure()
+    controller.start()
+    time.sleep(0.05)
+
+    commands = len(arm.sent_commands)
+    controller.close()
+    assert len(arm.sent_commands) >= commands
+    assert arm.lifecycle is ArmLifecycle.ENABLED

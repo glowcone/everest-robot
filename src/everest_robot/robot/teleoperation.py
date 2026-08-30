@@ -211,18 +211,25 @@ class TeleoperationController:
                 self._command = tuple(state.positions)
         return self.paused
 
-    def stop(self) -> None:
+    def stop(self, *, hold: bool = True) -> None:
+        """Stop following. ``hold=True`` freezes the follower where it is.
+
+        ``hold=False`` is for a teardown that is about to cut torque anyway. Commanding a
+        hold first only snaps the arm toward its last target a moment before it goes limp,
+        which the operator feels as a lurch on Ctrl-C.
+        """
+
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, 4.0 / self.rate_hz))
         self._thread = None
-        if self.follower.lifecycle is ArmLifecycle.ENABLED:
+        if hold and self.follower.lifecycle is ArmLifecycle.ENABLED:
             self.follower.hold_current_position()
 
-    def close(self) -> None:
+    def close(self, *, hold: bool = True) -> None:
         try:
-            self.stop()
+            self.stop(hold=hold)
         finally:
             self.leader.disconnect()
 

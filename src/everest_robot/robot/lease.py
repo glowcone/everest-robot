@@ -171,9 +171,15 @@ class PostgresAdvisoryLease:
 
     @property
     def lock_key(self) -> int:
-        """A stable 32-bit key derived from the robot id, inside our namespace."""
+        """A stable 32-bit key derived from the robot id, inside our namespace.
 
-        return zlib.crc32(self._robot_id.encode())
+        Wrapped into the signed range because the two-argument advisory lock functions
+        take `integer`; an unsigned crc32 above 2**31 would be sent as a bigint and match
+        no overload.
+        """
+
+        unsigned = zlib.crc32(self._robot_id.encode())
+        return unsigned - 2**32 if unsigned >= 2**31 else unsigned
 
     def acquire(self) -> None:
         if self._connection is not None:
@@ -183,7 +189,8 @@ class PostgresAdvisoryLease:
         connection = psycopg.connect(self.database_url, autocommit=True)
         try:
             row = connection.execute(
-                "SELECT pg_try_advisory_lock(%s, %s)", (LOCK_NAMESPACE, self.lock_key)
+                "SELECT pg_try_advisory_lock(%s::int, %s::int)",
+                (LOCK_NAMESPACE, self.lock_key),
             ).fetchone()
         except Exception:
             connection.close()
@@ -199,7 +206,8 @@ class PostgresAdvisoryLease:
             return
         try:
             connection.execute(
-                "SELECT pg_advisory_unlock(%s, %s)", (LOCK_NAMESPACE, self.lock_key)
+                "SELECT pg_advisory_unlock(%s::int, %s::int)",
+                (LOCK_NAMESPACE, self.lock_key),
             )
         finally:
             connection.close()

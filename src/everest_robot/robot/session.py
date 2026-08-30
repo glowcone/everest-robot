@@ -89,11 +89,22 @@ class RobotSession:
         return self
 
     def close(self) -> None:
-        """Leave the arm safe and release the claim, whatever happened before."""
+        """Disengage the arm and release the claim, whatever happened before.
+
+        Torque comes off, deliberately and on every path including Ctrl-C. An arm that is
+        no longer being commanded should not be holding a pose under power, and the
+        operator standing at the bench is a better authority on where it should rest than
+        a dying process is.
+
+        No hold is commanded on the way out. Torque is released immediately afterwards, so
+        a hold could not persist even in principle; all it can do is snap the arm toward
+        the last commanded target before going limp, which is exactly the lurch this
+        teardown exists to avoid. A stage that genuinely needs the arm held commands that
+        itself while it is still running -- see ``ReplayRunner._hold``.
+        """
 
         try:
             if self.port.lifecycle is ArmLifecycle.ENABLED:
-                self.port.hold_current_position()
                 self.port.disable()
         finally:
             try:

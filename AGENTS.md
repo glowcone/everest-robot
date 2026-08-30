@@ -5,7 +5,9 @@ recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robo
 (`monitor` -- powered calibration teleoperation; `goto` -- powered named-position motion;
 `goto-list`, `goto-dry`, `monitor-read-only`, `monitor-once`, `monitor-fake` -- no motion),
 `database`
-(`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
+(`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `calibration` (the numbered
+`pixel-*` path that teaches and then uses the fixed camera's pixel-to-joint map),
+`workflow` (`worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
 automatically. Run `just check` before handing off changes.
@@ -83,6 +85,12 @@ Absurd checkpoints store.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
   backend, parameters path -- `parameters_path()`, which is also where a captured preset is
   written back). Do not read the environment anywhere else in the runtime.
+- `visual_tracking.py` is the bounded servo loop for a target that changes every frame. It
+  takes a full joint target or `None` per tick and clamps the commanded step, so the arm's
+  speed is bounded by construction and a missing detection holds rather than coasting.
+  Where the target comes from is the caller's problem: `pixel_map.py` fits the fixed
+  camera's pixels to taught pre-grasp poses and refuses to extrapolate outside their convex
+  hull, and `calibrate_pixel_map.py` (`robot-pixel-map`) is the operator's CLI over both.
 - `robot/monitor.py` remains the read-only feedback view model. The `robot-monitor` CLI
   defaults to a powered, lease-local calibration session: `robot/teleoperation.py` owns the
   Star leader and commands the already-claimed follower while the same process renders that

@@ -74,6 +74,45 @@ goto-dry position:
 goto position speed="0.25":
     uv run robot-goto {{ position }} --speed-scale {{ speed }}
 
+# ── calibration ────────────────────────────────────────────────────────────────────
+# The fixed camera's pixels to joint positions, in the order they are run. Bolt the camera
+# before step 0 and do not move it afterwards: moving it voids every sample and the whole
+# procedure repeats. Steps 0 and 4 hold the arm lease and MOVE the arm -- 0 follows the
+# Star leader, 4 servos to the detection at a locked speed and holds still whenever it
+# sees nothing. Steps 1-3 touch no hardware. The full procedure, including the wrist-roll
+# model and the two hard limits, is in src/everest_robot/calibrate_pixel_map.py.
+
+# 0. POWERED: teleoperate to ~30 pre-grasp poses, pairing each with the object's pixel.
+[group('calibration')]
+pixel-collect camera x y w h speed="0.375":
+    uv run robot-pixel-map collect --camera {{ camera }} \
+        --roi {{ x }} {{ y }} {{ w }} {{ h }} --max-velocity {{ speed }}
+
+# 1. Refit the stored samples and print the held-out joint error. Moves nothing.
+[group('calibration')]
+pixel-fit model="thin_plate_spline":
+    uv run robot-pixel-map fit --model {{ model }}
+
+# 2. Print the calibration: camera, arm, sampled region, roll offset, holdout report.
+[group('calibration')]
+pixel-check:
+    uv run robot-pixel-map check
+
+# 3. Print the joint vector for whatever the camera sees right now. Moves nothing.
+[group('calibration')]
+pixel-predict frames="1":
+    uv run robot-pixel-map predict --frames {{ frames }}
+
+# 3b. The tracking loop with the arm never energized: watch what it would command.
+[group('calibration')]
+pixel-track-dry speed="0.15":
+    uv run robot-pixel-map track --max-velocity {{ speed }} --dry-run
+
+# 4. POWERED: servo continuously above the detected carabiner at a locked speed.
+[group('calibration')]
+pixel-track speed="0.15" rate="15":
+    uv run robot-pixel-map track --max-velocity {{ speed }} --rate {{ rate }}
+
 # ── database ───────────────────────────────────────────────────────────────────────
 # Docker is optional. `robot-db` uses compose.yaml when Docker Compose and its daemon are
 # both available, and an already-installed PostgreSQL (Homebrew, a package) otherwise.
@@ -158,6 +197,11 @@ cancel task_id:
 [group('replay')]
 raise delta="0.10" speed="0.25" dry="":
     uv run robot-raise --delta-rad {{ delta }} --speed-scale {{ speed }} {{ dry }}
+
+# 0b. The same command against the FakeArm: exercises the path with no CAN adapter present.
+[group('replay')]
+raise-fake delta="0.10" speed="0.25":
+    uv run robot-raise --delta-rad {{ delta }} --speed-scale {{ speed }} --fake
 
 # 1. Print the preflight report locally. Claims nothing, energizes nothing, needs no worker.
 [group('replay')]

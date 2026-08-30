@@ -62,12 +62,13 @@ def parameters() -> RobotParameters:
     )
 
 
-def make_arm(identity: RobotIdentity = IDENTITY) -> FakeArm:
+def make_arm(identity: RobotIdentity = IDENTITY, **overrides: object) -> FakeArm:
     return FakeArm(
         identity=identity,
         joint_limits=LIMITS,
         clock=ManualClock(),
         positions=[0.0, -1.0, -0.1],
+        **overrides,
     )
 
 
@@ -153,6 +154,16 @@ def test_the_postgres_lock_key_is_stable_and_namespaced() -> None:
     assert lease.lock_key != PostgresAdvisoryLease("maker-arm-03", "x").lock_key
 
 
+def test_the_postgres_lock_key_fits_a_signed_integer() -> None:
+    # pg_try_advisory_lock's two-argument form takes `integer`; an unsigned crc32 above
+    # 2**31 is sent as a bigint and matches no overload.
+    ids = ["maker-arm-02", "maker-arm-03", "robot", "", "arm-" * 40]
+
+    for robot_id in ids:
+        key = PostgresAdvisoryLease(robot_id, "postgresql://unused").lock_key
+        assert -(2**31) <= key < 2**31, robot_id
+
+
 # ── sessions ───────────────────────────────────────────────────────────────────────
 def test_a_session_claims_connects_and_releases() -> None:
     arm = make_arm()
@@ -168,7 +179,9 @@ def test_a_session_claims_connects_and_releases() -> None:
     assert arm.lifecycle is ArmLifecycle.DISCONNECTED
 
 
-def test_a_session_leaves_the_arm_safe_even_when_the_body_raises() -> None:
+def test_a_crash_disengages_the_arm_and_commands_nothing_on_the_way_out() -> None:
+    """Ctrl-C leaves the arm limp and movable by hand, without a parting lurch."""
+
     arm = make_arm()
     lease = InMemoryLease("maker-arm-02")
 
@@ -178,9 +191,27 @@ def test_a_session_leaves_the_arm_safe_even_when_the_body_raises() -> None:
     ):
         session.port.enable()
         session.port.send_targets([0.5, -0.5, -0.1])
+        commands = len(arm.sent_commands)
         raise RuntimeError("stage failed")
 
     assert arm.lifecycle is ArmLifecycle.DISCONNECTED
+    # No hold was commanded on the way out. A hold followed immediately by torque release
+    # cannot persist; all it does is snap the arm toward its last target before going limp.
+    assert len(arm.sent_commands) == commands
+    assert not lease.held
+
+
+def test_an_orderly_close_disengages_the_same_way() -> None:
+    arm = make_arm()
+    lease = InMemoryLease("maker-arm-02")
+
+    session = RobotSession(arm, parameters(), lease=lease).open()
+    session.port.enable()
+    commands = len(arm.sent_commands)
+    session.close()
+
+    assert arm.lifecycle is ArmLifecycle.DISCONNECTED
+    assert len(arm.sent_commands) == commands
     assert not lease.held
 
 

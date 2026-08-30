@@ -29,6 +29,7 @@ Environment:
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,21 @@ def build_port(
         )
     backend = environ.get("EVEREST_CAN_BACKEND", "socketcan")
     driver = environ.get("EVEREST_ARM_DRIVER", "maker-arm")
+
+    # SocketCAN is a Linux kernel facility. python-can reaches for socket.AF_CAN, which
+    # only exists there, so on any other host this fails deep inside the driver with an
+    # AttributeError that says nothing about the actual misconfiguration.
+    if backend == "socketcan" and sys.platform != "linux":
+        raise ValueError(
+            f"EVEREST_CAN_BACKEND=socketcan needs Linux; this host is {sys.platform}. "
+            f"Use a USB-CAN adapter with EVEREST_CAN_BACKEND=slcan and EVEREST_CAN_PORT "
+            f"set to its serial port, or run on the robot's Linux host."
+        )
+    if backend == "slcan" and not Path(port).exists():
+        raise ValueError(
+            f"EVEREST_CAN_PORT={port!r} does not exist: the USB-CAN adapter is not "
+            f"plugged in, or it enumerates under a different name."
+        )
 
     if driver == "mit":
         return RobstrideMitPort.from_deployment(

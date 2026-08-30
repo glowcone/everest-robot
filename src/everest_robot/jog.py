@@ -120,6 +120,23 @@ def raise_arm(
     return result, start, target
 
 
+def open_fake_session() -> RobotSession:
+    """A session over :class:`FakeArm`, for exercising this command without an arm.
+
+    Mirrors ``robot-monitor --fake``: the soft limits are invented here because real ones
+    belong to the driver's hardware profile and there is no driver in this mode. Nothing
+    this reports means anything about a physical arm.
+    """
+
+    from everest_robot.robot.contracts import JointLimit
+    from everest_robot.robot.deployment import load_parameters
+    from everest_robot.robot.fake_arm import FakeArm
+
+    parameters = load_parameters()
+    limits = tuple(JointLimit(name, -2.0, 2.0) for name in parameters.identity.joint_names)
+    return RobotSession(FakeArm(parameters.identity, limits), parameters, cameras=None).open()
+
+
 def _print_plan(joint_names: Sequence[str], start, target, limits) -> None:
     print(f"{'joint':<16}{'measured':>11}{'target':>11}{'delta':>10}   soft limits")
     for name, a, b, limit in zip(joint_names, start, target, limits, strict=True):
@@ -154,6 +171,10 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="validate and report the planned motion without energizing the arm",
     )
+    parser.add_argument(
+        "--fake", action="store_true",
+        help="run against the deterministic FakeArm: no CAN, no claim, no real numbers",
+    )
     args = parser.parse_args()
 
     if args.delta_deg is not None:
@@ -167,8 +188,10 @@ def main() -> None:
 
     from everest_robot.robot.deployment import open_session
 
+    if args.fake:
+        print("FAKE ARM: nothing below this line describes a physical robot.\n")
     try:
-        session = open_session()
+        session = open_fake_session() if args.fake else open_session()
     except Exception as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         raise SystemExit(1) from None
