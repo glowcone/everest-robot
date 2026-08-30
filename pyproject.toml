@@ -6,7 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "absurd-sdk>=0.2.0",
+    "maker-arm",
+    "numpy>=1.26",
+    "opencv-python>=4.9",
 ]
+
+[tool.uv.sources]
+maker-arm = { git = "https://github.com/makermods-robotics/maker-arm-sdk" }
 
 [project.scripts]
 robot-worker = "everest_robot.worker:main"

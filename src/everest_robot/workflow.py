@@ -5,7 +5,7 @@ from typing import Any
 
 from absurd_sdk import Absurd
 
-from everest_robot.adapters import ScaffoldRobot
+from everest_robot.adapters import create_robot
 from everest_robot.domain import (
     AttachmentResult,
     RecoveryTarget,
@@ -29,7 +29,7 @@ def _verification_from_json(value: dict[str, Any]) -> VerificationResult:
 def run_attach_carabiner(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Localize, pick up, position, attach, verify, and durably recover."""
 
-    robot = ScaffoldRobot(verification_failures=int(params.get("verification_failures", 0)))
+    robot = create_robot(params)
     detector = str(params.get("carabiner_detector", "deterministic-cv"))
     grasp_planner = str(params.get("grasp_planner", "graspnet"))
     position_name = str(params.get("attachment_position", "clip-attachment-ready"))
