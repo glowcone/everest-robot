@@ -13,11 +13,12 @@ just attach-fsm-fake --initial-detection
 
 `just attach-fsm` selects the hardware adapter. The learned states are implemented: both
 load a policy from a file (`--search-policy`, `--clip-policy`) and step it one action at a
-time through a persistent `PolicySession`. The run still stops at a guarded
-`NotImplementedError`, now from perception alone -- `INITIAL`, `SEARCH_CV`, and the gate
-signals `CLIP_RL` reads after each action have no detector or verifier behind them yet, and
-refuse rather than guess. The refusal happens in `attachment_fsm_handlers()` before the
-robot is claimed, so discovering it costs no lease and no energized arm.
+time through a persistent `PolicySession`. `SEARCH_CV` is implemented too, against the
+fixed camera and the calibrated pixel map. The run still stops at a guarded
+`NotImplementedError`, now from perception alone -- `INITIAL` and the gate signals
+`CLIP_RL` reads after each action have no detector or verifier behind them yet, and refuse
+rather than guess. The refusal happens in `attachment_fsm_handlers()` before the robot is
+claimed, so discovering it costs no lease and no energized arm.
 
 One assumption inside the implemented half is **unverified against real hardware**: how a
 clip policy reports that it has returned to neutral. See
@@ -60,7 +61,8 @@ The reader is strict for the same reason `ReplayRequest.from_json` is: a misspel
 that silently took a default would move a real arm along a sequence nobody wrote. Unknown
 fields are rejected, every action must match `action_features` exactly, and non-finite
 values are refused. Both files are resolved **before** the robot is claimed, so a missing or
-malformed policy costs no lease.
+malformed policy costs no lease. The pixel map `SEARCH_CV` servos on is loaded and checked
+against the connected arm in the same window, for the same reason.
 
 ## Handler contract
 
@@ -79,6 +81,13 @@ Implemented. Entry into `SEARCH_RL` and `CLIP_RL` re-seeds that state's own
 `PolicySession` (`robot/policy.py`) from where the arm is standing now. Search and clip may
 select the same checkpoint, but they are separate sessions because CV physically moves the
 arm between them, and entering one leaves the other alone.
+
+Entry into `SEARCH_CV` builds a fresh `CarabinerFollower` and calls `start()` on it, and
+entry into anything else stops and discards the one that was running. The follower's
+lock-on count and its tracker command are seeded from joint feedback, and both are stale
+the moment a policy moves the arm, so this is a rebuild rather than a resume. The fixed
+camera itself is opened once per attempt and released by `close()`; re-opening it would
+cost a capture-session spin-up on every hand-back with the arm claimed and energized.
 
 The session lifecycle is `seed()` / `step()` / `close()`. It retains recurrent state and
 action chunks between `step()` calls, and reuses the existing bridge compatibility and
@@ -131,19 +140,51 @@ progress.
 
 ### `search_cv_step()`
 
-Run one detector/calibration/servo tick:
+Implemented. One step is one `CarabinerFollower.step()`
+(`robot/carabiner_follower.py`), which is one detector/calibration/servo tick:
 
-1. Detect the carabiner in the current frame.
-2. Convert the accepted pixel target through the calibrated pixel map.
+1. Read the fixed camera and detect the carabiner in that frame.
+2. Convert the accepted centroid through the calibrated pixel map
+   (`EVEREST_PIXEL_MAP`, default `config/pixel_map.json`), then over the measured pose with
+   `full_target()` so joints the map never fitted hold where they are.
 3. Pass that target, or `None`, to one `VisualTracker.tick()` call.
-4. Return the CV subsystem's built-in `target_visible` and `followed` decisions along with
-   confidence and pixel error.
+4. Return the follower's `target_visible` and `followed` decisions along with its measured
+   pixel error.
 
-Reuse `VisualTracker`; it owns lock-on behavior, per-tick velocity bounds, holds on missing
-detections, and limit refusal. Do not reproduce those controls in the handler. `followed`
-must mean the CV subsystem has completed its approach tolerance, not merely that one
-tracker tick reported motion. A lost target returns to RL search; `followed=True` enters
-clip RL.
+The map is taught on *pre-grasp* poses, so tracking to its prediction tracks to
+directly-above-the-carabiner by construction; nothing in this path models the table plane,
+the camera's obliquity or the arm's kinematics. `VisualTracker` owns lock-on behaviour,
+per-tick velocity bounds, holds on missing detections, and limit refusal, and none of that
+is reproduced above it.
+
+Three judgements belong to the follower rather than to the FSM:
+
+- **Loss.** One dropped frame is a threshold segmentation flickering, not a lost carabiner.
+  Only `lost_after_misses` consecutive frames without a detection report
+  `target_visible=False`, which is what returns the FSM to RL search.
+- **`followed`.** The measured pose must be within `settle_tolerance_rad` of the map's
+  target for `settle_ticks` consecutive ticks. A tick that reported motion means the arm is
+  on its way, and handing a half-finished approach to the clip policy is the failure this
+  state exists to prevent.
+- **Pacing.** The tracker's speed lock is a per-tick clamp of `max_velocity_rad_s /
+  rate_hz`, so the follower waits out the remainder of the period itself rather than
+  trusting the FSM's call rate.
+
+A detection the map refuses -- outside the taught convex hull, or too far from the previous
+frame to be the same blob -- holds the arm but stays *visible*. The camera is bolted down,
+so no arm motion moves the carabiner back inside the hull, and a search policy would only
+hand back the detection the follower already has.
+
+`confidence` is `None`: the two-white-tape segmentation is a hard threshold with no score,
+and for the same reason `attach_clip` reports no force, a number here would be fiction.
+`pixel_error` is real -- the joint-space servo error inverted through the fit's Jacobian at
+that pixel, so it reads as *the gripper is standing where a carabiner this many pixels away
+would have put it*, in the same units as the hull margin and the jump gate. It is derived
+from the fit and inherits the fit's errors; it is not independent evidence about where the
+gripper physically is.
+
+An arm fault, lost feedback or a refused command raises `TrackerStopped` out of the tracker
+after it has held the arm, and the handler turns that into `AttachmentAbort`.
 
 ### `clip_rl_step()`
 

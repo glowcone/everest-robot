@@ -273,3 +273,36 @@ def test_stopping_with_a_hold_still_freezes_the_follower() -> None:
     controller.close()
     assert len(arm.sent_commands) >= commands
     assert arm.lifecycle is ArmLifecycle.ENABLED
+
+
+def test_the_pose_the_arm_started_from_is_recorded_and_never_moves() -> None:
+    """It is where the operator parked the arm, so it is where the arm can be dropped."""
+
+    arm = connected_arm()
+    controller = TeleoperationController(arm, FakeLeader(), IdentityMapper())
+
+    assert controller.start_pose == ()
+
+    controller.connect_and_measure()
+    assert controller.start_pose == (0.0, -1.0, -0.5)
+
+    controller.start()
+    time.sleep(0.05)
+    controller.close()
+
+    # Following moved the follower; the pose it is to be parked at is not dragged along.
+    assert arm.sent_commands
+    assert controller.start_pose == (0.0, -1.0, -0.5)
+
+
+def test_a_leader_that_never_measured_records_no_pose_to_return_to() -> None:
+    """Nothing was enabled, so there is nothing to undo -- and no pose to invent."""
+
+    arm = connected_arm()
+    leader = FakeLeader({0: math.nan, 1: -1.0, 2: -0.5})
+    controller = TeleoperationController(arm, leader, IdentityMapper())
+
+    with pytest.raises(RuntimeError):
+        controller.connect_and_measure()
+
+    assert controller.start_pose == ()

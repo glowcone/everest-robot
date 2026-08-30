@@ -134,6 +134,7 @@ class TeleoperationController:
         self._last_raw: dict[int, float] = {}
         self._last_seen: dict[int, float] = {}
         self._command: tuple[float, ...] = ()
+        self._start_pose: tuple[float, ...] = ()
         self._clamped: tuple[str, ...] = ()
         self._out_of_range_since: float | None = None
         self.error: str | None = None
@@ -158,6 +159,20 @@ class TeleoperationController:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def start_pose(self) -> tuple[float, ...]:
+        """The follower's measured pose from before it was ever enabled, or ``()``.
+
+        Recorded by :meth:`connect_and_measure`, which reads it while the arm is still
+        merely connected, and never written again -- following must not drag it along.
+        The caller needs somewhere safe to put the arm before torque comes off, and this
+        is the one pose that is known to have held the arm without power: it is where the
+        operator parked it. Empty until the leader has been measured, which is exactly
+        the case where nothing was enabled and there is nothing to undo.
+        """
+
+        return self._start_pose
+
     def connect_and_measure(self, timeout_s: float = 2.0) -> float:
         """Connect the leader and return maximum initial follower/leader difference."""
 
@@ -180,6 +195,7 @@ class TeleoperationController:
             if not current.all_finite:
                 raise RuntimeError("follower has missing position feedback")
             self._command = tuple(current.positions)
+            self._start_pose = self._command
             return max(
                 abs(target - position)
                 for target, position in zip(targets, current.positions, strict=True)

@@ -22,6 +22,10 @@ Environment:
   or ``file``.
 * ``EVEREST_CAMERAS`` / ``EVEREST_CAMERAS_FILE`` -- see
   :mod:`everest_robot.robot.cameras`.
+* ``EVEREST_PIXEL_MAP`` -- path to the fixed camera's pixel-to-joint calibration
+  (default ``config/pixel_map.json``). It is not a policy observation and deliberately
+  does not go through ``EVEREST_CAMERAS``: the camera id it uses is part of the
+  calibration, because moving that camera voids every sample in the file.
 * ``HF_TOKEN`` -- read by ``huggingface_hub`` itself for a private dataset. It is never
   passed through workflow parameters and never appears in a result or an error.
 """
@@ -34,6 +38,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from everest_robot.pixel_map import PixelJointMap, PixelMapError
 from everest_robot.robot.cameras import CameraRuntime
 from everest_robot.robot.contracts import CancelCheck, Heartbeat
 from everest_robot.robot.datasets import HuggingFaceDatasetResolver
@@ -47,6 +52,7 @@ from everest_robot.robot.robstride_mit_port import RobstrideMitPort
 from everest_robot.robot.session import RobotSession
 
 DEFAULT_PARAMETERS_PATH = "config/maker_arm_v1.yaml"
+DEFAULT_PIXEL_MAP_PATH = "config/pixel_map.json"
 
 
 def parameters_path(environ: Mapping[str, str] | None = None) -> Path:
@@ -58,6 +64,32 @@ def parameters_path(environ: Mapping[str, str] | None = None) -> Path:
 
 def load_parameters(environ: Mapping[str, str] | None = None) -> RobotParameters:
     return RobotParameters.from_yaml(parameters_path(environ))
+
+
+def pixel_map_path(environ: Mapping[str, str] | None = None) -> Path:
+    """Which fixed-camera calibration the visual follower uses."""
+
+    environ = os.environ if environ is None else environ
+    return Path(environ.get("EVEREST_PIXEL_MAP", DEFAULT_PIXEL_MAP_PATH))
+
+
+def load_pixel_map(environ: Mapping[str, str] | None = None) -> PixelJointMap:
+    """Load the calibration and refuse one that cannot drive anything.
+
+    A file with samples but no fit, or with no ROI, is a teaching session someone stopped
+    halfway through. Both refusals belong here rather than at the first servo tick, where
+    the arm is already claimed and the operator is already waiting.
+    """
+
+    path = pixel_map_path(environ)
+    calibration = PixelJointMap.load(path)
+    if calibration.model is None:
+        raise PixelMapError(f"{path} has no fit yet; run `robot-pixel-map fit` first")
+    if calibration.detector.roi_xywh is None:
+        raise PixelMapError(
+            f"{path} stored no detector ROI; re-run `robot-pixel-map collect --roi X Y W H`"
+        )
+    return calibration
 
 
 def build_lease(

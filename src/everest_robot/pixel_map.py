@@ -585,6 +585,50 @@ class PixelJointMap:
             for name, value in zip(self.joint_names, measured, strict=True)
         )
 
+    def pixel_error_px(self, prediction: Prediction, measured: Sequence[float]) -> float:
+        """How far, in pixels, the measured pose is from the pose this pixel asks for.
+
+        Nothing detects the *gripper*: the map pairs the object's pixel with the pose that
+        grasps it, so there is no second image feature to difference against and no
+        pixel-space error to measure directly. What there is, is the fit. Solving
+        ``J dp = q_measured - q_target`` for the pixel displacement ``dp``, with ``J`` the
+        fit's Jacobian at this pixel, expresses the joint-space servo error back in the
+        map's own units: *the gripper is standing where a carabiner this many pixels away
+        would have put it*. That is comparable to the hull margin and the jump gate, which
+        radians are not.
+
+        Least squares because ``J`` is (fitted joints) x 2: four joints move for two pixel
+        degrees of freedom, so a joint error with a component off the taught surface has no
+        exact pixel explanation and gets the closest one. This is diagnostics -- it is
+        derived from the fit, so it inherits every one of the fit's errors and is not
+        independent evidence about where the gripper physically is.
+        """
+
+        if self.model is None:
+            raise PixelMapError("this calibration has no fit yet; run `robot-pixel-map fit` first")
+        if len(measured) != len(self.joint_names):
+            raise PixelMapError(
+                f"expected {len(self.joint_names)} measured joints, got {len(measured)}"
+            )
+        position = {name: index for index, name in enumerate(self.joint_names)}
+        target = np.asarray(
+            [prediction.joints[name] for name in self.model.joints], dtype=float
+        )
+        current = np.asarray(
+            [float(measured[position[name]]) for name in self.model.joints], dtype=float
+        )
+        # One pixel each way. The fit is smooth at that scale, and a central difference is
+        # first-order exact without a second model to keep in step with this one.
+        u, v = prediction.pixel
+        probes = self.model.predict(
+            [[u - 1.0, v], [u + 1.0, v], [u, v - 1.0], [u, v + 1.0]]
+        )
+        jacobian = np.column_stack(
+            [(probes[1] - probes[0]) / 2.0, (probes[3] - probes[2]) / 2.0]
+        )
+        offset, *_ = np.linalg.lstsq(jacobian, current - target, rcond=None)
+        return float(np.linalg.norm(offset))
+
     def approach_pose(self, target: Sequence[float]) -> tuple[float, ...]:
         """The pose to pass through so every joint arrives from the taught direction.
 

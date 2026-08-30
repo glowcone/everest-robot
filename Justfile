@@ -152,9 +152,10 @@ psql:
 # ── workflows ──────────────────────────────────────────────────────────────────────
 # `attach-fsm` is the local real-time orchestrator from ADR-0003. It holds one robot lease
 # for the complete attempt and does not require Absurd or PostgreSQL. The learned states
-# (SEARCH_RL, CLIP_RL) are implemented and load a policy from a file; perception (INITIAL,
-# SEARCH_CV, and the CLIP_RL gates) is still a guarded stub, so `attach-fsm` refuses before
-# claiming the robot. `attach-fsm-fake` exercises the whole FSM with no hardware at all.
+# (SEARCH_RL, CLIP_RL) load a policy from a file and SEARCH_CV drives the fixed camera and
+# the pixel map from `pixel-fit`; INITIAL and the CLIP_RL gates are still guarded stubs, so
+# `attach-fsm` refuses before claiming the robot. Use `attach-fsm-fake` to exercise the
+# state machine with no hardware at all, and `pixel-track` to watch the CV follower alone.
 
 # Exercise the attachment FSM with deterministic handlers. No camera, database, or motion.
 [group('workflow')]

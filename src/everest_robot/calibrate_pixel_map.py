@@ -36,7 +36,6 @@ import contextlib
 import math
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,144 +56,38 @@ from everest_robot.pixel_map import (
     now_stamp,
 )
 
-DEFAULT_CONFIG = "config/pixel_map.json"
+# The camera, the detector and the follower live in the robot SDK layer, because the
+# attachment FSM's SEARCH_CV state uses exactly the same three. They are re-exported here:
+# this CLI is where an operator meets them, and `robot-pixel-map track` is the same loop
+# the FSM runs, minus the arbitration.
+from everest_robot.robot.carabiner_follower import (
+    DEFAULT_MAX_JUMP_PX,
+    CarabinerPixel,
+    detect_carabiner,
+    load_cv2,
+    open_capture,
+    read_frame,
+)
 
-# A detection that jumps further than this between frames is a different blob, not the
-# same carabiner moving. Treated as a miss so the arm holds instead of lunging.
-DEFAULT_MAX_JUMP_PX = 150.0
+DEFAULT_CONFIG = "config/pixel_map.json"
 
 # How far each joint backs off before the final one-way move onto the target.
 DEFAULT_APPROACH_RAD = 0.05
 
-
-# ── camera ─────────────────────────────────────────────────────────────────────────
-def _cv2() -> Any:
-    try:
-        import cv2  # type: ignore[import-not-found]
-    except ImportError as error:
-        raise PixelMapError(
-            "OpenCV is required for the camera. Install with: uv add opencv-python"
-        ) from error
-    return cv2
-
-
-def _capture_api(cv2: Any, backend: str) -> int:
-    if backend == "auto":
-        return cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
-    apis = {
-        "avfoundation": cv2.CAP_AVFOUNDATION,
-        "v4l2": cv2.CAP_V4L2,
-        "any": cv2.CAP_ANY,
-    }
-    if backend not in apis:
-        raise PixelMapError(f"unknown camera backend {backend!r} (expected {', '.join(apis)})")
-    return apis[backend]
-
-
-def open_capture(camera: CameraSource) -> Any:
-    """Open the fixed camera, or say plainly which id failed."""
-
-    cv2 = _cv2()
-    try:
-        index_or_path: int | str = int(camera.index_or_path)
-    except ValueError:
-        index_or_path = camera.index_or_path
-    capture = cv2.VideoCapture(index_or_path, _capture_api(cv2, camera.backend))
-    if not capture.isOpened():
-        raise PixelMapError(
-            f"could not open camera {camera.index_or_path!r} "
-            f"(backend {camera.backend}); check the id and that nothing else holds it"
-        )
-    if camera.width:
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, camera.width)
-    if camera.height:
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, camera.height)
-    return capture
-
-
-def read_frame(capture: Any, camera: CameraSource, *, attempts: int = 20) -> Any:
-    """One frame, retrying briefly before giving up.
-
-    A single failed ``read()`` means very little. AVFoundation returns false for the first
-    few reads while the capture session spins up, and a momentary miss mid-session should
-    not end a 25-minute teaching run. Only a sustained failure is real -- and on macOS its
-    usual cause is another process already holding the device, because ``VideoCapture``
-    still reports ``isOpened()`` in that case and simply never yields a frame.
-    """
-
-    import time
-
-    for attempt in range(attempts):
-        ok, frame = capture.read()
-        if ok:
-            return frame
-        if attempt + 1 < attempts:
-            time.sleep(0.05)
-    raise PixelMapError(
-        f"camera {camera.index_or_path!r} opened but produced no frame in {attempts} reads. "
-        "Another process is probably holding it -- close any running "
-        "robot-two-white-black-live, tools/preview.py or robot-pixel-map window. "
-        "If nothing else is running, check the camera permission for your terminal."
-    )
-
-
-# ── detection ──────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True, slots=True)
-class CarabinerPixel:
-    """One detection, reduced to what the map consumes."""
-
-    centroid: tuple[float, float]
-    spine_rad: float
-    white_a: tuple[float, float]
-    white_b: tuple[float, float]
-    gate: tuple[float, float]
-
-
-def detect_carabiner(frame: Any, roi_xywh: Sequence[int]) -> CarabinerPixel:
-    """The two-white-tape plus black-gate detection, reduced to a centroid and an angle.
-
-    The centroid is the midpoint of the two white tapes -- the *object's* pixel, never the
-    gripper's. Pairing that pixel with the joint vector that grasped it is what absorbs
-    the camera's parallax into the fit instead of leaving it to be modelled.
-
-    The spine angle is measured in image coordinates, where +v runs downward, so it is
-    left-handed with respect to the arm. ``RollModel`` picks up the sign; nothing here
-    needs to know how the camera is mounted.
-    """
-
-    from everest_robot.vision import detect_two_white_tapes_and_black_gate_bgr
-
-    detection = detect_two_white_tapes_and_black_gate_bgr(
-        frame, roi_xywh=(int(roi_xywh[0]), int(roi_xywh[1]), int(roi_xywh[2]), int(roi_xywh[3]))
-    )
-    a, b = detection.white_points_px
-    gate = detection.black_gate_px
-    midpoint = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
-
-    axis = (b.x - a.x, b.y - a.y)
-    length = math.hypot(*axis)
-    if length < 1e-6:
-        raise PixelMapError("the two white tapes landed on the same pixel")
-    axis = (axis[0] / length, axis[1] / length)
-    # Two identical tapes leave the axis sign ambiguous; the gate resolves it, exactly as
-    # `pickup.carabiner_pose_from_axis_points_and_side_point` does in the robot frame.
-    left = (-axis[1], axis[0])
-    if left[0] * (gate.x - midpoint[0]) + left[1] * (gate.y - midpoint[1]) < 0.0:
-        axis = (-axis[0], -axis[1])
-
-    return CarabinerPixel(
-        centroid=midpoint,
-        spine_rad=math.atan2(axis[1], axis[0]),
-        white_a=(a.x, a.y),
-        white_b=(b.x, b.y),
-        gate=(gate.x, gate.y),
-    )
+__all__ = [
+    "CarabinerPixel",
+    "build_parser",
+    "detect_carabiner",
+    "main",
+    "open_capture",
+    "read_frame",
+]
 
 
 def _draw(
     frame: Any, roi: Sequence[int], detection: CarabinerPixel | None, lines: list[str]
 ) -> None:
-    cv2 = _cv2()
+    cv2 = load_cv2()
     colour = (0, 220, 0) if detection is not None else (0, 0, 255)
     cv2.rectangle(frame, (roi[0], roi[1]), (roi[0] + roi[2], roi[1] + roi[3]), colour, 2)
     if detection is not None:
@@ -216,7 +109,7 @@ def _draw(
 def _draw_hull(frame: Any, hull: Any) -> None:
     import numpy as np
 
-    cv2 = _cv2()
+    cv2 = load_cv2()
     cv2.polylines(frame, [np.asarray(hull, dtype=np.int32)], True, (255, 180, 0), 2)
 
 
@@ -377,7 +270,7 @@ def _existing_or_new_map(args: argparse.Namespace, session: Any) -> PixelJointMa
 def cmd_collect(args: argparse.Namespace) -> int:
     """Teach correspondences: object pixel now, joint vector that grasps it now."""
 
-    cv2 = _cv2()
+    cv2 = load_cv2()
     session = _open_session(args)
     controller = None
     try:
@@ -628,7 +521,7 @@ def cmd_track(args: argparse.Namespace) -> int:
     the calibrated region. It never coasts toward a stale target.
     """
 
-    cv2 = _cv2()
+    cv2 = load_cv2()
     from everest_robot.robot.visual_tracking import TrackerStopped, VisualTracker
 
     calibration = PixelJointMap.load(args.config)

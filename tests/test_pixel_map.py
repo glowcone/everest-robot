@@ -206,6 +206,33 @@ def test_full_target_rejects_a_measured_pose_of_the_wrong_width():
         fitted.full_target(fitted.predict((320.0, 240.0)), (0.0, 0.0))
 
 
+def test_the_pixel_error_recovers_the_displacement_that_caused_it():
+    """The joint error is inverted through the fit's Jacobian, so parking the arm at the
+    pose for one pixel while asking for another must read back as their separation."""
+
+    fitted = calibration().fitted(fit_joints=FIT_JOINTS)
+    wanted = fitted.predict((320.0, 240.0))
+    parked = fitted.full_target(fitted.predict((350.0, 260.0)), (0.0,) * len(JOINTS))
+
+    error = fitted.pixel_error_px(wanted, parked)
+
+    assert error == pytest.approx(math.dist((320.0, 240.0), (350.0, 260.0)), rel=0.05)
+
+
+def test_a_pose_that_is_already_the_target_has_no_pixel_error():
+    fitted = calibration().fitted(fit_joints=FIT_JOINTS)
+    prediction = fitted.predict((320.0, 240.0))
+    parked = fitted.full_target(prediction, (0.0,) * len(JOINTS))
+
+    assert fitted.pixel_error_px(prediction, parked) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_pixel_error_rejects_a_measured_pose_of_the_wrong_width():
+    fitted = calibration().fitted(fit_joints=FIT_JOINTS)
+    with pytest.raises(PixelMapError, match="expected 6 measured joints"):
+        fitted.pixel_error_px(fitted.predict((320.0, 240.0)), (0.0, 0.0))
+
+
 # ── the file ───────────────────────────────────────────────────────────────────────
 def test_round_trip_through_the_file_predicts_identically(tmp_path):
     fitted = calibration().fitted(fit_joints=FIT_JOINTS)

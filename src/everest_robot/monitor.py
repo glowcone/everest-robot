@@ -5,6 +5,12 @@ lease, follows the leader at a bounded rate, and renders the same encoder TUI.  
 process cannot monitor an active controller safely because both would participate on the
 CAN bus.  ``--read-only`` and ``--once`` retain the torque-disabled hand-teaching path.
 
+However a powered session ends -- ``q``, Ctrl-C, or a teleoperation failure -- the arm is
+driven back to the pose it was measured at before it was enabled and only then disabled.
+Cutting torque wherever the leader happened to leave the follower drops the arm from an
+arbitrary pose; the pose the operator parked it at is the one place it is known to rest
+under no power.  See :func:`_return_to_start`.
+
 It does claim the robot lease, and that is not incidental. Reading feedback from a merely
 connected arm makes the driver poll the bus (``MakerArmPort.read_state`` refreshes when
 the arm is not enabled), so a monitor is a bus participant, not a passive tap. Running one
@@ -51,10 +57,17 @@ _NEEDS_TORQUE = _NEEDS_TEMP + _TORQUE_W
 _BAR_W = 18
 _NEEDS_BAR = _NEEDS_TORQUE + _BAR_W
 
+# Every powered session ends by driving the follower back to the pose it was measured at
+# before it was enabled, and only then releasing torque. Reduced speed for `robot-goto`'s
+# reason: the leader may have walked the arm a long way from where it started, and this
+# interpolation is a direct one with no obstacle avoidance behind it.
+RETURN_SPEED_SCALE = 0.25
+RETURN_TARGET_NAME = "teleoperation-start"
+
 # The keys, once. The footer is derived from the short labels and the help overlay from
 # the long ones, so a binding cannot be added to the loop and forgotten in the guide.
 _KEY_BINDINGS: tuple[tuple[str, str], ...] = (
-    ("q", "quit+hold"),
+    ("q", "quit+park"),
     ("p", "capture pose"),
     ("z", "mark reference"),
     ("Z", "clear"),
@@ -64,7 +77,7 @@ _KEY_BINDINGS: tuple[tuple[str, str], ...] = (
 _HELP = " · ".join(f"{key} {label}" for key, label in _KEY_BINDINGS)
 
 _KEY_GUIDE: tuple[tuple[str, str], ...] = (
-    ("q", "stop, hold position, release the arm, and exit"),
+    ("q", "stop, park the arm where it started, release it, and exit"),
     ("p", "capture this pose; you are offered it as a named position on exit"),
     ("z", "mark this pose as the reference the d deg column measures from"),
     ("Z", "clear that reference"),
@@ -363,11 +376,16 @@ def _mode_guide(context: MonitorContext) -> tuple[str, ...]:
     if context.powered:
         return (
             "POWERED. The follower is enabled and tracking the Star leader at a",
-            "bounded velocity. space pauses following and holds; q stops, holds and",
-            "releases. This process holds the robot lease, so no worker can run.",
+            "bounded velocity. space pauses following and holds; q stops following.",
+            "This process holds the robot lease, so no worker can run.",
             "A leader pose the follower cannot reach is held at the soft limit and",
             "named as CLAMPED above; bring the leader back and following resumes.",
             "Staying out of range stops the session, because that is the mapping.",
+            "HOWEVER following ends -- q, a stop, or Ctrl-C -- the arm is then driven",
+            "back to the pose it was measured at before it was enabled, at reduced",
+            "speed and in a straight joint-space line with nothing avoiding obstacles.",
+            "Only after that does torque come off, so the arm goes limp where you",
+            "parked it rather than wherever the leader left it. Keep that line clear.",
         )
     return (
         "READ ONLY. The arm is never enabled, so you can position it by hand.",
@@ -658,10 +676,78 @@ def _run_session(
             controller.start()
             captured = _present(monitor, context, once=False, controller=controller)
         finally:
-            controller.close()
+            # Nested so that a leader that fails to close still cannot cost the arm its
+            # return: shutting the Star bus down is bookkeeping, parking the arm is not.
+            try:
+                controller.close()
+            finally:
+                _return_to_start(session, controller)
         if controller.error:
             raise SystemExit(f"teleoperation stopped: {controller.error}")
         return captured
+
+
+def _return_to_start(session: RobotSession, controller: TeleoperationController) -> None:
+    """Drive the follower back to its pre-teleoperation pose before torque comes off.
+
+    ``RobotSession.close()`` disables the arm on every exit path, so whichever pose the
+    leader left the follower in is the pose it goes limp from. That is fine where the
+    operator parked it and nowhere else, which is why this runs on the failure paths and
+    not only on ``q``: a leader-loss or sustained-excursion stop is precisely when the arm
+    is somewhere it must not simply be dropped from.
+
+    Reported, never raised. The teleoperation error is the one the operator has to see,
+    and a return that could not run must not replace it in the traceback. Whatever happens
+    the arm is left held rather than moving -- ``JointMotionController`` holds on every
+    failure path of its own -- so a failure here costs the parking, not the safety.
+    """
+
+    from everest_robot.robot.contracts import FailureReason
+
+    start = controller.start_pose
+    if not start:
+        return  # the leader was never measured, so the arm was never enabled
+    if session.port.lifecycle is not ArmLifecycle.ENABLED:
+        # Disabled or faulted under the driver's own policy. There is nothing to command,
+        # and saying so beats a silent skip: the arm is wherever it stopped.
+        print(
+            f"not returning to the starting pose: the arm is {session.port.lifecycle.value}",
+            file=sys.stderr,
+        )
+        return
+
+    print("returning the arm to the pose it started from...", file=sys.stderr)
+    try:
+        result = session.motion.go_to_joint_target(
+            RETURN_TARGET_NAME, start, speed_scale=RETURN_SPEED_SCALE
+        )
+    except BaseException as error:  # including a second Ctrl-C during the return
+        print(
+            f"return to the starting pose FAILED  {type(error).__name__}: {error}\n"
+            "the arm is held where it is and torque is about to come off; support it.",
+            file=sys.stderr,
+        )
+        return
+
+    if result.failure_reason is not None:
+        detail = result.failure_detail
+        if result.failure_reason is FailureReason.LIMIT_VIOLATION:
+            # The pose was inside the limits when it was read, so the limits have moved:
+            # a re-zeroed or wrapped joint. Not something to clamp our way past.
+            detail = f"{detail} -- the arm's limits are not the ones it started under"
+        print(
+            f"return to the starting pose FAILED  {result.failure_reason}: {detail}\n"
+            "the arm is held where it is and torque is about to come off; support it.",
+            file=sys.stderr,
+        )
+    elif result.already_at_target:
+        print("already at the pose it started from; the arm did not move.", file=sys.stderr)
+    else:
+        print(
+            f"back at the starting pose after {result.elapsed_s:.2f}s "
+            f"(max tracking error {result.max_tracking_error_rad:.4f} rad).",
+            file=sys.stderr,
+        )
 
 
 def _present(

@@ -120,13 +120,21 @@ Absurd checkpoints store.
   A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
   backend, parameters path -- `parameters_path()`, which is also where a captured preset is
-  written back). Do not read the environment anywhere else in the runtime.
+  written back; the pixel-map path -- `EVEREST_PIXEL_MAP`, loaded and refused up front by
+  `load_pixel_map()`). Do not read the environment anywhere else in the runtime.
 - `visual_tracking.py` is the bounded servo loop for a target that changes every frame. It
   takes a full joint target or `None` per tick and clamps the commanded step, so the arm's
   speed is bounded by construction and a missing detection holds rather than coasting.
   Where the target comes from is the caller's problem: `pixel_map.py` fits the fixed
   camera's pixels to taught pre-grasp poses and refuses to extrapolate outside their convex
   hull, and `calibrate_pixel_map.py` (`robot-pixel-map`) is the operator's CLI over both.
+- `robot/carabiner_follower.py` is that caller: the fixed camera, the two-white-tape
+  detector and the map, stepped one tracker tick at a time. It owns the three judgements
+  neither the tracker nor the FSM can make -- how many consecutive misses mean the target
+  is lost, what "followed" means (the *measured* pose settled, not one tick that moved),
+  and the pacing that keeps the per-tick clamp equal to `max_velocity_rad_s`. It never
+  chooses a next state. `calibrate_pixel_map.py` re-exports its camera and detector, so the
+  `track` subcommand and the FSM's `SEARCH_CV` run the same loop minus the arbitration.
 - `robot/monitor.py` remains the read-only feedback view model. The `robot-monitor` CLI
   defaults to a powered, lease-local calibration session: `robot/teleoperation.py` owns the
   Star leader and commands the already-claimed follower while the same process renders that
@@ -181,8 +189,10 @@ heartbeats often enough to retain their worker claim.
 The standalone attachment FSM is not durable orchestration. Its handler methods perform at
 most one physical action and return the typed result that the FSM uses for its transition;
 handlers must not contain hidden retry loops or choose the next state. `INITIAL` is
-motion-free, `SEARCH_CV` reuses `VisualTracker`, and `SEARCH_RL`/`CLIP_RL` use distinct
-persistent policy sessions even when they share a checkpoint. There is no automatic neutral
+motion-free, `SEARCH_CV` is integrated and steps one `CarabinerFollower` tick (the
+calibration is verified against the connected arm at handler construction, not at the first
+servo tick), and `SEARCH_RL`/`CLIP_RL` use distinct persistent policy sessions even when
+they share a checkpoint. There is no automatic neutral
 or known-position command. When `CLIP_RL` reports that the policy returned to neutral, the
 FSM returns to `INITIAL` and clears per-cycle state budgets; keep the lifetime total-action
 and wall-clock budgets finite. Treat the trace as diagnostics rather than resumable physical

@@ -89,11 +89,12 @@ just attach-fsm <search-policy> <clip-policy>
 ```
 
 **This refuses today, before claiming the robot.** The learned half of `SEARCH_RL` and
-`CLIP_RL` is implemented; perception is not. `INITIAL`, `SEARCH_CV`, and the gate signals
+`CLIP_RL` is implemented, and so is `SEARCH_CV`, which servos on the fixed camera and the
+calibrated pixel map; the rest of perception is not. `INITIAL` and the gate signals
 `CLIP_RL` reads after each action have no detector or verifier behind them yet and refuse
-rather than guess. Policy files are resolved and the perception gates are checked *before*
-`open_session()`, so a missing checkpoint or an unavailable detector costs no lease and no
-energized arm to discover.
+rather than guess. Policy files and the pixel map are resolved and the perception gates are
+checked *before* `open_session()`, so a missing checkpoint, a stale calibration or an
+unavailable detector costs no lease and no energized arm to discover.
 
 A trained checkpoint (a directory, or `.safetensors` / `.pt` / `.ckpt` / `.bin`) also still
 refuses: loading one needs the dataset feature metadata that the deferred recording/dataset

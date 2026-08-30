@@ -39,6 +39,8 @@ from everest_robot.robot.contracts import ArmLifecycle, TerminationReason
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from everest_robot.domain import ReplayRequest, ReplayResult
+    from everest_robot.pixel_map import PixelJointMap
+    from everest_robot.robot.carabiner_follower import CarabinerFollower
     from everest_robot.robot.policy import PolicyHandle, PolicySession, PolicyStep
     from everest_robot.robot.replay import ReplayControl
     from everest_robot.robot.session import RobotSession
@@ -189,6 +191,12 @@ class EverestAttachmentFSMHandlers:
     between them: an action chunk cached before CV moved the arm describes a pose the arm
     has left. Entering either state re-seeds its own session and leaves the other alone.
 
+    ``SEARCH_CV`` is that intervening vision: it drives :class:`CarabinerFollower`, which
+    is the fixed camera, the two-tape detector, the calibrated pixel map and a speed-locked
+    ``VisualTracker``. Its ``calibration`` is optional only so the learned states can be
+    brought up and rehearsed without a camera; the hardware backend always supplies one,
+    and entering ``SEARCH_CV`` without it refuses rather than servos blind.
+
     Every step method performs at most one physical action, then reads the gate signals
     fresh. The transition decision itself belongs to
     :class:`~everest_robot.attachment_fsm.AttachmentFSM` and is deliberately not duplicated
@@ -198,11 +206,32 @@ class EverestAttachmentFSMHandlers:
     session: RobotSession
     search_policy: PolicyHandle
     clip_policy: PolicyHandle
+    calibration: PixelJointMap | None = None
     perception: AttachmentPerception = field(default_factory=UnavailableAttachmentPerception)
     task: str | None = None
     fps: float | None = None
+    rate_hz: float = 15.0
+    max_velocity_rad_s: float = 0.15
+    lock_frames: int = 3
 
     def __post_init__(self) -> None:
+        from everest_robot.pixel_map import PixelMapError, RobotStamp
+
+        self._capture: Any = None
+        self._follower: CarabinerFollower | None = None
+        if self.calibration is not None:
+            identity = self.session.port.identity
+            # A fit only means anything for the arm and the zeroing it was taught on, and
+            # SEARCH_CV is reachable straight out of INITIAL. Refuse now, not three states
+            # in with the arm already moving.
+            self.calibration.robot.verify(
+                RobotStamp(identity.robot_id, identity.calibration_id)
+            )
+            if self.calibration.joint_names != tuple(self.session.port.joint_names):
+                raise PixelMapError(
+                    f"calibration joints {', '.join(self.calibration.joint_names)} do not "
+                    f"match this arm's {', '.join(self.session.port.joint_names)}"
+                )
         overrides: dict[str, object] = {"task": self.task}
         if self.fps is not None:
             overrides["fps"] = self.fps
@@ -231,9 +260,23 @@ class EverestAttachmentFSMHandlers:
         """
 
         del previous
+        # The follower owns lock-on state and a tracker command seeded from feedback, and
+        # both are stale the moment a policy moves the arm. Tear it down on the way out of
+        # SEARCH_CV and build a fresh one on the way back in, rather than resuming it.
+        if state is not AttachmentState.SEARCH_CV:
+            self._release_follower()
+        elif self._follower is None and self.calibration is not None:
+            self._follower = self._build_follower()
+            self._follower.start()
         rollout = self._sessions.get(state)
         if rollout is not None:
             rollout.seed()
+
+    def observe_initial(self) -> InitialObservation:
+        raise NotImplementedError(
+            "INITIAL needs one coherent camera observation plus non-moving attachment "
+            "verification; integrate the detector and verifier here"
+        )
 
     # ── the learned states ─────────────────────────────────────────────────────────
     def search_rl_step(self) -> SearchRLStep:
@@ -249,6 +292,39 @@ class EverestAttachmentFSMHandlers:
                 "the search policy signalled completion without detecting the carabiner"
             )
         return detection
+
+    def search_cv_step(self) -> SearchCVStep:
+        """One detector/map/servo tick, and the follower's own visibility verdict."""
+
+        from everest_robot.robot.visual_tracking import TrackerStopped
+
+        if self._follower is None:
+            if self.calibration is None:
+                from everest_robot.pixel_map import PixelMapError
+
+                raise PixelMapError(
+                    "SEARCH_CV needs a calibrated pixel map; these handlers were built "
+                    "without one (`robot-pixel-map fit`, then EVEREST_PIXEL_MAP)"
+                )
+            raise RuntimeError(
+                "search_cv_step() was called outside SEARCH_CV; the follower is built on "
+                "entry to that state"
+            )
+        try:
+            tick = self._follower.step()
+        except TrackerStopped as error:
+            # The tracker holds the arm before it stops. A fault, lost feedback or a
+            # refused command is a safety stop, not a step result to keep arbitrating on.
+            raise AttachmentAbort(f"visual follower stopped: {error}") from error
+        return SearchCVStep(
+            target_visible=tick.target_visible,
+            followed=tick.followed,
+            # The two-tape segmentation is a hard threshold with no score. Same reason
+            # `attach_clip` reports no force: a number here would be fiction. What the
+            # follower does measure is the servo error, in the map's own pixels.
+            confidence=None,
+            pixel_error=tick.pixel_error_px,
+        )
 
     def clip_rl_step(self) -> ClipRLStep:
         """One learned grasp/clip action, then fresh attachment and recovery checks.
@@ -279,6 +355,14 @@ class EverestAttachmentFSMHandlers:
         if self.session.port.lifecycle is ArmLifecycle.ENABLED:
             self.session.port.hold_current_position()
 
+    def close(self) -> None:
+        """Stop following and release the fixed camera. The session is closed by its owner."""
+
+        self._release_follower()
+        capture, self._capture = self._capture, None
+        if capture is not None:
+            capture.release()
+
     # ── helpers ────────────────────────────────────────────────────────────────────
     def _advance(self, state: AttachmentState) -> PolicyStep:
         """Take exactly one action, and turn a stopped rollout into an abort.
@@ -296,6 +380,62 @@ class EverestAttachmentFSMHandlers:
             raise AttachmentAbort(f"{state.value} stopped: {step.failure_reason} -- {detail}")
         return step
 
+    # ── the CV subsystem ───────────────────────────────────────────────────────────
+    def _build_follower(self) -> CarabinerFollower:
+        from everest_robot.pixel_map import PixelMapError
+        from everest_robot.robot.carabiner_follower import (
+            CarabinerFollower,
+            detect_carabiner,
+            read_frame,
+        )
+        from everest_robot.robot.visual_tracking import VisualTracker
+
+        if self.calibration is None:
+            raise PixelMapError(
+                "SEARCH_CV needs a calibrated pixel map; build the handlers with one "
+                "(`robot-pixel-map fit`, then EVEREST_PIXEL_MAP)"
+            )
+        camera = self.calibration.camera
+        roi = self.calibration.detector.roi_xywh
+        if roi is None:
+            raise PixelMapError(
+                "this calibration stored no detector ROI; re-run "
+                "`robot-pixel-map collect --roi X Y W H`"
+            )
+        capture = self._open_capture(camera)
+        return CarabinerFollower(
+            calibration=self.calibration,
+            tracker=VisualTracker(
+                self.session.port,
+                rate_hz=self.rate_hz,
+                max_velocity_rad_s=self.max_velocity_rad_s,
+                lock_frames=self.lock_frames,
+                clock=self.session.clock,
+            ),
+            frames=lambda: read_frame(capture, camera),
+            detect=lambda frame: detect_carabiner(frame, roi),
+            clock=self.session.clock,
+        )
+
+    def _open_capture(self, camera: Any) -> Any:
+        """Open the fixed camera once and keep it for the attempt.
+
+        Re-opening per SEARCH_CV entry would cost a capture-session spin-up every time the
+        clip policy handed control back, with the arm claimed and energized throughout.
+        """
+
+        if self._capture is None:
+            from everest_robot.robot.carabiner_follower import open_capture
+
+            self._capture = open_capture(camera)
+        return self._capture
+
+    def _release_follower(self) -> None:
+        follower, self._follower = self._follower, None
+        if follower is not None:
+            # Hold: the arm is about to be handed to a policy that seeds from feedback.
+            follower.stop()
+
 
 @contextmanager
 def attachment_fsm_handlers(
@@ -306,10 +446,10 @@ def attachment_fsm_handlers(
     """Build the standalone FSM handlers under the same deployment and lease boundary.
 
     Ordering is the point, and it is the same ordering replay preflight uses: the policy
-    files are resolved and the perception gates are checked *before* the robot is claimed
-    or energized. A missing checkpoint, a malformed scripted policy or an unavailable
-    detector is a mistake anyone can make, and none of them should cost an energized arm to
-    discover.
+    files are resolved, the perception gates are checked and the pixel map is loaded
+    *before* the robot is claimed or energized. A missing checkpoint, a malformed scripted
+    policy, an unavailable detector or an uncalibrated camera is a mistake anyone can make,
+    and none of them should cost an energized arm to discover.
     """
 
     import os
@@ -345,18 +485,27 @@ def attachment_fsm_handlers(
     checks = perception if perception is not None else UnavailableAttachmentPerception()
     checks.preflight()
 
-    from everest_robot.robot.deployment import open_session
+    from everest_robot.robot.deployment import load_pixel_map, open_session
+
+    # The pixel map is read and refused here for the same reason the policies are: a stale
+    # or missing calibration is not worth an energized arm to discover.
+    calibration = load_pixel_map()
 
     session = open_session()
     try:
-        yield EverestAttachmentFSMHandlers(
+        handlers = EverestAttachmentFSMHandlers(
             session,
             search_policy,
             clip_policy,
+            calibration=calibration,
             perception=checks,
             task=params.get("attachment_task"),
             fps=None if params.get("policy_fps") is None else float(params["policy_fps"]),
         )
+        try:
+            yield handlers
+        finally:
+            handlers.close()
     finally:
         session.close()
 
