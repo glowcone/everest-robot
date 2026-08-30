@@ -16,8 +16,9 @@ positions, and one operator has a hand on the e-stop for every step below.
 2. Move the leader until the follower reaches the target pose. Press space to pause following
    and hold the follower at the measured pose. Do not type the pose in.
 3. Press `p` to capture the current follower state, then `q`. Once the TUI restores the
-   terminal it prints a copyable `joints: [...]` vector in canonical radians with robot,
-   calibration, and configuration identity. Support the arm while the session releases torque.
+   terminal it prints the pose in canonical radians with robot, calibration, and
+   configuration identity, then offers to save it -- see step 2. Support the arm while the
+   session releases torque.
 4. Repeat the measurement three times, re-approaching the pose from a different direction
    each time. If any joint varies by more than the configured `tolerance_rad`, the pose is
    not repeatable: fix the fixture or the calibration before continuing.
@@ -29,7 +30,26 @@ combined in `just monitor`.
 
 ## 2. Record it
 
-Add an entry under `named_positions` with the measured values and its provenance:
+The save prompt runs after the session has released the arm, so nothing is claimed or
+energized while you type:
+
+```
+Save this pose to config/maker_arm_v1.yaml as a named position?
+  name (blank to skip) > clip-attachment-ready
+  approved by > <operator name or team>
+  notes (optional) > measured with the clip fixture at station 2
+```
+
+A blank name skips it. It refuses to save a pose from `--fake`, one with a joint reporting
+no feedback, one outside the driver's soft limits, or one measured while the arm was
+faulted, because none of those describe a place the arm actually was. Re-saving an existing
+name is a re-approval and has to be confirmed with `REPLACE`. The write is atomic and
+verified: the file is re-read through the strict loader afterwards and rolled back to its
+original bytes unless the preset that comes back is the one that went in. `--no-save` prints
+the pose and offers nothing.
+
+Hand-editing remains available for anything the prompt does not cover -- per-preset motion
+overrides, or reordering. The entry it writes has this shape:
 
 ```yaml
 named_positions:
@@ -44,7 +64,9 @@ named_positions:
 ```
 
 The loader rejects a preset whose `calibration_id` does not match the file's robot, and
-rejects unknown fields outright. The parameters file's content digest is stored in every
+rejects unknown fields outright -- the `robot_id` and `config_digest` the monitor prints
+beside a capture are identity for you to check, not preset fields, which is why the saved
+entry does not carry them. The parameters file's content digest is stored in every
 motion, policy and replay result, so a run can be traced back to the exact configuration.
 
 ## 3. Validate the approach at reduced speed

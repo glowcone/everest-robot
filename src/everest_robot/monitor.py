@@ -21,6 +21,7 @@ import contextlib
 import curses
 import sys
 from dataclasses import dataclass
+from datetime import date
 from typing import TYPE_CHECKING
 
 from everest_robot.robot.contracts import ArmLifecycle
@@ -35,6 +36,7 @@ from everest_robot.robot.monitor import (
 
 if TYPE_CHECKING:
     from everest_robot.robot.parameters import RobotParameters
+    from everest_robot.robot.session import RobotSession
     from everest_robot.robot.teleoperation import TeleoperationController
 
 # Column widths, and the terminal width each optional column needs before it earns its
@@ -355,11 +357,14 @@ def main() -> None:
     parser.add_argument(
         "--yes", action="store_true", help="accept a startup pose difference without prompting"
     )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="print a captured pose but never offer to write it to the parameters file",
+    )
     args = parser.parse_args()
     if args.poll_hz <= 0:
         parser.error(f"--poll-hz must be positive, got {args.poll_hz}")
-
-    import os
 
     from everest_robot.robot.deployment import build_lease, build_port, load_parameters
     from everest_robot.robot.session import RobotSession
@@ -378,18 +383,33 @@ def main() -> None:
 
     if args.fake:
         monitor = _build_fake_monitor(parameters, args.stale_after)
-        _present(monitor, context, once=args.once)
+        captured = _present(monitor, context, once=args.once)
+        _after_session(captured, context, parameters, save=not args.no_save)
         return
 
     # No cameras: calibration teleoperation and joint monitoring consume no images.
     session = RobotSession(
         build_port(parameters), parameters, lease=build_lease(parameters), cameras=None
     )
+    captured = _run_session(session, args, context)
+    # Deliberately outside the session: `close()` has held the arm, disabled it and
+    # released the lease, so nobody is waiting on a claimed robot while a name is typed.
+    _after_session(captured, context, parameters, save=not args.no_save)
+
+
+def _run_session(
+    session: RobotSession,
+    args: argparse.Namespace,
+    context: MonitorContext,
+) -> MonitorSample | None:
+    """Own the arm for the length of the session and return the pose captured with ``p``."""
+
+    import os
+
     with session:
         monitor = JointMonitor(session.port, stale_after_s=args.stale_after)
         if args.once or args.read_only:
-            _present(monitor, context, once=args.once)
-            return
+            return _present(monitor, context, once=args.once)
 
         from everest_robot.robot.teleoperation import (
             Star102LeaderPort,
@@ -430,8 +450,7 @@ def main() -> None:
             controller.close()
         if controller.error:
             raise SystemExit(f"teleoperation stopped: {controller.error}")
-        if captured is not None:
-            _print_capture(captured, context)
+        return captured
 
 
 def _present(
@@ -464,6 +483,100 @@ def _print_capture(sample: MonitorSample, context: MonitorContext) -> None:
     print(f"  calibration_id: {context.calibration_id}")
     print(f"  config_digest: {context.config_digest}")
     print(f"  joints: [{values}]")
+
+
+def _after_session(
+    captured: MonitorSample | None,
+    context: MonitorContext,
+    parameters: RobotParameters,
+    *,
+    save: bool,
+) -> None:
+    """Report the captured pose and, if it can be trusted, offer to record it."""
+
+    if captured is None:
+        return
+    _print_capture(captured, context)
+    if not save:
+        return
+    reason = _unsaveable(captured, context)
+    if reason is not None:
+        print(f"\nnot offering to save: {reason}")
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    try:
+        _prompt_save(captured, parameters)
+    except (EOFError, KeyboardInterrupt):
+        print("\nnot saved.")
+
+
+def _unsaveable(sample: MonitorSample, context: MonitorContext) -> str | None:
+    """Why this sample must not become a preset, if it must not.
+
+    A preset is a claim about where a physical arm was. Fake numbers are not, and a joint
+    that reported nothing or sits outside its own soft limits describes a pose the motion
+    layer would refuse to drive to anyway.
+    """
+
+    if context.fake:
+        return "--fake numbers describe no physical arm"
+    missing = sample.missing_feedback
+    if missing:
+        return f"no feedback from {', '.join(missing)}"
+    outside = sample.out_of_limits
+    if outside:
+        return f"{', '.join(outside)} outside the driver's soft limits"
+    if sample.has_fault:
+        return "the arm reported a fault while this pose was measured"
+    return None
+
+
+def _prompt_save(sample: MonitorSample, parameters: RobotParameters) -> None:
+    """Ask what to call the pose, and write it. A blank name skips the whole thing."""
+
+    from everest_robot.robot.capture import CapturedPose, CaptureRefused, save_preset
+    from everest_robot.robot.deployment import parameters_path
+
+    path = parameters_path()
+    print(f"\nSave this pose to {path} as a named position?")
+    name = input("  name (blank to skip) > ").strip()
+    if not name:
+        return
+
+    replace = name in parameters.named_positions
+    if replace:
+        print(f"  {name!r} already exists. Recapturing it is a re-approval: every")
+        print("  transition to it has to be re-validated afterwards.")
+        if input("  type REPLACE to overwrite > ").strip() != "REPLACE":
+            print("left unchanged.")
+            return
+
+    approved_by = input("  approved by > ").strip()
+    if not approved_by:
+        print("not saved: a preset records who approved the pose, and that cannot be blank.")
+        return
+    notes = input("  notes (optional) > ").strip()
+
+    pose = CapturedPose(
+        name=name,
+        joints=tuple(reading.position_rad for reading in sample.readings),
+        calibration_id=parameters.identity.calibration_id,
+        approved_by=approved_by,
+        captured_at=date.today(),
+        notes=notes or None,
+    )
+    try:
+        written = save_preset(path, pose, replace=replace)
+    except CaptureRefused as error:
+        print(f"not saved: {error}", file=sys.stderr)
+        return
+
+    print(f"\nwrote named position {name!r} to {written}")
+    print("It is not validated yet. Before anything relies on it:")
+    print(f"  just goto-dry {name}          # planned motion, nothing energized")
+    print(f"  just goto {name} 0.25         # then 0.5, then 1.0")
+    print("from every pose the move can start at -- docs/named-position-capture.md step 3.")
 
 
 if __name__ == "__main__":

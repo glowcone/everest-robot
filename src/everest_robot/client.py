@@ -39,10 +39,10 @@ def show_config() -> None:
     import os
 
     from everest_robot.robot.cameras import load_camera_specs
-    from everest_robot.robot.deployment import DEFAULT_PARAMETERS_PATH, load_parameters
+    from everest_robot.robot.deployment import load_parameters, parameters_path
     from everest_robot.robot.parameters import ParameterError
 
-    path = os.getenv("EVEREST_ROBOT_PARAMETERS", DEFAULT_PARAMETERS_PATH)
+    path = parameters_path()
     print(f"parameters file:   {path}")
     try:
         parameters = load_parameters()

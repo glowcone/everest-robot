@@ -50,6 +50,12 @@ Absurd checkpoints store.
 - `parameters.py` loads `config/maker_arm_v1.yaml` strictly: unknown fields are rejected,
   and a preset whose `calibration_id` does not match the file's robot is refused. Presets
   come from `docs/named-position-capture.md`, never from hand-edited joint values.
+- `capture.py` is the only writer of that file. It splices one `named_positions` entry in
+  as text, because the file's comments carry content no YAML dumper preserves, and it earns
+  that by verifying: atomic replace, re-read through the strict loader, and a rollback to
+  the original bytes unless the preset that comes back matches the one written. Keep every
+  new refusal ahead of the write, and keep provenance (`approved_by`, `captured_at`) coming
+  from a person -- it is an attestation, not metadata.
 - `motion.py`, `policy.py` and `session.py` take an injectable `Clock`
   (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
   cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
@@ -72,12 +78,16 @@ Absurd checkpoints store.
 - Third-party robotics dependencies live in the `hardware` extra and are imported lazily.
   A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
-  backend, parameters path). Do not read the environment anywhere else in the runtime.
+  backend, parameters path -- `parameters_path()`, which is also where a captured preset is
+  written back). Do not read the environment anywhere else in the runtime.
 - `robot/monitor.py` remains the read-only feedback view model. The `robot-monitor` CLI
   defaults to a powered, lease-local calibration session: `robot/teleoperation.py` owns the
   Star leader and commands the already-claimed follower while the same process renders that
   view. `--read-only` and `--once` never enable. Never split control and monitoring across
-  processes or allow either to bypass the robot lease.
+  processes or allow either to bypass the robot lease. Pressing `p` captures a pose; the
+  save prompt for it runs in `monitor.py` after the session has closed, so the arm is held,
+  disabled and released before anyone is waiting on a keyboard. Do not move that prompt
+  inside the session or into the curses loop.
 - `goto.py` (`robot-goto`) and `jog.py` (`robot-raise`) are the only motion commands outside
   the durable workflow, and both are thin: they resolve a destination and hand it to
   `JointMotionController`. Keep it that way -- no second path to the motors. `goto.py`

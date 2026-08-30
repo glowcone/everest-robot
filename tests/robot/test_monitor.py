@@ -2,11 +2,18 @@ import math
 
 import pytest
 
-from everest_robot.monitor import _header_row, _row
+from everest_robot.monitor import (
+    MonitorContext,
+    _header_row,
+    _prompt_save,
+    _row,
+    _unsaveable,
+)
 from everest_robot.robot.clock import ManualClock
 from everest_robot.robot.contracts import ArmLifecycle, JointLimit, RobotIdentity
 from everest_robot.robot.fake_arm import FakeArm
 from everest_robot.robot.monitor import JointMonitor, format_table
+from everest_robot.robot.parameters import RobotParameters
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "gripper")
 LIMITS = (
@@ -197,3 +204,167 @@ def test_narrow_terminals_drop_columns_but_never_the_joint_angles(width: int) ->
     assert len(_header_row(width)) <= width
     assert "shoulder_pan" in row
     assert f"{reading.position_deg:.2f}" in row
+
+
+# ── saving a captured pose ─────────────────────────────────────────────────────────
+
+
+CAPTURE_FILE = """schema_version: 1
+
+robot:
+  id: maker-arm-02
+  model: maker-arm-v1
+  calibration_id: cal-2026-08-20
+  joint_order: [shoulder_pan, shoulder_lift, gripper]
+  units: radians
+
+motion_defaults:
+  max_velocity_rad_s: 0.5
+  max_acceleration_rad_s2: 2.0
+  tolerance_rad: 0.02
+  settle_time_s: 0.2
+  timeout_s: 10.0
+  control_rate_hz: 30
+
+# Presets are captured, never invented.
+named_positions: {}
+
+named_transitions: {}
+
+policy:
+  default_controller: vla
+  fps: 30
+  max_duration_s: 30
+
+replay:
+  require_matching_robot_id: true
+  require_matching_calibration_id: true
+  safe_start_position: null
+  max_speed_scale: 1.0
+"""
+
+
+def capture_context(**kwargs) -> MonitorContext:
+    defaults = {
+        "robot_id": "maker-arm-02",
+        "model": "maker-arm-v1",
+        "calibration_id": "cal-2026-08-20",
+        "config_digest": "sha256:test",
+        "poll_hz": 10.0,
+        "fake": False,
+        "powered": True,
+    }
+    return MonitorContext(**(defaults | kwargs))
+
+
+def sample_of(arm: FakeArm, clock: ManualClock):
+    return JointMonitor(arm, clock=clock).sample()
+
+
+def capture_setup(tmp_path, monkeypatch, answers: list[str]):
+    """A loadable parameters file plus a scripted operator at the keyboard."""
+
+    path = tmp_path / "maker_arm_v1.yaml"
+    path.write_text(CAPTURE_FILE)
+    monkeypatch.setenv("EVEREST_ROBOT_PARAMETERS", str(path))
+    replies = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(replies))
+    return path, RobotParameters.from_yaml(path)
+
+
+def test_a_measured_pose_can_be_saved_and_loads_back_as_a_named_position(
+    tmp_path, monkeypatch
+) -> None:
+    clock = ManualClock()
+    arm = connected_arm(clock)
+    path, parameters = capture_setup(
+        tmp_path, monkeypatch, ["stage", "operator", "at station 2"]
+    )
+
+    _prompt_save(sample_of(arm, clock), parameters)
+
+    saved = RobotParameters.from_yaml(path).named_positions["stage"]
+    assert saved.joints == pytest.approx((0.5, -1.0, -0.5))
+    assert saved.approved_by == "operator"
+    assert saved.notes == "at station 2"
+    assert saved.calibration_id == "cal-2026-08-20"
+
+
+def test_a_blank_name_saves_nothing(tmp_path, monkeypatch) -> None:
+    clock = ManualClock()
+    path, parameters = capture_setup(tmp_path, monkeypatch, [""])
+    before = path.read_text()
+
+    _prompt_save(sample_of(connected_arm(clock), clock), parameters)
+
+    assert path.read_text() == before
+
+
+def test_provenance_cannot_be_left_blank(tmp_path, monkeypatch) -> None:
+    clock = ManualClock()
+    path, parameters = capture_setup(tmp_path, monkeypatch, ["stage", "", ""])
+    before = path.read_text()
+
+    _prompt_save(sample_of(connected_arm(clock), clock), parameters)
+
+    assert path.read_text() == before
+
+
+def test_overwriting_an_existing_preset_needs_the_word(tmp_path, monkeypatch) -> None:
+    clock = ManualClock()
+    arm = connected_arm(clock)
+    path, parameters = capture_setup(
+        tmp_path, monkeypatch, ["stage", "operator", ""]
+    )
+    _prompt_save(sample_of(arm, clock), parameters)
+    reloaded = RobotParameters.from_yaml(path)
+    before = path.read_text()
+
+    arm.positions[0] = 0.9
+    replies = iter(["stage", "no"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(replies))
+    _prompt_save(sample_of(arm, clock), reloaded)
+    assert path.read_text() == before
+
+    replies = iter(["stage", "REPLACE", "operator", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(replies))
+    _prompt_save(sample_of(arm, clock), reloaded)
+    updated = RobotParameters.from_yaml(path).named_positions["stage"]
+    assert updated.joints[0] == pytest.approx(0.9)
+
+
+# ── which poses may not be saved at all ────────────────────────────────────────────
+
+
+def test_a_good_sample_from_a_real_arm_is_saveable() -> None:
+    clock = ManualClock()
+
+    assert _unsaveable(sample_of(connected_arm(clock), clock), capture_context()) is None
+
+
+def test_fake_numbers_are_never_offered_for_saving() -> None:
+    clock = ManualClock()
+    sample = sample_of(connected_arm(clock), clock)
+
+    reason = _unsaveable(sample, capture_context(fake=True))
+    assert reason == "--fake numbers describe no physical arm"
+
+
+def test_a_joint_with_no_feedback_is_not_a_pose() -> None:
+    clock = ManualClock()
+    arm = connected_arm(clock)
+    arm.positions[2] = math.nan
+
+    reason = _unsaveable(sample_of(arm, clock), capture_context())
+
+    assert reason is not None and "no feedback from gripper" in reason
+
+
+def test_a_pose_outside_the_soft_limits_is_not_offered() -> None:
+    clock = ManualClock()
+    arm = connected_arm(clock)
+    arm.positions[1] = -2.5
+
+    reason = _unsaveable(sample_of(arm, clock), capture_context())
+
+    assert reason is not None and "shoulder_lift outside" in reason

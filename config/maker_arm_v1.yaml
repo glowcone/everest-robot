@@ -40,13 +40,14 @@ motion_defaults:
   timeout_s: 10.0
   control_rate_hz: 30
 
-# No presets are defined yet, and none may be invented.
+# Presets are measured and approved, never invented. None are defined yet.
 #
 # Every entry requires `joints` (one value per joint in joint_order, radians, in calibrated
 # joint coordinates), plus `calibration_id`, `approved_by` and `captured_at` recording who
 # measured it and when. The loader rejects any preset whose calibration_id differs from
 # robot.calibration_id above. Capture them from a measured, operator-approved arm state by
-# following docs/named-position-capture.md -- never by hand-editing joint values.
+# following docs/named-position-capture.md -- never by hand-editing joint values. Pressing
+# `p` in `just monitor` writes an entry here for you, which is the intended way to add one.
 named_positions: {}
 
 # Waypoint sequences for transitions where direct joint-space interpolation has not been

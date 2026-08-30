@@ -48,11 +48,15 @@ from everest_robot.robot.session import RobotSession
 DEFAULT_PARAMETERS_PATH = "config/maker_arm_v1.yaml"
 
 
-def load_parameters(environ: Mapping[str, str] | None = None) -> RobotParameters:
+def parameters_path(environ: Mapping[str, str] | None = None) -> Path:
+    """Which parameters file this deployment reads, and writes captured presets back to."""
+
     environ = os.environ if environ is None else environ
-    return RobotParameters.from_yaml(
-        Path(environ.get("EVEREST_ROBOT_PARAMETERS", DEFAULT_PARAMETERS_PATH))
-    )
+    return Path(environ.get("EVEREST_ROBOT_PARAMETERS", DEFAULT_PARAMETERS_PATH))
+
+
+def load_parameters(environ: Mapping[str, str] | None = None) -> RobotParameters:
+    return RobotParameters.from_yaml(parameters_path(environ))
 
 
 def build_lease(

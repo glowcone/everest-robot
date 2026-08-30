@@ -153,8 +153,28 @@ reference, `Z` clear it, and `space` pause/resume leader following.
 
 Set `EVEREST_STAR_PORT` before using powered mode. Startup reads all seven leader servos,
 compares the mapped pose with the follower, and requires confirmation for a large difference
-before enabling. Press `p`, then `q`, to print canonical joint radians and calibration identity
-after the TUI exits. Use `just monitor-read-only` when the arm should remain torque-disabled.
+before enabling. Use `just monitor-read-only` when the arm should remain torque-disabled.
+
+Press `p`, then `q`, and the pose is printed in canonical joint radians with its calibration
+identity — and then offered for saving as a named position:
+
+```
+Save this pose to config/maker_arm_v1.yaml as a named position?
+  name (blank to skip) > clip-attachment-ready
+  approved by > <operator name or team>
+  notes (optional) > measured with the clip fixture at station 2
+```
+
+That closes the loop with `just goto`: measure a pose here, name it, and it becomes a
+destination. The prompt runs after the session has released the arm, so nothing is claimed
+while you type, and it refuses poses that describe no physical arm — `--fake` numbers, a
+joint with no feedback, one outside the driver's soft limits, one measured during a fault.
+Re-saving a name is a re-approval and must be confirmed. The file is edited as text so its
+comments survive, then re-read through the strict loader and rolled back if anything about
+the result is not what was written. `--no-save` prints the pose and offers nothing.
+
+A saved preset is *not* yet validated: `docs/named-position-capture.md` step 3 is the speed
+ladder that makes it trustworthy, and the prompt prints those commands when it is done.
 
 All modes claim the robot lease. Powered following and monitoring therefore happen in the
 same process; run it *instead of* a worker, not alongside one. A joint whose feedback counter
