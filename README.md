@@ -64,6 +64,48 @@ they never command the robot. See [`docs/carabiner-marker-vision.md`](docs/carab
 for the one-frame and continuous commands, ROI setup, output meanings, and optional
 pixel-to-robot configuration.
 
+### The attachment state machine
+
+`robot-attach-fsm` is the real-time orchestrator from
+[ADR-0003](docs/adr/0003-realtime-attachment-fsm.md). It is *not* an Absurd workflow: one
+invocation holds one robot lease for one physical attempt, needs no worker and no
+PostgreSQL, and arbitrates after every individual action rather than at coarse checkpoints.
+
+Exercise the whole state graph with no hardware, camera, or database:
+
+```bash
+just attach-fsm-fake                     # INITIAL -> SEARCH_RL -> SEARCH_CV -> CLIP_RL -> SUCCESS
+just attach-fsm-fake --initial-detection # the carabiner is already visible; skips SEARCH_RL
+```
+
+Both print a JSON result: the terminal state, per-state action counts, elapsed time, and
+every transition with the evidence that caused it.
+
+On hardware, each learned state loads its own policy from a file and steps it one action at
+a time:
+
+```bash
+just attach-fsm <search-policy> <clip-policy>
+```
+
+**This refuses today, before claiming the robot.** The learned half of `SEARCH_RL` and
+`CLIP_RL` is implemented; perception is not. `INITIAL`, `SEARCH_CV`, and the gate signals
+`CLIP_RL` reads after each action have no detector or verifier behind them yet and refuse
+rather than guess. Policy files are resolved and the perception gates are checked *before*
+`open_session()`, so a missing checkpoint or an unavailable detector costs no lease and no
+energized arm to discover.
+
+A trained checkpoint (a directory, or `.safetensors` / `.pt` / `.ckpt` / `.bin`) also still
+refuses: loading one needs the dataset feature metadata that the deferred recording/dataset
+decision will settle. A `.json` scripted-policy file works today and exists so the one-action
+session and the FSM's gates can be rehearsed on a real arm before a checkpoint can be loaded.
+
+One assumption in the implemented half is **unverified against hardware**: a clip policy's
+return to neutral is read from `select_action()` returning `None`. Read
+[`docs/attachment-fsm.md`](docs/attachment-fsm.md) before running a trained checkpoint — it
+carries the handler contract, the scripted-policy file format, and what verifying that
+assumption requires.
+
 ### The two workflows
 
 | Task | Spawn it with | What it does |
@@ -300,13 +342,17 @@ demonstration workflow. `EverestRobot` is selected on the worker with
 `src/everest_robot/robot/deployment.py`.
 
 The hardware backend is intentionally partial. It currently provides the exclusive robot
-lease and session, Maker Arm connection, bounded motion to approved named positions, and
-the policy rollout runner. It does **not** yet provide:
+lease and session, Maker Arm connection, bounded motion to approved named positions, the
+policy rollout runner, and the one-action policy session the attachment FSM's learned states
+run on. It does **not** yet provide:
 
 - integration of the standalone carabiner CV target into the hardware workflow, or
   GraspNet pickup;
-- a policy factory that loads the requested RL/VLA checkpoint; or
-- attachment verification using sensors, CV, or a VLM.
+- a loader for a trained RL/VLA checkpoint -- `load_policy()` resolves the path and routes
+  it to the guarded `LeRobotPolicyHandle`, which still needs the dataset feature metadata
+  the deferred recording/dataset decision will settle; or
+- attachment verification using sensors, CV, or a VLM, which is also what the attachment
+  FSM's `AttachmentPerception` gates are missing.
 
 Those stages raise actionable `NotImplementedError` exceptions instead of returning
 plausible-looking results, so merely setting `EVEREST_ROBOT_BACKEND=hardware` does not yet

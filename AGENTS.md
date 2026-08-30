@@ -36,11 +36,27 @@ retries and brief overlapping execution.
 
 The real-time attachment state machine is the deliberate exception to the durable workflow:
 `src/everest_robot/attachment_fsm.py` owns only states, transition guards, budgets, and its
-diagnostic trace. It has no Absurd or hardware dependency. Its production handlers remain
+diagnostic trace. It has no Absurd or hardware dependency. Its production handlers live
 behind `EverestAttachmentFSMHandlers` in `adapters.py`, and one invocation holds one
 `RobotSession` lease throughout. Read `docs/adr/0003-realtime-attachment-fsm.md` and
 `docs/attachment-fsm.md` before integrating a handler. Never put an Absurd checkpoint or
 database call inside its action loop.
+
+Run it with `just attach-fsm-fake` (add `--initial-detection` to enter at `SEARCH_CV`),
+which exercises every state and prints the JSON result with no hardware, camera, or
+database -- this is the command to reach for when changing the FSM. `just attach-fsm
+<search-policy> <clip-policy>` is the hardware form: each learned state loads its own policy
+file and steps it one action at a time. It refuses today, and refuses *before* claiming the
+robot, because perception is still a stub -- keep it that way when adding a handler. The
+learned states of `SEARCH_RL` and `CLIP_RL` are implemented; `INITIAL`, `SEARCH_CV`, and
+the gate signals `CLIP_RL` reads sit behind `AttachmentPerception`, whose default
+implementation refuses in `preflight()`. Do not let a gate that cannot be read be discovered
+after a learned action has already moved the arm.
+
+`CLIP_RL` reads "the policy returned to neutral" from `select_action()` returning `None`.
+That mapping is marked UNVERIFIED in ADR-0003 and in `clip_rl_step`'s docstring, and a
+scripted policy cannot confirm it. Do not delete the marker or write a test that claims to
+verify it; confirming it needs a trained checkpoint on the arm.
 
 ## The robot SDK layer
 
@@ -73,11 +89,18 @@ Absurd checkpoints store.
   (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
   cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
   leave it held on `BaseException`, not only on its own failure paths.
-- The FSM requires one policy action at a time without losing policy context. Do not call
-  `PolicyRunner.run(max_steps=1)` repeatedly: it resets policy/processor state, recording,
-  and arm hold on every call. Extend the runtime with a persistent start/step/finish policy
-  session, discard cached actions whenever CV intervenes, and seed each RL state from a
-  fresh observation.
+- `policy.PolicySession` is the one-action primitive the FSM's learned states run on:
+  `seed()` / `step()` / `close()`, keeping policy context across the decisions the caller
+  makes in between. Never emulate it with repeated `PolicyRunner.run(max_steps=1)`, which
+  resets policy/processor state, recording, and the arm hold on every call. It is separate
+  from `PolicyRunner` on purpose and the two pace differently: the runner follows an
+  absolute schedule because it owns an uninterrupted rollout, while a session sets each
+  deadline from when the previous action went out and absorbs a late step rather than making
+  it up -- the same rule replay follows for a late frame. Do not unify them.
+- `policy.load_policy()` is the only place a file path becomes a `PolicyHandle`. A checkpoint
+  directory or suffix routes to the guarded `LeRobotPolicyHandle`; a `.json` scripted policy
+  is read strictly and is for rehearsal, never a trained policy. Both are resolved before the
+  robot is claimed. Add a new format here rather than teaching a caller what a checkpoint is.
 - `recording.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending the
   dataset-writing decision. Keep them refusing with an actionable message rather than
   guessing a format or a feature mapping.

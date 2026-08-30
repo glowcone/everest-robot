@@ -151,18 +151,21 @@ psql:
 
 # ── workflows ──────────────────────────────────────────────────────────────────────
 # `attach-fsm` is the local real-time orchestrator from ADR-0003. It holds one robot lease
-# for the complete attempt and does not require Absurd or PostgreSQL. The hardware handlers
-# are guarded stubs until their integrations land; `attach-fsm-fake` exercises the FSM.
+# for the complete attempt and does not require Absurd or PostgreSQL. The learned states
+# (SEARCH_RL, CLIP_RL) are implemented and load a policy from a file; perception (INITIAL,
+# SEARCH_CV, and the CLIP_RL gates) is still a guarded stub, so `attach-fsm` refuses before
+# claiming the robot. `attach-fsm-fake` exercises the whole FSM with no hardware at all.
 
 # Exercise the attachment FSM with deterministic handlers. No camera, database, or motion.
 [group('workflow')]
 attach-fsm-fake initial_detection="":
     uv run robot-attach-fsm --backend scaffold {{ initial_detection }}
 
-# Run one local attachment FSM attempt. POWERED once all guarded handlers are integrated.
+# Run one local attachment FSM attempt with a policy per learned state. POWERED once perception lands.
 [group('workflow')]
-attach-fsm:
-    uv run robot-attach-fsm --backend hardware
+attach-fsm search_policy clip_policy:
+    uv run robot-attach-fsm --backend hardware \
+        --search-policy {{ search_policy }} --clip-policy {{ clip_policy }}
 
 # Run the durable workflow worker. Leave it running; it serves both task types.
 [group('workflow')]
