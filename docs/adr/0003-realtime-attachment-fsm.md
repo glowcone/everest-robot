@@ -143,6 +143,15 @@ mapping the test asserts. Verifying it requires observing a real checkpoint's te
 behaviour on the arm and confirming that `select_action` returning `None` coincides with the
 end effector actually being at neutral.
 
+**What the checkpoint loader adds, without resolving this.** Now that
+`LeRobotPolicyHandle` exists, one structural fact is visible: it returns `None` only when
+the underlying policy does, and a chunked policy such as ACT emits an action on every call.
+So for an ACT checkpoint the second bullet above cannot fire, and the third is the live
+risk: the neutral branch is simply unreachable, and an attempt spends its lifetime budget in
+`CLIP_RL` rather than cycling back to `INITIAL`. That is an observation about the handle's
+plumbing, not a confirmation or a refutation of the mapping -- what a trained checkpoint
+does at the end of a task is still unmeasured, and confirming it still needs the arm.
+
 Until that is confirmed, the alternative this ADR already names remains open: a configured,
 measured neutral-pose tolerance, evaluated against the arm's own joint feedback rather than
 against anything the policy says. That option needs no cooperation from the checkpoint and

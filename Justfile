@@ -152,21 +152,42 @@ psql:
 # ── workflows ──────────────────────────────────────────────────────────────────────
 # `attach-fsm` is the local real-time orchestrator from ADR-0003. It holds one robot lease
 # for the complete attempt and does not require Absurd or PostgreSQL. The learned states
-# (SEARCH_RL, CLIP_RL) load a policy from a file and SEARCH_CV drives the fixed camera and
-# the pixel map from `pixel-fit`; INITIAL and the CLIP_RL gates are still guarded stubs, so
-# `attach-fsm` refuses before claiming the robot. Use `attach-fsm-fake` to exercise the
-# state machine with no hardware at all, and `pixel-track` to watch the CV follower alone.
+# (SEARCH_RL, CLIP_RL) load a checkpoint or a scripted policy, SEARCH_CV drives the fixed
+# camera and the pixel map from `pixel-fit`, and INITIAL plus the CLIP_RL gates come from
+# the wrist-camera detector. Everything -- checkpoints, feature mapping, perception, pixel
+# map -- resolves before the robot is claimed. Use `attach-fsm-fake` to exercise the state
+# machine with no hardware at all, and `pixel-track` to watch the CV follower alone.
+#
+# `attach-fsm-act` passes one checkpoint to both learned states, which is the loop as
+# designed: search until the carabiner is found, hand to classical CV to place the gripper,
+# hand back to the same model to clip. The two states still keep separate policy sessions.
+# It needs EVEREST_CAMERAS to name the `front` and `wrist` cameras the checkpoint was
+# trained on, and it will not report SUCCESS: attachment verification is not built, so
+# --no-attachment-verification is what makes that explicit.
 
 # Exercise the attachment FSM with deterministic handlers. No camera, database, or motion.
 [group('workflow')]
 attach-fsm-fake initial_detection="":
     uv run robot-attach-fsm --backend scaffold {{ initial_detection }}
 
-# Run one local attachment FSM attempt with a policy per learned state. POWERED once perception lands.
+# Run one local attachment FSM attempt with a policy per learned state. POWERED.
 [group('workflow')]
 attach-fsm search_policy clip_policy:
     uv run robot-attach-fsm --backend hardware \
         --search-policy {{ search_policy }} --clip-policy {{ clip_policy }}
+
+# Run the ACT loop: one checkpoint for both learned states, CV in between. POWERED.
+[group('workflow')]
+attach-fsm-act checkpoint device="auto":
+    uv run robot-attach-fsm --backend hardware \
+        --search-policy {{ checkpoint }} --clip-policy {{ checkpoint }} \
+        --device {{ device }} \
+        --no-attachment-verification --allow-unverified-lerobot-frame
+
+# Load a checkpoint and print the feature mapping it will run under. No robot, no motion.
+[group('workflow')]
+policy-check checkpoint:
+    uv run robot-policy-check {{ checkpoint }}
 
 # Run the durable workflow worker. Leave it running; it serves both task types.
 [group('workflow')]

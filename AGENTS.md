@@ -45,13 +45,17 @@ database call inside its action loop.
 Run it with `just attach-fsm-fake` (add `--initial-detection` to enter at `SEARCH_CV`),
 which exercises every state and prints the JSON result with no hardware, camera, or
 database -- this is the command to reach for when changing the FSM. `just attach-fsm
-<search-policy> <clip-policy>` is the hardware form: each learned state loads its own policy
-file and steps it one action at a time. It refuses today, and refuses *before* claiming the
-robot, because perception is still a stub -- keep it that way when adding a handler. The
-learned states of `SEARCH_RL` and `CLIP_RL` are implemented; `INITIAL`, `SEARCH_CV`, and
-the gate signals `CLIP_RL` reads sit behind `AttachmentPerception`, whose default
-implementation refuses in `preflight()`. Do not let a gate that cannot be read be discovered
-after a learned action has already moved the arm.
+<search-policy> <clip-policy>` is the hardware form, and `just attach-fsm-act <checkpoint>`
+is the intended shape: one model in both learned states with classical CV between them,
+still as two separate `PolicySession`s. Every state is implemented -- `INITIAL` and the
+`CLIP_RL` gates come from `robot/carabiner_perception.py` over the wrist camera. Two signals
+are still refused rather than invented: attachment verification (behind
+`AttachmentVerifier`; without it `SUCCESS` is unreachable, so it must be acknowledged with
+`--no-attachment-verification`) and grasp detection (needs a measured
+`EVEREST_GRASP_GRIPPER_BELOW_RAD`; unset means a conservative "not grasped"). Keep both
+refusals in `preflight()`, before the claim: do not let a gate that cannot be read be
+discovered after a learned action has already moved the arm. Perception shares the open
+session's `CameraRuntime` -- never open the wrist camera a second time.
 
 `CLIP_RL` reads "the policy returned to neutral" from `select_action()` returning `None`.
 That mapping is marked UNVERIFIED in ADR-0003 and in `clip_rl_step`'s docstring, and a
@@ -97,13 +101,24 @@ Absurd checkpoints store.
   absolute schedule because it owns an uninterrupted rollout, while a session sets each
   deadline from when the previous action went out and absorbs a late step rather than making
   it up -- the same rule replay follows for a late frame. Do not unify them.
-- `policy.load_policy()` is the only place a file path becomes a `PolicyHandle`. A checkpoint
-  directory or suffix routes to the guarded `LeRobotPolicyHandle`; a `.json` scripted policy
-  is read strictly and is for rehearsal, never a trained policy. Both are resolved before the
-  robot is claimed. Add a new format here rather than teaching a caller what a checkpoint is.
-- `recording.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending the
-  dataset-writing decision. Keep them refusing with an actionable message rather than
-  guessing a format or a feature mapping.
+- `policy.load_policy()` is the only place a reference becomes a `PolicyHandle`. A checkpoint
+  directory or a Hugging Face repo id routes to `LeRobotPolicyHandle`; a `.json` scripted
+  policy is read strictly and is for rehearsal, never a trained policy. All are resolved --
+  downloaded, cross-checked, weights loaded, device chosen -- before the robot is claimed.
+  Add a new format here rather than teaching a caller what a checkpoint is.
+- `checkpoints.py` owns the feature mapping, and it is the reason a checkpoint can be loaded
+  at all: which `{joint}.pos` and which camera become which tensor slice is read from the
+  *training dataset's* `meta/info.json`, found via the checkpoint's own `train_config.json`.
+  Never derive it from the connected robot, and never fall back to positional order --
+  `compatibility_problems()` compares the result against the arm, in order, and refuses a
+  mismatch. A checkpoint with no recorded training dataset is refused, not guessed at.
+- Device selection lives in `policy.resolve_torch_device` (`EVEREST_POLICY_DEVICE`): `auto`
+  prefers CUDA, then MPS, then CPU, and an explicit choice is never silently downgraded. A
+  checkpoint records the device it was trained on in both its config and its saved
+  preprocessor's `device_processor` step; both are overridden at load time, which is what
+  lets a CUDA-trained checkpoint run on Metal. Do not remove either override.
+- `recording.py` is still a guarded stub pending the dataset-writing decision. Keep it
+  refusing with an actionable message rather than guessing a format.
 - `datasets.py` reads a pinned LeRobot v3 snapshot directly (parquet + `meta/info.json`)
   rather than through `LeRobotDataset`, so replay needs no torch. Only the documented v3
   layout is supported; extend the reader deliberately rather than loosening its checks.
@@ -201,9 +216,16 @@ state.
 The CLI entry points are `src/everest_robot/client.py`,
 `src/everest_robot/worker.py`, `src/everest_robot/database.py`,
 `src/everest_robot/monitor.py`, `src/everest_robot/goto.py`, and
-`src/everest_robot/jog.py`, plus the local `src/everest_robot/fsm_cli.py`. Keep hardware-specific
+`src/everest_robot/jog.py`, plus the local `src/everest_robot/fsm_cli.py` and the
+hardware-free `src/everest_robot/policy_check.py`. Keep hardware-specific
 configuration out of these modules; pass selection and tuning data through validated task
 parameters or environment-backed configuration.
+
+`src/everest_robot/carabiner_detect.py` is the wrist-camera carabiner detector. It lives
+inside the installed package rather than in the repository's top-level `carabiner/` (now a
+re-export shim) because `robot-attach-fsm` is a console script: `sys.path` starts at the
+script's directory, not the working directory, so a top-level package is not importable from
+it. Runtime perception code must import `everest_robot.carabiner_detect`.
 
 Add deterministic unit tests under `tests/` for every adapter result and recovery branch.
 Before handing off a change, run `just check`. For orchestration changes, also run the

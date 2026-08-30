@@ -25,6 +25,7 @@ from everest_robot.attachment_fsm import (
     SearchCVStep,
     SearchRLStep,
 )
+from everest_robot.robot.carabiner_perception import PerceptionUnavailable
 from everest_robot.robot.clock import ManualClock
 from everest_robot.robot.contracts import ArmLifecycle
 from everest_robot.robot.fake_arm import FakeArm
@@ -37,13 +38,22 @@ from robot.test_policy_session import ACTION_KEYS, IDENTITY, LIMITS, act, parame
 class ScriptedPerception:
     """The gate signals, queued. Stands in for the detector and the attachment checks."""
 
-    def __init__(self, detections=(), clips=()) -> None:
+    def __init__(self, detections=(), clips=(), initial=None) -> None:
         self.detections = list(detections)
         self.clips = list(clips)
+        self.initial = initial
         self.detection_calls = 0
         self.clip_calls = 0
+        self.entered: list[AttachmentState] = []
 
     def preflight(self) -> None: ...
+
+    def enter_state(self, state: AttachmentState, previous) -> None:
+        del previous
+        self.entered.append(state)
+
+    def initial_observation(self) -> InitialObservation:
+        return self.initial or InitialObservation(False, False)
 
     def carabiner_detection(self) -> SearchRLStep:
         self.detection_calls += 1
@@ -224,9 +234,8 @@ def test_the_fsm_drives_both_learned_states_to_success(tmp_path) -> None:
         ],
     )
     handlers, arm, session, _ = make_handlers(tmp_path, perception)
-    # INITIAL and SEARCH_CV are the two states this change does not implement; scripting
-    # them here is what lets the learned states be exercised end to end.
-    handlers.observe_initial = lambda: InitialObservation(False, False)
+    # SEARCH_CV needs a camera and a calibrated map; scripting it here is what lets the
+    # learned states be exercised end to end. INITIAL comes from the perception.
     handlers.search_cv_step = lambda: SearchCVStep(True, True)
 
     result = AttachmentFSM(handlers, AttachmentFSMConfig(max_total_actions=20)).run()
@@ -242,6 +251,43 @@ def test_the_fsm_drives_both_learned_states_to_success(tmp_path) -> None:
     assert len(arm.sent_commands) == 4
     assert result.state_actions["search_rl"] == 2
     assert result.state_actions["clip_rl"] == 2
+    session.close()
+
+
+def test_initial_is_the_perceptions_motion_free_observation(tmp_path) -> None:
+    """INITIAL commands nothing: it is one look, and the FSM branches on it."""
+
+    perception = ScriptedPerception(initial=InitialObservation(False, True, confidence=None))
+    handlers, arm, session, _ = make_handlers(tmp_path, perception)
+
+    observation = handlers.observe_initial()
+
+    assert observation.carabiner_detected is True
+    assert observation.already_attached is False
+    assert arm.sent_commands == []
+    session.close()
+
+
+def test_an_already_attached_carabiner_is_reported_from_initial(tmp_path) -> None:
+    perception = ScriptedPerception(initial=InitialObservation(True, False))
+    handlers, arm, session, _ = make_handlers(tmp_path, perception)
+
+    result = AttachmentFSM(handlers, AttachmentFSMConfig(max_total_actions=5)).run()
+
+    assert result.final_state is AttachmentState.SUCCESS
+    assert arm.sent_commands == []
+    session.close()
+
+
+def test_state_entry_reaches_the_perception_so_it_can_drop_per_cycle_state(tmp_path) -> None:
+    """The alignment baseline belongs to one approach; the FSM's entry is what ends it."""
+
+    perception = ScriptedPerception()
+    handlers, _, session, _ = make_handlers(tmp_path, perception)
+
+    handlers.enter_state(AttachmentState.CLIP_RL, AttachmentState.SEARCH_CV)
+
+    assert perception.entered == [AttachmentState.CLIP_RL]
     session.close()
 
 
@@ -269,6 +315,8 @@ def test_perception_is_checked_before_the_robot_is_claimed(tmp_path, monkeypatch
         raise AssertionError("the robot must not be claimed before the gates are checked")
 
     monkeypatch.setattr("everest_robot.robot.deployment.open_session", explode)
+    monkeypatch.delenv("EVEREST_CAMERAS", raising=False)
+    monkeypatch.delenv("EVEREST_CAMERAS_FILE", raising=False)
     params = {
         "backend": "hardware",
         "search_policy": str(write_policy(tmp_path, "search.json")),
@@ -276,7 +324,7 @@ def test_perception_is_checked_before_the_robot_is_claimed(tmp_path, monkeypatch
     }
 
     with pytest.raises(
-        NotImplementedError, match="attachment perception"
+        PerceptionUnavailable, match="not configured"
     ), attachment_fsm_handlers(params):
         pass
 

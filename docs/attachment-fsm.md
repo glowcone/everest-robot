@@ -11,42 +11,100 @@ just attach-fsm-fake
 just attach-fsm-fake --initial-detection
 ```
 
-`just attach-fsm` selects the hardware adapter. The learned states are implemented: both
-load a policy from a file (`--search-policy`, `--clip-policy`) and step it one action at a
-time through a persistent `PolicySession`. `SEARCH_CV` is implemented too, against the
-fixed camera and the calibrated pixel map. The run still stops at a guarded
-`NotImplementedError`, now from perception alone -- `INITIAL` and the gate signals
-`CLIP_RL` reads after each action have no detector or verifier behind them yet, and refuse
-rather than guess. The refusal happens in `attachment_fsm_handlers()` before the robot is
-claimed, so discovering it costs no lease and no energized arm.
+`just attach-fsm` selects the hardware adapter. Every state now has an implementation:
+the learned states load a policy (`--search-policy`, `--clip-policy`) and step it one action
+at a time through a persistent `PolicySession`; `SEARCH_CV` drives the fixed camera and the
+calibrated pixel map; and `INITIAL` plus the gate signals `CLIP_RL` reads come from the
+wrist-camera detector behind `CarabinerVisionPerception`.
 
-One assumption inside the implemented half is **unverified against real hardware**: how a
-clip policy reports that it has returned to neutral. See
+Two things it still cannot do, and says so rather than guessing:
+
+- **Attachment verification.** Whether the carabiner ended up clipped onto the anchor is
+  the sensor/CV/VLM fusion the ADR defers. Without it `SUCCESS` is unreachable and an
+  attempt ends on a budget, so the run refuses unless `--no-attachment-verification` says
+  that was the intent.
+- **Grasp detection.** Whether the gripper is holding the carabiner needs a threshold
+  measured on this arm. Unset (`EVEREST_GRASP_GRIPPER_BELOW_RAD`), the answer is a
+  conservative "not grasped".
+
+Both refusals happen in `attachment_fsm_handlers()` before the robot is claimed, so
+discovering one costs no lease and no energized arm.
+
+One assumption inside the learned half is **unverified against real hardware**: how a clip
+policy reports that it has returned to neutral. See
 [the ADR section](adr/0003-realtime-attachment-fsm.md#assumption-pending-verification-how-a-policy-reports-its-return-to-neutral)
 and `clip_rl_step()` below before running a trained checkpoint.
 
-## Policy files
+## The one-checkpoint loop
 
-Each learned state loads its own policy from a path, and they are separate sessions even
-when the two paths are identical:
+The shape the FSM was built for is a single model on both ends with classical vision in
+between: search until the carabiner is found, hand to CV to place the gripper on it, hand
+back to the same model to clip.
 
 ```bash
-just attach-fsm --search-policy <path> --clip-policy <path>
+just attach-fsm-act h8i76dfsd9/act_h8i76dfsd9_combined-teleop_2026-08-29_23-54-19
 ```
 
-`load_policy()` in `robot/policy.py` is the only place a path becomes a `PolicyHandle`, and
-it recognizes two kinds of file:
+Passing one reference to both flags is what expresses that. They remain **separate
+`PolicySession`s** even so, and deliberately: classical vision physically moves the arm
+between the two, and an action chunk cached before that describes a pose the arm has left.
+Entering either state re-seeds its own session from live feedback and leaves the other
+alone.
 
-- **A trained checkpoint** -- a directory, or a file ending `.safetensors`, `.pt`, `.ckpt`
-  or `.bin` -- goes to `LeRobotPolicyHandle`, which **refuses**. Loading one needs the
-  dataset feature metadata that maps this robot's `{joint}.pos` scalars and camera frames
-  into the policy's input tensors, and that metadata comes from the recording/dataset
-  decision that has not been made. An invented mapping would mis-order joints against a real
-  checkpoint without ever failing, so the refusal is correct and this function is where it
-  becomes reachable from a command line.
+Check a checkpoint before going anywhere near the arm:
+
+```bash
+just policy-check <checkpoint>            # mapping, and how it compares to this arm
+uv run robot-policy-check <ckpt> --load   # also builds the model, proving the device works
+```
+
+## Policy references
+
+`load_policy()` in `robot/policy.py` is the only place a reference becomes a
+`PolicyHandle`, and it recognizes three kinds:
+
+- **A checkpoint directory** -- LeRobot's `config.json` and `model.safetensors` side by
+  side -- is loaded by `LeRobotPolicyHandle`.
+- **A Hugging Face repo id** (`namespace/name`) is the same thing, fetched first. Only the
+  inference files are downloaded; the per-step training snapshots and the optimizer state
+  stay on the hub. The resolved commit is recorded in the handle's `checkpoint` string.
 - **A `.json` scripted-policy file** replays a fixed action sequence. It is not a trained
   policy and never pretends to be; it exists so the one-action session, the FSM's gates and
-  the whole hardware path can be rehearsed on a real arm before a checkpoint can be loaded.
+  the whole hardware path can be rehearsed without an accelerator in the loop.
+
+### Where the feature mapping comes from
+
+The thing that makes a checkpoint loadable is knowing which `{joint}.pos` scalar and which
+camera frame become which slice of which input tensor. It is **not** derived from the
+connected robot, because a checkpoint trained on a differently-ordered arm would then be
+silently mis-packed. `robot/checkpoints.py` reads it from the dataset the checkpoint was
+trained on:
+
+```text
+config.json        policy type, input/output feature shapes
+train_config.json  dataset.repo_id  ->  meta/info.json  ->  feature names, order, fps
+```
+
+`meta/info.json` names every joint of `observation.state` and `action` in the exact order
+the tensors pack them. Everything else cross-checks it -- the dataset's shapes against the
+checkpoint config's, the state names against the action names -- and then
+`compatibility_problems()` compares the resulting action space against the connected arm's,
+in order, before anything is enabled. A mismatch is refused, never adapted around.
+
+A checkpoint copied out of a training run without its `train_config.json` has no
+authoritative joint order, and is refused rather than guessed at; `--dataset` supplies it
+when you know it.
+
+### Devices
+
+`--device` (or `EVEREST_POLICY_DEVICE`) takes `auto`, `cuda`, `mps` or `cpu`. `auto`
+prefers CUDA, then Apple's Metal backend, then the CPU. An explicit choice is never
+silently downgraded: a rollout meant for an accelerator that quietly fell back to the CPU
+would miss its control deadlines, and that should be heard about before the arm is claimed.
+
+Checkpoints record the device they were *trained* on, in both the policy config and the
+saved preprocessor's `device_processor` step. Both are overridden at load time, which is
+what lets a CUDA-trained checkpoint run on Metal.
 
 ```json
 {
@@ -109,26 +167,27 @@ terminal outcome and on any exception, which is where a hold belongs.
 
 ### `observe_initial()`
 
-Capture one coherent, motion-free scene observation. Run:
+Implemented, and motion-free: it delegates to
+`AttachmentPerception.initial_observation()`, which runs
 
 - attachment verification, producing `already_attached`;
-- carabiner detection, producing `carabiner_detected` and measured confidence.
+- carabiner detection, producing `carabiner_detected`.
 
 Attachment wins if both are true. This handler must not enable the arm or move to a named
-or neutral position. Detector thresholds and camera selection belong in validated robot
+or neutral position. Detector thresholds and camera selection belong in deployment
 configuration, not in the FSM or CLI.
 
 ### `search_rl_step()`
 
-The action is implemented; the detection is not. One `PolicySession.step()` commands
-exactly one action, then the result of `AttachmentPerception.carabiner_detection()` is
-returned as `SearchRLStep(carabiner_detected, confidence)`. The FSM switches to CV on a
-detection.
+Implemented. One `PolicySession.step()` commands exactly one action, then the result of
+`AttachmentPerception.carabiner_detection()` is returned as
+`SearchRLStep(carabiner_detected, confidence)`. The FSM switches to CV on a detection.
 
-Still to integrate: read a fresh camera frame and run the lightweight carabiner detector
-behind `AttachmentPerception`. The default implementation refuses, and refuses in
-`preflight()` -- before the claim -- so a gate that cannot be read is never discovered after
-a learned action has already moved the arm.
+The detector runs over a fresh frame from the session's **own** camera runtime -- the same
+one the policy observes through -- rather than a second capture on the same device, which
+on macOS and V4L2 alike either fails or starves the first. A gate that cannot be read is
+refused in `preflight()`, before the claim, so it is never discovered after a learned action
+has already moved the arm.
 
 The action and detection together are one orchestrator step; the policy must not run an
 uninterruptible multi-action chunk. Safety faults and operator cancellation are raised as
@@ -188,16 +247,27 @@ after it has held the arm, and the handler turns that into `AttachmentAbort`.
 
 ### `clip_rl_step()`
 
-The action and `returned_to_neutral` are implemented; the remaining evidence is not. One
-`PolicySession.step()` commands exactly one action from the post-CV session, then fresh
-evidence is needed for:
+One `PolicySession.step()` commands exactly one action from the post-CV session, then the
+gates are read fresh from `AttachmentPerception`:
 
-- `attachment_verified` -- **not implemented**, behind `AttachmentPerception`;
-- `returned_to_neutral` -- implemented, but on an **unverified assumption**; see below;
-- `carabiner_grasped` -- **not implemented**;
-- `carabiner_visible` -- **not implemented**;
-- `alignment_degraded` -- **not implemented**;
-- verification confidence -- **not implemented**.
+- `carabiner_visible` -- the wrist-camera detector accepted a component this frame.
+- `alignment_degraded` -- the detected insertion point has drifted more than
+  `EVEREST_ALIGNMENT_TOLERANCE_PX` from the pose CV handed over at. The baseline is the
+  first clip observation after entering the state, not an assumed image centre: `SEARCH_CV`
+  settles on the pixel map's pre-grasp target to get here, so that *is* what aligned looks
+  like, and nothing establishes that it puts the carabiner at the centre of the wrist view.
+  Re-entering `CLIP_RL` drops the baseline, because a new approach has its own hand-over.
+- `carabiner_grasped` -- the gripper joint is below
+  `EVEREST_GRASP_GRIPPER_BELOW_RAD`. Unset, this is always `False`, which is the
+  conservative reading: the FSM will return to search when the carabiner goes out of view
+  rather than assume the gripper is holding it.
+- `attachment_verified` -- **not implemented**. Behind `AttachmentVerifier`, whose only
+  implementation answers "not verified" and must be acknowledged with
+  `--no-attachment-verification`.
+- `returned_to_neutral` -- implemented, but on an **unverified assumption**; see below.
+- verification confidence -- deliberately `None`. The detector is a hysteresis threshold
+  with shape validation and has no score behind it; the same reason `search_cv_step`
+  reports `None`.
 
 Verification should use the eventual sensor/CV/VLM fusion behind the adapter. A verified
 attachment succeeds. A visible, degraded alignment returns to CV. An invisible, ungrasped

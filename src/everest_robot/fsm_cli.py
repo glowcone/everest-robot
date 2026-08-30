@@ -21,11 +21,30 @@ def main() -> None:
     )
     parser.add_argument(
         "--search-policy",
-        help="SEARCH_RL policy file: a checkpoint, or a .json scripted policy (hardware only)",
+        help="SEARCH_RL policy: a checkpoint directory, a Hugging Face repo id, or a "
+        ".json scripted policy (hardware only)",
     )
     parser.add_argument(
         "--clip-policy",
-        help="CLIP_RL policy file: a checkpoint, or a .json scripted policy (hardware only)",
+        help="CLIP_RL policy: the same forms. Pass the same reference as --search-policy "
+        "to run one checkpoint in both learned states, in two separate sessions",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="torch device for inference: auto (default), cuda, mps, or cpu",
+    )
+    parser.add_argument(
+        "--no-attachment-verification",
+        action="store_true",
+        help="run without an attachment verifier. The loop runs, but a successful "
+        "attachment cannot be recognized, so the attempt can only end on a budget",
+    )
+    parser.add_argument(
+        "--allow-unverified-lerobot-frame",
+        action="store_true",
+        help="run a checkpoint against the derived, not-yet-hardware-verified lerobot_frame "
+        "offsets; see docs/lerobot-frame-reconciliation.md before using this",
     )
     parser.add_argument(
         "--policy-fps",
@@ -49,6 +68,9 @@ def main() -> None:
         "clip_policy": args.clip_policy,
         "policy_fps": args.policy_fps,
         "attachment_task": args.task,
+        "policy_device": args.device,
+        "allow_unverified_attachment": args.no_attachment_verification,
+        "allow_unverified_lerobot_frame": args.allow_unverified_lerobot_frame,
     }
     with attachment_fsm_handlers(params) as handlers:
         result = AttachmentFSM(handlers, config).run()

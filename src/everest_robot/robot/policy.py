@@ -6,11 +6,12 @@ safety boundary, cancellation and duration/step limits, recording, heartbeats, a
 durable result.
 
 Inference itself sits behind :class:`PolicyHandle`, so the loop is exercised against a
-deterministic fake. :class:`LeRobotPolicyHandle` -- the real checkpoint loader -- is a
-guarded stub: LeRobot builds a model-ready observation through ``build_inference_frame``,
-which needs the dataset feature metadata that the deferred recording/dataset decision will
-settle. Guessing that mapping would produce glue that fails silently against a real
-checkpoint, which is worse than refusing.
+deterministic fake. :class:`LeRobotPolicyHandle` is the real checkpoint loader. The feature
+metadata it needs to build a model-ready observation -- which ``{joint}.pos`` scalar and
+which camera frame become which slice of which input tensor -- comes from the dataset the
+checkpoint was trained on, resolved by :mod:`everest_robot.robot.checkpoints`. It is never
+guessed from the connected robot: :func:`compatibility_problems` compares the two and
+refuses a mismatch instead.
 
 :class:`PolicyRunner` owns an uninterrupted rollout. :class:`PolicySession` owns the other
 shape ADR-0003 needs: a rollout a state machine advances one action at a time, keeping the
@@ -29,10 +30,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from everest_robot.robot.clock import Clock, SystemClock
 from everest_robot.robot.contracts import (
@@ -46,6 +48,9 @@ from everest_robot.robot.contracts import (
 from everest_robot.robot.lerobot_bridge import RobotBridgeCore
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.recording import NullSessionRecorder, SessionRecorder
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from everest_robot.robot.checkpoints import ResolvedCheckpoint
 
 
 @runtime_checkable
@@ -400,28 +405,159 @@ class ScriptedPolicy:
         return action
 
 
-class LeRobotPolicyHandle:
-    """Placeholder for the LeRobot checkpoint loader.
+def resolve_torch_device(preference: str | None = None) -> Any:
+    """Pick the inference device, or refuse a preference this host cannot serve.
 
-    What it will do, once the dataset decision lands: resolve the config with
-    ``PreTrainedConfig.from_pretrained``, build the policy through
-    ``get_policy_class(cfg.type).from_pretrained``, load the checkpoint's own processor
-    pipelines with ``make_pre_post_processors(cfg, pretrained_path=...)``, and run each
-    step through ``predict_action``.
-
-    What it cannot do yet: build the model-ready observation. LeRobot assembles that with
-    ``build_inference_frame``, which needs the dataset feature metadata describing how the
-    robot's ``{joint}.pos`` scalars and camera frames map into the policy's input tensors.
-    That metadata comes from the stored-session format still being decided, and an
-    invented mapping would mis-order joints against a real checkpoint without failing.
+    ``None`` or ``"auto"`` prefers CUDA, then Apple's Metal backend, then the CPU. An
+    explicit preference is never silently downgraded: a rollout that was meant to run on an
+    accelerator and quietly fell back to the CPU would miss its control deadlines, which is
+    a timing failure the operator should hear about before the arm is claimed rather than
+    diagnose from a run full of missed deadlines.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(
-            "LeRobot checkpoint loading is not implemented yet: it needs the dataset "
-            "feature metadata that the deferred recording/dataset work will define. "
-            "PolicyRunner itself is complete and runs against any PolicyHandle."
+    import torch
+
+    def mps_available() -> bool:
+        backend = getattr(torch.backends, "mps", None)
+        return backend is not None and backend.is_available()
+
+    if preference and preference != "auto":
+        device = torch.device(preference)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise PolicyLoadError("device 'cuda' was requested but CUDA is not available here")
+        if device.type == "mps" and not mps_available():
+            raise PolicyLoadError(
+                "device 'mps' was requested but Apple's Metal backend is not available here "
+                "(it needs macOS on Apple silicon and a torch built with MPS)"
+            )
+        return device
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+class LeRobotPolicyHandle:
+    """A trained LeRobot checkpoint, loaded and wrapped in its own processor pipelines.
+
+    The feature mapping this needs -- how ``{joint}.pos`` scalars and camera frames become
+    the policy's input tensors -- is not invented here and not derived from the connected
+    robot. :mod:`everest_robot.robot.checkpoints` reads it from the dataset the checkpoint
+    was trained on, and :func:`compatibility_problems` then compares the resulting action
+    space against this arm's, in order, before anything is enabled. A checkpoint trained on
+    a differently-ordered robot fails that comparison instead of commanding the wrong axis.
+
+    Loading is eager, and deliberately so: the download, the torch import, the weights and
+    the processor pipelines are all resolved in the constructor, which
+    :func:`load_policy` runs before the robot is claimed.
+
+    **On the neutral signal.** :meth:`select_action` returns ``None`` only when the
+    underlying policy does. ADR-0003's ``CLIP_RL`` reads that as "the policy returned to
+    neutral", and it remains the UNVERIFIED assumption recorded there: a chunked policy such
+    as ACT emits an action on every call and so will never raise that signal through this
+    handle. Nothing here confirms or refutes the mapping -- it only means the FSM's neutral
+    branch is unreachable for such a checkpoint, and a run ends on its budgets or its
+    perception gates instead.
+    """
+
+    def __init__(
+        self,
+        checkpoint: ResolvedCheckpoint,
+        *,
+        controller: str | None = None,
+        device: str | None = None,
+        use_amp: bool = False,
+    ) -> None:
+        from lerobot.configs.policies import PreTrainedConfig
+        from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+
+        self.checkpoint_spec = checkpoint
+        self._controller = controller or checkpoint.policy_type
+        self.device = resolve_torch_device(device)
+        # Automatic mixed precision is a CUDA facility. Asking for it anywhere else is a
+        # configuration mistake, not something to quietly ignore.
+        if use_amp and self.device.type != "cuda":
+            raise PolicyLoadError(f"use_amp needs a CUDA device; this run is on {self.device}")
+        self.use_amp = use_amp
+
+        root = str(checkpoint.root)
+        config = PreTrainedConfig.from_pretrained(root)
+        # The checkpoint records the device it was *trained* on. Left alone, a model trained
+        # on CUDA refuses to load its own processor pipeline on a Mac.
+        config.device = str(self.device)
+        config.use_amp = use_amp
+
+        policy = get_policy_class(config.type).from_pretrained(root, config=config)
+        policy.to(self.device)
+        policy.eval()
+        self._policy = policy
+
+        # The saved preprocessor pins the training device into its `device_processor` step
+        # for the same reason, and it is overridden by step key rather than rebuilt: the
+        # normalization statistics in the other steps are part of the checkpoint.
+        self._preprocessor, self._postprocessor = make_pre_post_processors(
+            config,
+            pretrained_path=root,
+            preprocessor_overrides={"device_processor": {"device": str(self.device)}},
         )
+
+    # ── identity ───────────────────────────────────────────────────────────────────
+    @property
+    def controller(self) -> str:
+        return self._controller
+
+    @property
+    def checkpoint(self) -> str:
+        return self.checkpoint_spec.identifier
+
+    @property
+    def fps(self) -> float | None:
+        """The rate the training data was recorded at; running off it changes the dynamics."""
+
+        return self.checkpoint_spec.features.fps
+
+    @property
+    def input_features(self) -> Mapping[str, tuple[int, ...]]:
+        return self.checkpoint_spec.features.input_features
+
+    @property
+    def action_features(self) -> tuple[str, ...]:
+        return self.checkpoint_spec.features.action_names
+
+    # ── inference ──────────────────────────────────────────────────────────────────
+    def reset(self) -> None:
+        """Drop the carried state: the action queue, and the processors' own buffers."""
+
+        self._policy.reset()
+        for pipeline in (self._preprocessor, self._postprocessor):
+            reset = getattr(pipeline, "reset", None)
+            if callable(reset):
+                reset()
+
+    def select_action(
+        self, observation: Mapping[str, Any], task: str | None = None
+    ) -> Mapping[str, float] | None:
+        """One action, in the robot's own ``{joint}.pos`` keys and degrees."""
+
+        import torch
+        from lerobot.policies.utils import build_inference_frame, make_robot_action
+
+        features = self.checkpoint_spec.features
+        with torch.inference_mode():
+            batch = build_inference_frame(
+                dict(observation),
+                self.device,
+                dict(features.ds_features),
+                task=task,
+                robot_type=features.robot_type,
+            )
+            action = self._policy.select_action(self._preprocessor(batch))
+            if action is None:
+                return None
+            action = self._postprocessor(action)
+        return make_robot_action(action, dict(features.ds_features))
 
 
 class PolicyLoadError(RuntimeError):
@@ -715,52 +851,109 @@ class PolicySession:
 
 
 # ── loading a policy from a file ───────────────────────────────────────────────────
-#: Suffixes that mean "this is a trained checkpoint", routed to the LeRobot loader.
+#: Weights-file suffixes. A checkpoint is loaded from the directory holding one of these,
+#: never from the file alone, so these exist to give that mistake a useful message.
 CHECKPOINT_SUFFIXES = frozenset({".safetensors", ".pt", ".ckpt", ".bin"})
+
+#: A Hugging Face reference, distinguished from a path only after the path misses on disk.
+_REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _SCRIPTED_FIELDS = frozenset(
     {"kind", "controller", "checkpoint", "fps", "input_features", "action_features", "actions"}
 )
 
 
-def load_policy(path: str | Path, *, controller: str | None = None) -> PolicyHandle:
-    """Load a policy from a file. The single seam where a file becomes a handle.
+def load_policy(
+    path: str | Path,
+    *,
+    controller: str | None = None,
+    device: str | None = None,
+    revision: str | None = None,
+    dataset_repo_id: str | None = None,
+    allow_download: bool = True,
+) -> PolicyHandle:
+    """Turn a reference into a handle. The single seam where that conversion happens.
 
-    Two kinds of file are recognized, and the distinction is deliberate:
+    Three kinds of reference are recognized, and the distinction is deliberate:
 
-    * A trained checkpoint -- a directory, or a file with a checkpoint suffix -- is handed
-      to :class:`LeRobotPolicyHandle`, which refuses. Loading one needs the dataset feature
-      metadata that maps this robot's ``{joint}.pos`` scalars and camera frames into the
-      policy's input tensors, and that metadata comes from the recording/dataset decision
-      that has not been made. An invented mapping would mis-order joints against a real
-      checkpoint without ever failing, so the refusal is the correct behaviour and this
-      function is where it becomes reachable from a command line.
-    * A ``.json`` scripted-policy file replays a fixed action sequence through
+    * A **checkpoint directory** -- LeRobot's ``config.json`` and ``model.safetensors`` side
+      by side -- is loaded by :class:`LeRobotPolicyHandle`.
+    * A **Hugging Face repo id** (``namespace/name``) is the same thing, fetched first.
+      Only the inference files are downloaded; the per-step training snapshots and the
+      optimizer state are left on the hub.
+    * A ``.json`` **scripted-policy file** replays a fixed action sequence through
       :class:`ScriptedPolicy`. This is not a trained policy and never pretends to be. It
       exists so the one-action session, the FSM's gates and the whole hardware path can be
-      brought up and rehearsed on a real arm before a checkpoint can be loaded.
+      rehearsed on a real arm without an accelerator in the loop.
 
-    Resolution happens before anything is claimed or energized, so a missing or malformed
-    file costs no lease.
+    Everything -- the download, the feature-mapping cross-checks, the weights, the torch
+    device -- is resolved here, which callers run before the robot is claimed. A wrong repo
+    id, an unreachable dataset, a feature mismatch or an unavailable device costs no lease.
     """
 
     resolved = Path(path).expanduser()
-    if not resolved.exists():
-        raise PolicyLoadError(f"policy file {str(resolved)!r} does not exist")
+    if resolved.is_dir():
+        return _load_checkpoint(
+            resolved,
+            controller=controller,
+            device=device,
+            revision=revision,
+            dataset_repo_id=dataset_repo_id,
+            allow_download=allow_download,
+        )
 
-    if resolved.is_dir() or resolved.suffix.lower() in CHECKPOINT_SUFFIXES:
-        # Raises NotImplementedError, with the reason. Deliberately not caught: a caller
-        # that asked for a trained checkpoint must not silently get something else.
-        return LeRobotPolicyHandle(resolved, controller=controller)
+    if resolved.is_file():
+        if resolved.suffix.lower() == ".json":
+            return _load_scripted_policy(resolved, controller=controller)
+        if resolved.suffix.lower() in CHECKPOINT_SUFFIXES:
+            raise PolicyLoadError(
+                f"{str(resolved)!r} is a weights file, but a checkpoint is loaded from the "
+                f"directory that holds it: config.json, the processor pipelines and the "
+                f"weights are all needed. Pass {str(resolved.parent)!r}"
+            )
+        raise PolicyLoadError(
+            f"cannot tell what kind of policy {str(resolved)!r} is: expected a checkpoint "
+            f"directory, a Hugging Face repo id, or a .json scripted-policy file"
+        )
 
-    if resolved.suffix.lower() == ".json":
-        return _load_scripted_policy(resolved, controller=controller)
-
+    # Not on disk. A 'namespace/name' reference is a hub checkpoint; anything else is a
+    # path that does not exist, and saying so is more useful than a download failure.
+    if _REPO_ID.match(str(path)):
+        return _load_checkpoint(
+            str(path),
+            controller=controller,
+            device=device,
+            revision=revision,
+            dataset_repo_id=dataset_repo_id,
+            allow_download=allow_download,
+        )
     raise PolicyLoadError(
-        f"cannot tell what kind of policy {str(resolved)!r} is: expected a checkpoint "
-        f"directory, a checkpoint file ({', '.join(sorted(CHECKPOINT_SUFFIXES))}), or a "
-        f".json scripted-policy file"
+        f"policy {str(path)!r} does not exist, and is not a Hugging Face repo id of the "
+        f"form 'namespace/name'"
     )
+
+
+def _load_checkpoint(
+    reference: str | Path,
+    *,
+    controller: str | None,
+    device: str | None,
+    revision: str | None,
+    dataset_repo_id: str | None,
+    allow_download: bool,
+) -> PolicyHandle:
+    from everest_robot.robot.checkpoints import CheckpointError, resolve_checkpoint
+
+    try:
+        checkpoint = resolve_checkpoint(
+            reference,
+            revision=revision,
+            dataset_repo_id=dataset_repo_id,
+            allow_download=allow_download,
+        )
+    except CheckpointError as error:
+        raise PolicyLoadError(str(error)) from None
+    return LeRobotPolicyHandle(checkpoint, controller=controller, device=device)
 
 
 def _load_scripted_policy(path: Path, *, controller: str | None) -> ScriptedPolicy:

@@ -145,10 +145,18 @@ class AttachmentPerception(Protocol):
 
     Each method is called immediately after one physical action, and must report what is
     true *now*. The FSM, not this protocol, decides what any of it means.
+
+    :meth:`enter_state` exists so an implementation can drop per-cycle state -- an alignment
+    baseline, a smoothing window -- when the FSM re-enters a state. It commands nothing and
+    is the one method here that is not a measurement.
     """
 
     def preflight(self) -> None:
         """Raise unless every gate below can be served. Called before the robot is claimed."""
+
+    def enter_state(self, state: AttachmentState, previous: AttachmentState | None) -> None: ...
+
+    def initial_observation(self) -> InitialObservation: ...
 
     def carabiner_detection(self) -> SearchRLStep: ...
 
@@ -166,11 +174,18 @@ class UnavailableAttachmentPerception:
 
     def preflight(self) -> None:
         raise NotImplementedError(
-            "no attachment perception is configured: SEARCH_RL needs a carabiner detector "
-            "and CLIP_RL needs attachment, grasp, visibility and alignment checks. The "
-            "learned half of both states is implemented -- pass a perception "
-            "implementation to attachment_fsm_handlers() to run them."
+            "no attachment perception is configured: INITIAL and SEARCH_RL need a carabiner "
+            "detector and CLIP_RL needs attachment, grasp, visibility and alignment checks. "
+            "everest_robot.robot.carabiner_perception.CarabinerVisionPerception serves them "
+            "from the wrist camera; pass one to attachment_fsm_handlers() to run them."
         )
+
+    def enter_state(self, state: AttachmentState, previous: AttachmentState | None) -> None:
+        del state, previous
+
+    def initial_observation(self) -> InitialObservation:
+        self.preflight()
+        raise AssertionError("unreachable")
 
     def carabiner_detection(self) -> SearchRLStep:
         self.preflight()
@@ -213,6 +228,12 @@ class EverestAttachmentFSMHandlers:
     rate_hz: float = 15.0
     max_velocity_rad_s: float = 0.15
     lock_frames: int = 3
+    #: Run a checkpoint against a ``lerobot_frame`` whose offsets are not zero. The offsets
+    #: reconcile this arm's zero pose with the one every recorded dataset is expressed in,
+    #: so a trained checkpoint *needs* them -- but they are still derived rather than
+    #: measured on hardware. Opt in only after working through
+    #: docs/lerobot-frame-reconciliation.md.
+    allow_unverified_lerobot_frame: bool = False
 
     def __post_init__(self) -> None:
         from everest_robot.pixel_map import PixelMapError, RobotStamp
@@ -232,7 +253,10 @@ class EverestAttachmentFSMHandlers:
                     f"calibration joints {', '.join(self.calibration.joint_names)} do not "
                     f"match this arm's {', '.join(self.session.port.joint_names)}"
                 )
-        overrides: dict[str, object] = {"task": self.task}
+        overrides: dict[str, object] = {
+            "task": self.task,
+            "allow_non_identity_frame": self.allow_unverified_lerobot_frame,
+        }
         if self.fps is not None:
             overrides["fps"] = self.fps
         self._sessions = {
@@ -259,7 +283,6 @@ class EverestAttachmentFSMHandlers:
         exception, which is where a hold actually belongs.
         """
 
-        del previous
         # The follower owns lock-on state and a tracker command seeded from feedback, and
         # both are stale the moment a policy moves the arm. Tear it down on the way out of
         # SEARCH_CV and build a fresh one on the way back in, rather than resuming it.
@@ -268,15 +291,15 @@ class EverestAttachmentFSMHandlers:
         elif self._follower is None and self.calibration is not None:
             self._follower = self._build_follower()
             self._follower.start()
+        self.perception.enter_state(state, previous)
         rollout = self._sessions.get(state)
         if rollout is not None:
             rollout.seed()
 
     def observe_initial(self) -> InitialObservation:
-        raise NotImplementedError(
-            "INITIAL needs one coherent camera observation plus non-moving attachment "
-            "verification; integrate the detector and verifier here"
-        )
+        """One motion-free look: is it already attached, and can the carabiner be seen?"""
+
+        return self.perception.initial_observation()
 
     # ── the learned states ─────────────────────────────────────────────────────────
     def search_rl_step(self) -> SearchRLStep:
@@ -478,14 +501,23 @@ def attachment_fsm_handlers(
             f"{', '.join(missing)}"
         )
 
-    # Search and clip are separate sessions even when this resolves to the same file
-    # twice: ADR-0003 requires separate carried state, not a shared handle.
-    search_policy = load_policy(search_path)
-    clip_policy = load_policy(clip_path)
-    checks = perception if perception is not None else UnavailableAttachmentPerception()
-    checks.preflight()
+    from everest_robot.robot.deployment import (
+        build_attachment_perception,
+        load_pixel_map,
+        open_session,
+        policy_device,
+    )
 
-    from everest_robot.robot.deployment import load_pixel_map, open_session
+    device = params.get("policy_device") or policy_device()
+    # Search and clip are separate sessions even when this resolves to the same reference
+    # twice: ADR-0003 requires separate carried state, not a shared handle. The weights are
+    # loaded once each here, before the lease, so a bad reference or an unavailable device
+    # never costs an energized arm.
+    search_policy = load_policy(search_path, device=device)
+    clip_policy = load_policy(clip_path, device=device)
+
+    checks = perception if perception is not None else build_attachment_perception(params)
+    checks.preflight()
 
     # The pixel map is read and refused here for the same reason the policies are: a stale
     # or missing calibration is not worth an energized arm to discover.
@@ -493,6 +525,11 @@ def attachment_fsm_handlers(
 
     session = open_session()
     try:
+        # The perception was preflighted before the claim; the camera runtime and the arm
+        # port only exist now. It shares them rather than opening the wrist camera twice.
+        bind = getattr(checks, "bind", None)
+        if callable(bind):
+            bind(session.bridge.cameras, session.port)
         handlers = EverestAttachmentFSMHandlers(
             session,
             search_policy,
@@ -501,6 +538,7 @@ def attachment_fsm_handlers(
             perception=checks,
             task=params.get("attachment_task"),
             fps=None if params.get("policy_fps") is None else float(params["policy_fps"]),
+            allow_unverified_lerobot_frame=bool(params.get("allow_unverified_lerobot_frame")),
         )
         try:
             yield handlers

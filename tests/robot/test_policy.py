@@ -16,7 +16,6 @@ from everest_robot.robot.fake_arm import FakeArm
 from everest_robot.robot.lerobot_bridge import JointFrame, RobotBridgeCore
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.policy import (
-    LeRobotPolicyHandle,
     PolicyHandle,
     PolicyRunner,
     ScriptedPolicy,
@@ -337,11 +336,6 @@ def test_heartbeats_fire_during_a_long_rollout() -> None:
     runner.run(policy(actions=30), fps=10.0)
 
     assert beats["count"] >= 3
-
-
-def test_the_checkpoint_loader_refuses_with_an_actionable_message() -> None:
-    with pytest.raises(NotImplementedError, match="dataset feature metadata"):
-        LeRobotPolicyHandle("checkpoints/vla")
 
 
 def test_a_raising_heartbeat_holds_the_arm_and_abandons_the_episode() -> None:

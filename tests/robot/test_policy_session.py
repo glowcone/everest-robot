@@ -439,14 +439,23 @@ def test_an_unrecognized_extension_says_what_is_supported(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("name", ["checkpoint.safetensors", "checkpoint.pt"])
-def test_a_trained_checkpoint_routes_to_the_guarded_loader(tmp_path, name) -> None:
+def test_a_weights_file_points_at_the_directory_that_holds_it(tmp_path, name) -> None:
+    """A checkpoint is a directory: the config and the processor pipelines are part of it."""
+
     path = tmp_path / name
     path.write_bytes(b"")
 
-    with pytest.raises(NotImplementedError, match="dataset feature metadata"):
+    with pytest.raises(PolicyLoadError, match="loaded from the directory"):
         load_policy(path)
 
 
-def test_a_checkpoint_directory_routes_to_the_guarded_loader(tmp_path) -> None:
-    with pytest.raises(NotImplementedError, match="dataset feature metadata"):
+def test_a_directory_without_a_config_is_not_a_checkpoint(tmp_path) -> None:
+    with pytest.raises(PolicyLoadError, match="missing config.json"):
         load_policy(tmp_path)
+
+
+def test_an_unknown_reference_is_not_mistaken_for_a_repo_id(tmp_path) -> None:
+    """'namespace/name' is a hub reference; a plain missing path says so instead."""
+
+    with pytest.raises(PolicyLoadError, match="does not exist"):
+        load_policy(tmp_path / "no-such-checkpoint")

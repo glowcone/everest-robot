@@ -274,7 +274,11 @@ configuration works on a workstation and in the cell:
 | `EVEREST_ROBOT_PARAMETERS`, `EVEREST_ARM_PROFILE` | Override either configuration file's path. |
 | `EVEREST_LEASE_BACKEND` | `postgres` (default when the database is configured) or `file`. |
 | `EVEREST_CAMERAS`, `EVEREST_CAMERAS_FILE` | Camera devices as JSON, inline or from a file. |
-| `HF_TOKEN` | Read by `huggingface_hub` for a private dataset. Never passed through workflow parameters, and never printed. |
+| `EVEREST_POLICY_DEVICE` | Inference device: `auto` (default; CUDA, then MPS, then CPU), or an explicit `cuda`/`mps`/`cpu`, which is never silently downgraded. |
+| `EVEREST_WRIST_CAMERA`, `EVEREST_WRIST_CAMERA_COLOR` | Which configured camera the attachment detector looks through (default `wrist`), and whether it produces `rgb` (default) or `bgr`. |
+| `EVEREST_GRASP_GRIPPER_BELOW_RAD` | Gripper position, in joint radians, below which it counts as holding the carabiner. Unset means grasp is never asserted. |
+| `EVEREST_ALIGNMENT_TOLERANCE_PX` | Drift of the carabiner's insertion point from the CV hand-over pose that counts as a degraded alignment (default 60). |
+| `HF_TOKEN` | Read by `huggingface_hub` for a private dataset or model. Never passed through workflow parameters, and never printed. |
 
 `src/everest_robot/robot/deployment.py` is the only module that reads these.
 

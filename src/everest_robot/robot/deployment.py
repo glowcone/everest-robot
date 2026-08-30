@@ -26,6 +26,17 @@ Environment:
   (default ``config/pixel_map.json``). It is not a policy observation and deliberately
   does not go through ``EVEREST_CAMERAS``: the camera id it uses is part of the
   calibration, because moving that camera voids every sample in the file.
+* ``EVEREST_POLICY_DEVICE`` -- torch device for checkpoint inference: ``auto`` (default;
+  CUDA, then Apple's Metal backend, then the CPU), or an explicit ``cuda``/``mps``/``cpu``,
+  which is never silently downgraded.
+* ``EVEREST_WRIST_CAMERA`` -- which configured camera the attachment detector looks
+  through (default ``wrist``). It must be one of the ``EVEREST_CAMERAS`` names, because
+  perception shares the session's already-open camera rather than opening a second one.
+* ``EVEREST_WRIST_CAMERA_COLOR`` -- ``rgb`` (default, LeRobot's convention) or ``bgr``.
+* ``EVEREST_GRASP_GRIPPER_BELOW_RAD`` -- gripper position, in this arm's joint radians,
+  below which it counts as holding the carabiner. Unset means grasp is never asserted.
+* ``EVEREST_ALIGNMENT_TOLERANCE_PX`` -- how far the carabiner's insertion point may drift
+  in the wrist view before ``CLIP_RL`` calls the alignment degraded (default 60).
 * ``HF_TOKEN`` -- read by ``huggingface_hub`` itself for a private dataset. It is never
   passed through workflow parameters and never appears in a result or an error.
 """
@@ -39,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from everest_robot.pixel_map import PixelJointMap, PixelMapError
-from everest_robot.robot.cameras import CameraRuntime
+from everest_robot.robot.cameras import CameraRuntime, load_camera_specs
 from everest_robot.robot.contracts import CancelCheck, Heartbeat
 from everest_robot.robot.datasets import HuggingFaceDatasetResolver
 from everest_robot.robot.lease import FileLease, PostgresAdvisoryLease, RobotLease
@@ -90,6 +101,45 @@ def load_pixel_map(environ: Mapping[str, str] | None = None) -> PixelJointMap:
             f"{path} stored no detector ROI; re-run `robot-pixel-map collect --roi X Y W H`"
         )
     return calibration
+
+
+def policy_device(environ: Mapping[str, str] | None = None) -> str:
+    """Which torch device a checkpoint runs on. ``auto`` is resolved inside the handle."""
+
+    environ = os.environ if environ is None else environ
+    return environ.get("EVEREST_POLICY_DEVICE", "auto")
+
+
+def build_attachment_perception(
+    params: Mapping[str, Any] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Any:
+    """Build the FSM's perception gates from deployment configuration.
+
+    Built unbound: the camera runtime and the arm port belong to a session that has not been
+    opened yet. Everything here is configuration, so a missing camera or an unacknowledged
+    lack of attachment verification is discovered before the robot is claimed.
+    """
+
+    from everest_robot.robot.carabiner_perception import (
+        CarabinerVisionPerception,
+        UnverifiableAttachment,
+    )
+
+    environ = os.environ if environ is None else environ
+    params = params or {}
+
+    threshold = environ.get("EVEREST_GRASP_GRIPPER_BELOW_RAD")
+    return CarabinerVisionPerception(
+        verifier=UnverifiableAttachment(
+            acknowledged=bool(params.get("allow_unverified_attachment"))
+        ),
+        camera_name=environ.get("EVEREST_WRIST_CAMERA", "wrist"),
+        color_mode=environ.get("EVEREST_WRIST_CAMERA_COLOR", "rgb"),
+        alignment_tolerance_px=float(environ.get("EVEREST_ALIGNMENT_TOLERANCE_PX", 60.0)),
+        grasp_gripper_below_rad=None if threshold is None else float(threshold),
+        configured_cameras=tuple(spec.name for spec in load_camera_specs(environ=environ)),
+    )
 
 
 def build_lease(
