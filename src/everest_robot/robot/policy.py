@@ -515,6 +515,7 @@ class LeRobotPolicyHandle:
         import torch
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+        from lerobot.utils.device_utils import is_torch_device_available
         from lerobot.utils.feature_utils import hw_to_dataset_features
 
         self._checkpoint = str(checkpoint)
@@ -530,7 +531,16 @@ class LeRobotPolicyHandle:
                 f"could not read a policy config from {self._checkpoint!r}: {error}"
             ) from error
         if device is not None:
+            if not is_torch_device_available(device):
+                raise PolicyLoadError(
+                    f"torch device {device!r} is not available on this host. A checkpoint "
+                    "trained on a GPU runs here on 'mps' (Apple silicon) or 'cpu'."
+                )
             config.device = device
+        # A checkpoint trained on a GPU says so in its config; LeRobot's own config
+        # validation has already fallen back to whatever this host has, so this is the
+        # device that is actually going to run, not the one the training box had.
+        self._device_name = str(config.device)
         self._config = config
         self._controller = config.type
 
@@ -587,8 +597,17 @@ class LeRobotPolicyHandle:
             self._policy = policy_class.from_pretrained(
                 self._checkpoint, config=config, revision=revision
             )
+            # The saved processor pipelines pin their own device -- the training box's,
+            # typically 'cuda'. Overriding both is what lets a checkpoint trained on a GPU
+            # run here at all; without it the preprocessor refuses to instantiate on a
+            # machine with no CUDA, whatever the policy config says.
+            device_override = {"device_processor": {"device": self._device_name}}
             self._preprocessor, self._postprocessor = make_pre_post_processors(
-                config, pretrained_path=self._checkpoint, pretrained_revision=revision
+                config,
+                pretrained_path=self._checkpoint,
+                pretrained_revision=revision,
+                preprocessor_overrides=device_override,
+                postprocessor_overrides=device_override,
             )
         except PolicyLoadError:
             raise
