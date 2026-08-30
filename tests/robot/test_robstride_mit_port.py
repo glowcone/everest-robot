@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from everest_robot.robot.clock import ManualClock
 from everest_robot.robot.contracts import ArmLifecycle, RobotIdentity
 from everest_robot.robot.lerobot_bridge import JointFrame
 from everest_robot.robot.robstride_mit_port import RobstrideMitPort
@@ -123,7 +124,11 @@ def make_port(**overrides: Any) -> RobstrideMitPort:
     bus = StubBus()
     for name, value in overrides.items():
         setattr(bus, name, value)
-    return RobstrideMitPort(bus, IDENTITY, FRAME, limits_deg=LIMITS_DEG, gains=GAINS)
+    # ManualClock so connect()'s feedback priming costs no wall-clock time in the tests
+    # that deliberately keep a motor silent.
+    return RobstrideMitPort(
+        bus, IDENTITY, FRAME, limits_deg=LIMITS_DEG, gains=GAINS, clock=ManualClock()
+    )
 
 
 def enabled_port(**overrides: Any) -> RobstrideMitPort:
@@ -463,3 +468,46 @@ def test_concurrent_reads_and_commands_are_serialized_on_the_bus() -> None:
 
     assert overlaps == []
     assert errors == []
+
+
+def test_connect_waits_for_complete_feedback_before_returning() -> None:
+    """A motor that answers a beat late must not surface as NaN in the first read.
+
+    Callers plan motion from the first read after connect -- ``robot-goto`` prints a
+    target computed against it -- so a NaN there is a pose nobody can act on, produced by
+    nothing worse than asking too early.
+    """
+
+    port = make_port(silent={"gripper"})
+
+    class LateBus:
+        """Answers for the gripper only from the third read of its position onward."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+            self.reads = 0
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def read(self, register: str, joint: str) -> Any:
+            if register == "Present_Position" and joint == "gripper":
+                self.reads += 1
+                if self.reads >= 3:
+                    self._inner.silent = set()
+            return self._inner.read(register, joint)
+
+    port._bus = LateBus(port._bus)
+    port.connect(timeout=2.0)
+
+    assert port.read_state().all_finite
+
+
+def test_connect_gives_up_priming_rather_than_hanging_on_a_dead_motor() -> None:
+    """Priming removes a race; it must not paper over a motor that is genuinely gone."""
+
+    port = make_port(silent={"gripper"})
+    port.connect(timeout=2.0)
+
+    assert port.lifecycle is ArmLifecycle.CONNECTED
+    assert not port.read_state().all_finite

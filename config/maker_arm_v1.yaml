@@ -37,7 +37,12 @@ motion_defaults:
   max_acceleration_rad_s2: 1.0
   tolerance_rad: 0.03
   settle_time_s: 0.25
-  timeout_s: 10.0
+  # A full-range move on this arm is around 2 rad, and at the 0.25 speed scale the ordered
+  # recipes use that is roughly 15 s of honest travel -- so 10 s failed moves that were
+  # working. This bounds "slow but progressing" only: an arm that is stuck or fighting its
+  # command is caught by the motion controller's tracking-error limit, which does not wait
+  # for this to expire.
+  timeout_s: 60.0
   control_rate_hz: 30
 
 # Presets are measured and approved, never invented. None are defined yet.
@@ -48,7 +53,12 @@ motion_defaults:
 # robot.calibration_id above. Capture them from a measured, operator-approved arm state by
 # following docs/named-position-capture.md -- never by hand-editing joint values. Pressing
 # `p` in `just monitor` writes an entry here for you, which is the intended way to add one.
-named_positions: {}
+named_positions:
+  zero:
+    joints: [1.9987876, 0.9735851, 3.8926746, 0.4370996, 2.0512737, 3.7168329, -0.0821411]
+    calibration_id: maker-arm-02-2026-08-20
+    approved_by: "Steph"
+    captured_at: 2026-08-29
 
 # Waypoint sequences for transitions where direct joint-space interpolation has not been
 # shown to be collision-free. When a transition exists, the runtime must use it.
@@ -90,6 +100,11 @@ replay:
   require_matching_calibration_id: true
   # Set to an approved named position once one exists.
   safe_start_position: null
+  # Where the arm is driven before torque comes off, however a replay ends -- completed,
+  # cancelled, faulted or interrupted. A replay finishes wherever the episode's last frame
+  # left the arm, and releasing torque there drops it onto the bench. Set to null only if
+  # something else is holding the arm up.
+  park_position: zero
   max_speed_scale: 1.0
   max_fps: 30
   # Largest allowed frame-to-frame action change. Null means unenforced: there is no

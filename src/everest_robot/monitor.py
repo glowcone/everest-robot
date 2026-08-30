@@ -11,6 +11,12 @@ the arm is not enabled), so a monitor is a bus participant, not a passive tap. R
 alongside a worker would put two participants on one CAN bus, which this repo does not
 treat as a degraded mode. If the lease is held, the monitor refuses and names the holder.
 
+However a powered session ends -- ``q``, a teleoperation failure, an unhandled exception,
+Ctrl-C -- the follower is driven back to ``--park`` (``zero`` by default) before torque is
+released. A teleoperation session finishes with the arm wherever the operator's hands last
+put the leader, and that is not a pose anyone chose to be safe to drop from. A second
+Ctrl-C abandons the parking move; the physical e-stop overrides everything.
+
 The derivation lives in :mod:`everest_robot.robot.monitor`; this module is the terminal.
 """
 
@@ -21,7 +27,7 @@ import contextlib
 import curses
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import TYPE_CHECKING
 
@@ -53,8 +59,11 @@ _NEEDS_BAR = _NEEDS_TORQUE + _BAR_W
 
 # The keys, once. The footer is derived from the short labels and the help overlay from
 # the long ones, so a binding cannot be added to the loop and forgotten in the guide.
+# Where the follower is driven before torque comes off, however the session ends.
+DEFAULT_PARK_POSITION = "zero"
+
 _KEY_BINDINGS: tuple[tuple[str, str], ...] = (
-    ("q", "quit+hold"),
+    ("q", "quit+park"),
     ("p", "capture pose"),
     ("z", "mark reference"),
     ("Z", "clear"),
@@ -64,7 +73,7 @@ _KEY_BINDINGS: tuple[tuple[str, str], ...] = (
 _HELP = " · ".join(f"{key} {label}" for key, label in _KEY_BINDINGS)
 
 _KEY_GUIDE: tuple[tuple[str, str], ...] = (
-    ("q", "stop, hold position, release the arm, and exit"),
+    ("q", "stop following, park the arm at its rest pose, release it, and exit"),
     ("p", "capture this pose; you are offered it as a named position on exit"),
     ("z", "mark this pose as the reference the d deg column measures from"),
     ("Z", "clear that reference"),
@@ -103,6 +112,9 @@ class MonitorContext:
     poll_hz: float
     fake: bool
     powered: bool = False
+    # The rest pose the follower is driven to before torque comes off, or None when the
+    # operator asked for the arm to be released where it stands.
+    park: str | None = None
 
 
 # ── the terminal ───────────────────────────────────────────────────────────────────
@@ -361,14 +373,27 @@ def _mode_guide(context: MonitorContext) -> tuple[str, ...]:
             "No CAN bus, no claim, nothing measured. A pose cannot be saved from here.",
         )
     if context.powered:
-        return (
+        lines = [
             "POWERED. The follower is enabled and tracking the Star leader at a",
-            "bounded velocity. space pauses following and holds; q stops, holds and",
-            "releases. This process holds the robot lease, so no worker can run.",
+            "bounded velocity. space pauses following and holds; q ends the session.",
+            "This process holds the robot lease, so no worker can run.",
             "A leader pose the follower cannot reach is held at the soft limit and",
             "named as CLAMPED above; bring the leader back and following resumes.",
             "Staying out of range stops the session, because that is the mapping.",
-        )
+        ]
+        if context.park:
+            lines += [
+                "However the session ends -- q, a failure, Ctrl-C -- the arm is driven",
+                f"back to {context.park!r} before torque comes off, so it is never dropped",
+                "from a teleoperated pose. A second Ctrl-C abandons that move and releases",
+                "the arm where it stands; the e-stop cuts power outright.",
+            ]
+        else:
+            lines += [
+                "--no-park was passed, so torque is released wherever the leader left the",
+                "arm and it WILL fall unless you are supporting it.",
+            ]
+        return tuple(lines)
     return (
         "READ ONLY. The arm is never enabled, so you can position it by hand.",
         "space freezes the display. This process still holds the robot lease.",
@@ -572,6 +597,21 @@ def main() -> None:
         action="store_true",
         help="print a captured pose but never offer to write it to the parameters file",
     )
+    parser.add_argument(
+        "--park",
+        default=DEFAULT_PARK_POSITION,
+        help=(
+            "named position the follower returns to before torque comes off, however the "
+            f"session ends (default {DEFAULT_PARK_POSITION!r})"
+        ),
+    )
+    parser.add_argument(
+        "--no-park",
+        action="store_const",
+        const=None,
+        dest="park",
+        help="release torque where the leader left the arm instead of returning it home",
+    )
     args = parser.parse_args()
     if args.poll_hz <= 0:
         parser.error(f"--poll-hz must be positive, got {args.poll_hz}")
@@ -589,7 +629,12 @@ def main() -> None:
         poll_hz=args.poll_hz,
         fake=args.fake,
         powered=not (args.fake or args.once or args.read_only),
+        park=args.park,
     )
+    if not context.powered:
+        # Nothing is energized in these modes, so there is nothing to park; saying so in
+        # the guide beats implying an arm that is never under torque is about to be driven.
+        context = replace(context, park=None)
 
     if args.fake:
         monitor = _build_fake_monitor(parameters, args.stale_after)
@@ -598,8 +643,19 @@ def main() -> None:
         return
 
     # No cameras: calibration teleoperation and joint monitoring consume no images.
+    #
+    # Parking is unconditional in the powered mode, unlike `robot-goto`: a teleoperation
+    # session ends with the arm wherever the operator's hands last put the leader, which is
+    # exactly the pose nobody chose to be safe to release torque at. The read-only and
+    # --once modes never enable, so they would skip parking anyway -- and they are asked for
+    # precisely when the arm is not in a state to be driven, so they must not be refused
+    # for a rest pose that is missing or unreachable.
     session = RobotSession(
-        build_port(parameters), parameters, lease=build_lease(parameters), cameras=None
+        build_port(parameters),
+        parameters,
+        lease=build_lease(parameters),
+        cameras=None,
+        park_position=args.park if context.powered else None,
     )
     captured = _run_session(session, args, context)
     # Deliberately outside the session: `close()` has held the arm, disabled it and

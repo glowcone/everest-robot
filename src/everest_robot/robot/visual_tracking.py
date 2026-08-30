@@ -50,6 +50,49 @@ class TrackerStopped(RuntimeError):
     """The tracker will not command anything further; the arm is held."""
 
 
+@dataclass
+class ArrivalGate:
+    """Decides when the arm has actually reached the tracked target and stayed there.
+
+    Servoing has no natural end: the target is recomputed every frame, so "arrived" is a
+    judgement someone has to make before handing the arm to whatever comes next. The
+    judgement is made on *measured* feedback rather than on the commanded value -- the
+    commanded value reaches the target one clamped step early, while the arm is still
+    catching up -- and it has to hold for ``ticks`` consecutive frames, so a detection that
+    momentarily lands near the current pose does not read as an arrival.
+
+    Any tick without a target (a miss, a hold, a limit refusal) resets the count: the
+    object may have moved, and the arm is no longer above where it was.
+    """
+
+    tolerance_rad: float = 0.02
+    ticks: int = 5
+    consecutive: int = 0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.tolerance_rad) or self.tolerance_rad <= 0.0:
+            raise ValueError("tolerance_rad must be finite and positive")
+        if self.ticks < 1:
+            raise ValueError("ticks must be at least 1")
+
+    @property
+    def arrived(self) -> bool:
+        return self.consecutive >= self.ticks
+
+    def update(self, tick: TrackTick) -> bool:
+        """Fold one tick in and report whether the arm counts as arrived."""
+
+        if tick.target is None or not tick.measured or not tick.moved:
+            self.consecutive = 0
+            return False
+        error = max(abs(a - b) for a, b in zip(tick.measured, tick.target, strict=True))
+        self.consecutive = self.consecutive + 1 if error <= self.tolerance_rad else 0
+        return self.arrived
+
+    def reset(self) -> None:
+        self.consecutive = 0
+
+
 @dataclass(frozen=True, slots=True)
 class TrackTick:
     """What one control tick did, and why."""

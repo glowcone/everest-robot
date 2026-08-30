@@ -120,3 +120,90 @@ def test_the_tracked_target_matches_what_the_map_predicts_for_that_pixel():
     )
     assert target[4] == pytest.approx(prediction.roll_rad)
     assert target[5] == 0.0  # gripper was never fitted; it holds where it is
+
+
+# ── the handoff ────────────────────────────────────────────────────────────────────
+class StubCapture:
+    """A camera that always sees the carabiner at one pixel, and drives simulated time.
+
+    Advancing the arm's clock once per frame is what makes the loop converge in a test:
+    the tracker commands a step per tick, and the arm integrates one frame's worth of
+    motion toward it.
+    """
+
+    def __init__(self, clock, pixel=(300, 200), frames=400):
+        self.clock = clock
+        self.pixel = pixel
+        self.remaining = frames
+
+    def read(self):
+        if self.remaining <= 0:
+            raise KeyboardInterrupt  # the loop treats this as the operator quitting
+        self.remaining -= 1
+        self.clock.advance(0.1)
+        return True, frame_with_carabiner(*self.pixel)
+
+    def release(self):
+        pass
+
+
+def track_arguments(**overrides):
+    import argparse
+
+    defaults = dict(
+        no_window=True,
+        rate=1000.0,  # the loop's own pacing; simulated arm time comes from the capture
+        max_velocity=50.0,
+        max_jump_px=150.0,
+        no_roll_tracking=False,
+        policy=None,
+    )
+    return argparse.Namespace(**{**defaults, **overrides})
+
+
+def run_track_loop(**overrides):
+    from types import SimpleNamespace
+
+    from everest_robot.calibrate_pixel_map import _track_loop
+    from everest_robot.pixel_map import CameraSource
+    from everest_robot.robot.visual_tracking import ArrivalGate
+
+    fitted = calibration().fitted(fit_joints=FIT_JOINTS)
+    clock = ManualClock()
+    arm = fake_arm(fitted.joint_names, clock)
+    tracker = VisualTracker(arm, rate_hz=1000.0, max_velocity_rad_s=50.0, lock_frames=2)
+    tracker.start()
+    args = track_arguments(**overrides)
+    capture = StubCapture(clock, frames=200)
+    reasons, arrived = _track_loop(
+        SimpleNamespace(port=arm),
+        fitted,
+        tracker,
+        capture,
+        CameraSource(index_or_path="0"),
+        ROI,
+        args,
+        None,
+        ArrivalGate(tolerance_rad=0.02, ticks=3),
+    )
+    return reasons, arrived, capture
+
+
+def test_the_loop_hands_over_once_the_arm_has_settled_on_the_tracked_pose():
+    reasons, arrived, capture = run_track_loop(policy="checkpoints/act")
+
+    assert arrived
+    # It stopped at the arrival rather than running the capture out, which is what leaves
+    # the arm held on target for the policy instead of still servoing at it.
+    assert capture.remaining > 0
+    assert reasons["tracking"] > 0
+
+
+def test_without_a_policy_arriving_does_not_end_the_loop():
+    """Tracking with nothing to hand over to is a calibration check; it keeps tracking."""
+
+    reasons, arrived, capture = run_track_loop(policy=None)
+
+    assert not arrived
+    assert capture.remaining == 0
+    assert reasons["tracking"] > 3

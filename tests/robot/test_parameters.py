@@ -65,14 +65,19 @@ def load(doc: dict) -> RobotParameters:
     return RobotParameters.from_mapping(doc, config_digest="sha256:test", source="test.yaml")
 
 
-def test_shipped_config_loads_and_defines_no_presets() -> None:
+def test_shipped_config_loads_and_every_preset_carries_its_provenance() -> None:
     parameters = RobotParameters.from_yaml(SHIPPED_CONFIG)
 
-    # Poses may only come from a measured, operator-approved arm state.
-    assert parameters.named_positions == {}
     assert parameters.named_transitions == {}
     assert parameters.identity.units == "radians"
     assert parameters.replay.safe_start_position is None
+
+    # Poses may only come from a measured, operator-approved arm state, so every preset
+    # in the shipped file has to name who approved it and be valid for this calibration.
+    for name, position in parameters.named_positions.items():
+        assert position.calibration_id == parameters.identity.calibration_id, name
+        assert position.approved_by.strip(), name
+        assert len(position.joints) == len(parameters.identity.joint_names), name
 
 
 def test_digest_is_the_file_content_hash() -> None:

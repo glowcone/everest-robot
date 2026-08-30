@@ -16,11 +16,13 @@ from everest_robot.robot.fake_arm import FakeArm
 from everest_robot.robot.lerobot_bridge import JointFrame, RobotBridgeCore
 from everest_robot.robot.parameters import RobotParameters
 from everest_robot.robot.policy import (
-    LeRobotPolicyHandle,
     PolicyHandle,
+    PolicyLoadError,
     PolicyRunner,
     ScriptedPolicy,
     compatibility_problems,
+    robot_action_features,
+    robot_observation_features,
 )
 from everest_robot.robot.recording import InMemorySessionRecorder
 
@@ -339,9 +341,47 @@ def test_heartbeats_fire_during_a_long_rollout() -> None:
     assert beats["count"] >= 3
 
 
-def test_the_checkpoint_loader_refuses_with_an_actionable_message() -> None:
-    with pytest.raises(NotImplementedError, match="dataset feature metadata"):
-        LeRobotPolicyHandle("checkpoints/vla")
+# ── translating a checkpoint's features onto this arm ──────────────────────────────
+# The loader itself needs the hardware extra (LeRobot, torch), but the translation these
+# tests cover is where a checkpoint trained on another arm is caught, so it is pure.
+def test_a_checkpoints_state_and_cameras_are_restated_in_the_robots_own_names() -> None:
+    features = robot_observation_features((3,), {"wrist": (3, 4, 8)}, JOINTS)
+
+    assert features == {**dict.fromkeys(ACTION_KEYS, ()), "wrist": (4, 8, 3)}
+
+
+def test_a_checkpoint_trained_on_a_different_arm_is_refused_at_load() -> None:
+    with pytest.raises(PolicyLoadError, match="this arm has 3 joints"):
+        robot_observation_features((7,), {}, JOINTS)
+    with pytest.raises(PolicyLoadError, match="this arm takes 3 joint positions"):
+        robot_action_features((7,), JOINTS)
+
+
+def test_a_camera_feature_that_is_not_channel_first_is_refused() -> None:
+    with pytest.raises(PolicyLoadError, match="expected channel-first"):
+        robot_observation_features((3,), {"wrist": (224, 224, 3)}, JOINTS)
+
+
+def test_action_keys_follow_the_arms_joint_order_unless_the_checkpoint_names_them() -> None:
+    assert robot_action_features((3,), JOINTS) == ACTION_KEYS
+
+    # Names recorded by the checkpoint are returned as they are, so a checkpoint trained on
+    # a differently ordered arm is caught by the action-space check rather than permuted.
+    named = robot_action_features((3,), JOINTS, ["gripper.pos", "shoulder_pan.pos", "x.pos"])
+    assert named == ("gripper.pos", "shoulder_pan.pos", "x.pos")
+
+
+def test_a_translated_checkpoint_passes_the_compatibility_check() -> None:
+    """What the loader produces is what compatibility_problems is fed."""
+
+    bridge, _, _ = make_bridge(with_cameras=True)
+    handle = policy(
+        input_features=robot_observation_features((3,), {"wrist": (3, 4, 8)}, JOINTS),
+        action_features=robot_action_features((3,), JOINTS),
+        fps=None,
+    )
+
+    assert compatibility_problems(handle, bridge, fps=10.0) == ()
 
 
 def test_a_raising_heartbeat_holds_the_arm_and_abandons_the_episode() -> None:

@@ -745,6 +745,11 @@ class ReplayRunner:
             if control.heartbeat
             else None,
             cancel=control.cancelled,
+            # A replay ends with the arm wherever the last recorded frame left it -- a
+            # pose chosen by an episode, not by anyone thinking about what happens when
+            # torque goes. Parking is unconditional here: a completed replay is no more
+            # entitled to drop the arm than a cancelled one.
+            park_position=self.parameters.replay.park_position,
         )
         player = SessionPlayer(session, clock=self.clock, control=control)
 

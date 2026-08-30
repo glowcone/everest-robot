@@ -14,6 +14,10 @@ reconciliation.md), and only some joints have 0.0 rad inside their soft limits a
 No preset is invented here. Named positions are captured, never authored
 (docs/named-position-capture.md), so this goes through ``go_to_joint_target`` -- the same
 limit checks, bounded interpolation and settling as any other move.
+
+A jog that is interrupted or fails stops mid-travel, and releasing torque there drops the
+arm, so it returns to ``--park`` (``zero`` by default) before disengaging. A jog that
+completes stays put: it has moved one small delta and that is the result being checked.
 """
 
 from __future__ import annotations
@@ -36,6 +40,8 @@ MAX_DELTA_RAD = 0.35
 # -70..-106 deg by the time it faces the table. The LeRobot/Everest mapping is a pure
 # positive offset, so the sign carries into radians unchanged.
 DEFAULT_JOINT = "shoulder_lift"
+# Where an interrupted or failed jog leaves the arm, rather than limp wherever it stopped.
+DEFAULT_PARK_POSITION = "zero"
 
 
 class JogRefused(RuntimeError):
@@ -120,7 +126,9 @@ def raise_arm(
     return result, start, target
 
 
-def open_fake_session() -> RobotSession:
+def open_fake_session(
+    park_position: str | None = None, *, park_on_success: bool = True
+) -> RobotSession:
     """A session over :class:`FakeArm`, for exercising this command without an arm.
 
     Mirrors ``robot-monitor --fake``: the soft limits are invented here because real ones
@@ -134,7 +142,13 @@ def open_fake_session() -> RobotSession:
 
     parameters = load_parameters()
     limits = tuple(JointLimit(name, -2.0, 2.0) for name in parameters.identity.joint_names)
-    return RobotSession(FakeArm(parameters.identity, limits), parameters, cameras=None).open()
+    return RobotSession(
+        FakeArm(parameters.identity, limits),
+        parameters,
+        cameras=None,
+        park_position=park_position,
+        park_on_success=park_on_success,
+    ).open()
 
 
 def _print_plan(joint_names: Sequence[str], start, target, limits) -> None:
@@ -175,6 +189,17 @@ def main() -> None:
         "--fake", action="store_true",
         help="run against the deterministic FakeArm: no CAN, no claim, no real numbers",
     )
+    parser.add_argument(
+        "--park", default=DEFAULT_PARK_POSITION,
+        help=(
+            "named position the arm returns to if the jog is interrupted or fails, before "
+            f"torque comes off (default {DEFAULT_PARK_POSITION!r})"
+        ),
+    )
+    parser.add_argument(
+        "--no-park", action="store_const", const=None, dest="park",
+        help="release torque where the arm stands instead of returning it to the rest pose",
+    )
     args = parser.parse_args()
 
     if args.delta_deg is not None:
@@ -191,11 +216,19 @@ def main() -> None:
     if args.fake:
         print("FAKE ARM: nothing below this line describes a physical robot.\n")
     try:
-        session = open_fake_session() if args.fake else open_session()
+        session = (
+            open_fake_session(args.park, park_on_success=False)
+            if args.fake
+            # A jog that completes leaves the arm one small delta from where it started,
+            # which is the point of the command; only an interrupted or failed one has to
+            # come home. An unknown --park destination is refused here, before the claim.
+            else open_session(park_position=args.park, park_on_success=False)
+        )
     except Exception as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         raise SystemExit(1) from None
 
+    failed = True
     try:
         try:
             result, start, target = raise_arm(
@@ -225,8 +258,9 @@ def main() -> None:
                 f"max tracking error {result.max_tracking_error_rad:.4f} rad)"
             )
             print(f"final: {', '.join(f'{v:+.4f}' for v in result.final_joints)}")
+        failed = False
     finally:
-        session.close()
+        session.close(failed=failed)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import pytest
 from everest_robot.robot.clock import ManualClock
 from everest_robot.robot.contracts import ArmLifecycle, JointLimit, RobotIdentity
 from everest_robot.robot.fake_arm import FakeArm
-from everest_robot.robot.visual_tracking import TrackerStopped, VisualTracker
+from everest_robot.robot.visual_tracking import ArrivalGate, TrackerStopped, VisualTracker
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "gripper")
 LIMITS = (
@@ -208,3 +208,68 @@ def test_stopping_without_a_hold_commands_nothing_on_the_way_out():
     running.stop(hold=False)
     assert len(hardware.sent_commands) == commands
     assert not running.locked
+
+
+# ── arrival ────────────────────────────────────────────────────────────────────────
+def arrival_ticks(gate, clock, running, count, target=TARGET):
+    """Servo `count` ticks of the tracker's period and report the gate's verdict."""
+
+    arrived = False
+    for _ in range(count):
+        arrived = gate.update(running.tick(target))
+        clock.advance(running.period_s)
+    return arrived
+
+
+def test_arrival_needs_the_measured_pose_to_settle_not_just_the_command():
+    clock = ManualClock()
+    hardware = arm(clock, max_velocity_rad_s=0.0)  # commanded, but never gets there
+    running = tracker(hardware, lock_frames=1)
+    running.start()
+    gate = ArrivalGate(tolerance_rad=0.01, ticks=3)
+
+    assert not arrival_ticks(gate, clock, running, 10)
+    assert gate.consecutive == 0
+
+
+def test_arrival_is_reported_once_the_arm_holds_the_target():
+    clock = ManualClock()
+    hardware = arm(clock)
+    running = tracker(hardware, lock_frames=1)
+    running.start()
+    gate = ArrivalGate(tolerance_rad=0.01, ticks=3)
+
+    # The FakeArm reaches what it is commanded, so the arm closes the gap within the speed
+    # lock and the gate then needs its consecutive settled ticks.
+    assert arrival_ticks(gate, clock, running, 40)
+    assert gate.arrived
+
+
+def test_a_miss_resets_the_arrival_count():
+    clock = ManualClock()
+    hardware = arm(clock)
+    running = tracker(hardware, lock_frames=1)
+    running.start()
+    gate = ArrivalGate(tolerance_rad=0.01, ticks=3)
+    arrival_ticks(gate, clock, running, 40)
+
+    # The object may have been picked up or moved; being above where it *was* is not an
+    # arrival, so the count starts again from the next good detection.
+    assert not gate.update(running.tick(None))
+    assert gate.consecutive == 0
+
+
+def test_a_held_tick_never_counts_as_an_arrival():
+    hardware = arm(ManualClock())
+    running = tracker(hardware, lock_frames=5)
+    running.start()
+    gate = ArrivalGate(tolerance_rad=10.0, ticks=1)
+
+    # Locking on: the target is accepted but nothing has been commanded yet.
+    assert not gate.update(running.tick(TARGET))
+
+
+@pytest.mark.parametrize(("field", "value"), [("tolerance_rad", 0.0), ("ticks", 0)])
+def test_a_nonsensical_arrival_gate_is_refused_at_construction(field, value):
+    with pytest.raises(ValueError):
+        ArrivalGate(**{field: value})

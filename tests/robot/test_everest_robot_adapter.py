@@ -148,7 +148,7 @@ def test_attachment_without_a_policy_refuses_rather_than_pretending() -> None:
     with make_session() as session:
         robot = EverestRobot(session)
 
-        with pytest.raises(NotImplementedError, match="dataset decision"):
+        with pytest.raises(NotImplementedError, match="no policy factory configured"):
             robot.attach_clip("vla")
 
 

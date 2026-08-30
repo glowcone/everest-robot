@@ -44,6 +44,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from everest_robot.robot.clock import Clock, SystemClock
 from everest_robot.robot.contracts import (
     ArmLifecycle,
     JointLimit,
@@ -97,6 +98,7 @@ class RobstrideMitPort:
         *,
         limits_deg: Mapping[str, tuple[float, float]],
         gains: Mapping[str, tuple[float, float]],
+        clock: Clock | None = None,
     ) -> None:
         if frame.joint_names != identity.joint_names:
             raise ValueError("the joint frame must describe the arm's joints, in the same order")
@@ -111,6 +113,7 @@ class RobstrideMitPort:
                 "file and the MakerFollower tables are describing different arms"
             )
         self._bus = bus
+        self._clock = clock or SystemClock()
         # One lock around every bus operation: the TUI thread reads feedback while the
         # teleoperation thread commands, and neither the bus nor slcan tolerates that.
         self._bus_lock = threading.RLock()
@@ -242,6 +245,29 @@ class RobstrideMitPort:
             self._flush_rx()
         self._lifecycle = ArmLifecycle.CONNECTED
         self._fault_reason = None
+        self._prime_feedback(timeout)
+
+    def _prime_feedback(self, timeout: float) -> None:
+        """Read until every joint reports a finite position, or give up trying.
+
+        The first ``read_state()`` after a handshake can come back before every motor has
+        answered, and a missing answer surfaces as NaN. Callers plan motion from that first
+        read -- ``robot-goto`` prints a target computed against it -- so a NaN there is a
+        pose nobody can act on, produced by nothing worse than asking too early.
+
+        Deliberately silent on failure: a joint that is genuinely not reporting is the
+        business of ``read_state``'s own NaN, of the monitor's NO FEEDBACK, and of the
+        motion controller's refusal to interpolate from one. This only removes the race,
+        it does not paper over a real fault.
+        """
+
+        deadline = self._clock.monotonic() + max(timeout, 0.0)
+        while True:
+            if self.read_state().all_finite:
+                return
+            if self._clock.monotonic() >= deadline:
+                return
+            self._clock.sleep(0.02)
 
     def disconnect(self) -> None:
         if self._lifecycle is ArmLifecycle.DISCONNECTED:

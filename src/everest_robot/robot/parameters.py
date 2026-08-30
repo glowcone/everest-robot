@@ -212,6 +212,11 @@ class ReplaySettings:
     require_matching_calibration_id: bool
     safe_start_position: str | None
     max_speed_scale: float
+    # Where the arm is driven before torque comes off, however a replay ends. Optional and
+    # separate from ``safe_start_position``: that one is where a replay may *begin*, which
+    # is a statement about the recording, while this is where the arm is safe to be left
+    # standing when nothing is commanding it. They are often the same pose and need not be.
+    park_position: str | None = None
     max_fps: float = 30.0
     max_step_deg: float | None = None
     tracking_error_limit_deg: float = 5.0
@@ -525,6 +530,7 @@ def _parse_replay(
         *_REPLAY_FLAGS,
         "max_step_deg",
         "max_consecutive_missed_deadlines",
+        "park_position",
     )
     _reject_unknown(value, allowed, where)
     _require(value, _REPLAY_REQUIRED, where)
@@ -536,6 +542,14 @@ def _parse_replay(
             raise ParameterError(
                 f"{where}.safe_start_position: {start!r} is not a named position"
             )
+
+    # Checked at load time for the same reason the session resolves its park route in its
+    # constructor: a teardown is no place to discover that the rest pose does not exist.
+    park = value.get("park_position")
+    if park is not None:
+        park = _text(park, f"{where}.park_position")
+        if park not in positions:
+            raise ParameterError(f"{where}.park_position: {park!r} is not a named position")
 
     scale = _number(value["max_speed_scale"], f"{where}.max_speed_scale")
     if scale > 1.0:
@@ -574,6 +588,7 @@ def _parse_replay(
         ),
         safe_start_position=start,
         max_speed_scale=scale,
+        park_position=park,
         max_step_deg=max_step,
         max_consecutive_missed_deadlines=int(missed),
         **numbers,

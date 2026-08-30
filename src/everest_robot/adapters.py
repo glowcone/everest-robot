@@ -135,8 +135,8 @@ class EverestRobot:
         if self.policy_factory is None:
             raise NotImplementedError(
                 "no policy factory configured: attach_clip needs a loaded checkpoint. "
-                "LeRobot checkpoint loading is still blocked on the dataset decision "
-                "(see everest_robot.robot.policy.LeRobotPolicyHandle)."
+                "Build one with everest_robot.robot.deployment.load_policy_handle, which "
+                "loads any LeRobot checkpoint (ACT, SmolVLA, ...) for this arm."
             )
         handle = self.policy_factory(controller)
         result = self.session.policy.run(handle, task=self.task)
@@ -176,6 +176,13 @@ def robot_session(
     to the scaffold, so nothing touches hardware by accident. On the hardware backend the
     session claims the robot exclusively for the whole stage and releases it on the way
     out, including when the stage raises.
+
+    Releasing does not mean dropping. A stage that fails or is cancelled leaves the arm
+    mid-task, so the session drives it to the configured rest pose before torque comes off
+    -- see :class:`~everest_robot.robot.session.RobotSession`. ``park_position`` comes from
+    the replay settings because that is where this deployment records the pose, and the
+    answer is a property of the arm and its bench, not of which stage happened to be
+    running.
     """
 
     import os
@@ -189,9 +196,14 @@ def robot_session(
     if backend != "hardware":
         raise ValueError(f"unknown robot backend {backend!r} (expected scaffold or hardware)")
 
-    from everest_robot.robot.deployment import open_session
+    from everest_robot.robot.deployment import load_parameters, open_session
 
-    session = open_session(heartbeat=heartbeat, cancel=cancel)
+    session = open_session(
+        heartbeat=heartbeat,
+        cancel=cancel,
+        park_position=load_parameters().replay.park_position,
+    )
+    failed = True
     try:
         yield EverestRobot(
             session,
@@ -199,8 +211,9 @@ def robot_session(
             speed_scale=float(params.get("speed_scale", 1.0)),
             transitions=dict(params.get("named_transitions") or {}),
         )
+        failed = False
     finally:
-        session.close()
+        session.close(failed=failed)
 
 
 def replay_session(

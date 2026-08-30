@@ -38,6 +38,12 @@ config:
 # All claim the arm, so a worker cannot be holding it. The `goto` recipes are ordered:
 # `goto-list` reads the configuration, `goto-dry` claims and validates without energizing,
 # and only `goto` moves.
+#
+# Every powered recipe here and in `calibration` drives the arm back to the `zero` named
+# position before torque comes off, on every exit -- a clean quit, a crash, Ctrl-C. Torque
+# released at an arbitrary pose means the arm falls. Press Ctrl-C a second time to abandon
+# that move and release the arm where it stands; the physical e-stop overrides both. Pass
+# `--no-park` to any of these commands to opt out.
 
 # Follow the Star leader at bounded speed (rad/s) while watching follower encoders. POWERED.
 [group('robot')]
@@ -77,9 +83,10 @@ goto position speed="0.25":
 # ── calibration ────────────────────────────────────────────────────────────────────
 # The fixed camera's pixels to joint positions, in the order they are run. Bolt the camera
 # before step 0 and do not move it afterwards: moving it voids every sample and the whole
-# procedure repeats. Steps 0 and 4 hold the arm lease and MOVE the arm -- 0 follows the
+# procedure repeats. Steps 0, 4 and 5 hold the arm lease and MOVE the arm -- 0 follows the
 # Star leader, 4 servos to the detection at a locked speed and holds still whenever it
-# sees nothing. Steps 1-3 touch no hardware. The full procedure, including the wrist-roll
+# sees nothing, and 5 does that as the approach and then hands the arm to a trained
+# checkpoint. Steps 1-3 touch no hardware. The full procedure, including the wrist-roll
 # model and the two hard limits, is in src/everest_robot/calibrate_pixel_map.py.
 
 # 0. POWERED: teleoperate to ~30 pre-grasp poses, pairing each with the object's pixel.
@@ -110,8 +117,14 @@ pixel-track-dry speed="0.15":
 
 # 4. POWERED: servo continuously above the detected carabiner at a locked speed.
 [group('calibration')]
-pixel-track speed="0.15" rate="15":
-    uv run robot-pixel-map track --max-velocity {{ speed }} --rate {{ rate }}
+pixel-track speed="0.15" rate="15" park="zero":
+    uv run robot-pixel-map track --max-velocity {{ speed }} --rate {{ rate }} --park {{ park }}
+
+# 5. POWERED: approach by camera, then hand the arm to a trained checkpoint to finish.
+[group('calibration')]
+pixel-pick checkpoint task="" park="zero":
+    uv run robot-pixel-map track --park {{ park }} \
+        --policy {{ checkpoint }} --policy-task "{{ task }}"
 
 # ── database ───────────────────────────────────────────────────────────────────────
 # Docker is optional. `robot-db` uses compose.yaml when Docker Compose and its daemon are

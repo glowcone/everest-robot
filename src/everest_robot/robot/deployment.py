@@ -22,6 +22,8 @@ Environment:
   or ``file``.
 * ``EVEREST_CAMERAS`` / ``EVEREST_CAMERAS_FILE`` -- see
   :mod:`everest_robot.robot.cameras`.
+* ``EVEREST_POLICY_DEVICE`` -- ``cpu``, ``mps``, ``cuda``... for checkpoint inference.
+  Unset lets the checkpoint's own config choose, which is what LeRobot does elsewhere.
 * ``HF_TOKEN`` -- read by ``huggingface_hub`` itself for a private dataset. It is never
   passed through workflow parameters and never appears in a result or an error.
 """
@@ -41,6 +43,7 @@ from everest_robot.robot.lease import FileLease, PostgresAdvisoryLease, RobotLea
 from everest_robot.robot.lerobot_bridge import JointFrame
 from everest_robot.robot.maker_arm_port import MakerArmPort
 from everest_robot.robot.parameters import RobotParameters
+from everest_robot.robot.policy import LeRobotPolicyHandle
 from everest_robot.robot.ports import ArmPort
 from everest_robot.robot.replay import ReplayRunner
 from everest_robot.robot.robstride_mit_port import RobstrideMitPort
@@ -142,8 +145,17 @@ def open_session(
     heartbeat: Heartbeat | None = None,
     cancel: CancelCheck | None = None,
     environ: Mapping[str, str] | None = None,
+    park_position: str | None = None,
+    park_on_success: bool = True,
 ) -> RobotSession:
-    """Claim, connect and identity-check the deployed robot. Caller closes it."""
+    """Claim, connect and identity-check the deployed robot. Caller closes it.
+
+    ``park_position`` is where the session drives the arm before torque comes off; see
+    :class:`~everest_robot.robot.session.RobotSession`. It is a caller's argument rather
+    than an environment variable because it is a per-command decision -- what an
+    interrupted teleoperation session should do is not what an interrupted ``robot-goto``
+    should do -- and because an operator must be able to see it on the command line.
+    """
 
     environ = os.environ if environ is None else environ
     parameters = load_parameters(environ)
@@ -154,8 +166,42 @@ def open_session(
         cameras=CameraRuntime.from_env(environ),
         heartbeat=heartbeat,
         cancel=cancel,
+        park_position=park_position,
+        park_on_success=park_on_success,
     )
     return session.open()
+
+
+def load_policy_handle(
+    checkpoint: str,
+    parameters: RobotParameters | None = None,
+    *,
+    task: str | None = None,
+    fps: float | None = None,
+    device: str | None = None,
+    revision: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> LeRobotPolicyHandle:
+    """Load a trained checkpoint for the deployed arm. Touches no hardware.
+
+    One loader for every architecture: which policy class to build comes from the
+    checkpoint's own config, so ACT and SmolVLA -- and anything else LeRobot registers --
+    arrive through this call. It is deliberately callable before a session is opened, so a
+    missing checkpoint, a mismatched action width or a VLA with no task costs no robot
+    claim; see :class:`~everest_robot.robot.policy.LeRobotPolicyHandle`.
+    """
+
+    environ = os.environ if environ is None else environ
+    parameters = load_parameters(environ) if parameters is None else parameters
+    return LeRobotPolicyHandle(
+        checkpoint,
+        parameters.identity.joint_names,
+        task=task,
+        fps=fps,
+        device=device or environ.get("EVEREST_POLICY_DEVICE"),
+        revision=revision,
+        robot_type=parameters.identity.model,
+    )
 
 
 def joint_frame(parameters: RobotParameters) -> JointFrame:

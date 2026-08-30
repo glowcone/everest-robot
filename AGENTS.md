@@ -65,9 +65,37 @@ Absurd checkpoints store.
   (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
   cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
   leave it held on `BaseException`, not only on its own failure paths.
-- `recording.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending the
-  dataset-writing decision. Keep them refusing with an actionable message rather than
-  guessing a format or a feature mapping.
+- `session.py` releases torque only *after* driving the arm to `park_position` -- an arm
+  released at an arbitrary pose falls onto the bench, and every exit reaches `close()`:
+  a clean return, an exception, a cancelled workflow, Ctrl-C. Three invariants make that
+  safe and must be kept. The park route is resolved in the constructor, so a session that
+  cannot bring the arm home is refused before it claims anything. Parking is skipped when
+  the arm was never `ENABLED` (a dry run, `--read-only`, a destination refused before
+  anything was energized) -- energizing a cold arm in a teardown would create the hazard,
+  not remove it -- and when the arm is faulted or missing feedback, because a pose nobody
+  can measure cannot be interpolated from; both say so on stderr rather than passing
+  silently. `defer_interrupt` absorbs the first SIGINT so the Ctrl-C that *ends* a session
+  is not also what abandons the park half-way; the second one releases the arm where it
+  stands, and the physical e-stop is the authority over both. `park_on_success=False` is
+  for the commands whose purpose is to leave the arm somewhere specific (`robot-goto`,
+  `robot-raise`); they still park when interrupted or failed.
+- `robot/routing.py` owns route resolution (`resolve_route`, which prefers an approved
+  `named_transitions` sequence over the direct line). It lives under `robot/` because the
+  session teardown needs it: a CLI may import the runtime, never the reverse. `goto.py`
+  re-publishes those names, `GotoRefused` included.
+- `recording.py` is a guarded stub pending the dataset-writing decision. Keep it refusing
+  with an actionable message rather than guessing a format.
+- `policy.LeRobotPolicyHandle` loads a trained checkpoint, and it is one loader for every
+  architecture on purpose: the checkpoint's own config names its policy class and carries
+  its processors, so ACT, SmolVLA and anything else LeRobot registers arrive through the
+  same path. What it validates is the *interface* -- state width, action width, camera
+  shapes, and a language-conditioned policy given no task -- because that is what differs
+  between a checkpoint and this arm. `robot_observation_features` and
+  `robot_action_features` restate a checkpoint's features in this robot's names so
+  `compatibility_problems` can refuse before anything is energized; they are pure, and
+  they are where a checkpoint trained on a different arm is caught. Load through
+  `deployment.load_policy_handle`, before a session is opened: a bad checkpoint must cost
+  no claim. Never reshape or reorder a mismatched action space at runtime.
 - `datasets.py` reads a pinned LeRobot v3 snapshot directly (parquet + `meta/info.json`)
   rather than through `LeRobotDataset`, so replay needs no torch. Only the documented v3
   layout is supported; extend the reader deliberately rather than loosening its checks.
@@ -91,13 +119,23 @@ Absurd checkpoints store.
   Where the target comes from is the caller's problem: `pixel_map.py` fits the fixed
   camera's pixels to taught pre-grasp poses and refuses to extrapolate outside their convex
   hull, and `calibrate_pixel_map.py` (`robot-pixel-map`) is the operator's CLI over both.
+  The map is taught on pre-grasp poses, so the tracked target *is* the pose to hand over
+  from; there is no height, standoff or lift offset applied on top of it, and adding one
+  back would be modelling a table plane this deliberately does not model.
+  `visual_tracking.ArrivalGate` decides when servoing is done -- on measured feedback, held
+  for consecutive ticks, reset by any miss -- because a loop whose target is recomputed
+  every frame has no natural end. `robot-pixel-map track --policy` uses that to hand the
+  arm to a checkpoint: the tracker is stopped and holding, and the fixed camera released,
+  before the rollout's first observation. Keep it that way -- two controllers must never
+  command the arm at once, and the policy's cameras are the deployment's, not this
+  calibration's.
 - `robot/monitor.py` remains the read-only feedback view model. The `robot-monitor` CLI
   defaults to a powered, lease-local calibration session: `robot/teleoperation.py` owns the
   Star leader and commands the already-claimed follower while the same process renders that
   view. `--read-only` and `--once` never enable. Never split control and monitoring across
   processes or allow either to bypass the robot lease. Pressing `p` captures a pose; the
-  save prompt for it runs in `monitor.py` after the session has closed, so the arm is held,
-  disabled and released before anyone is waiting on a keyboard. Do not move that prompt
+  save prompt for it runs in `monitor.py` after the session has closed, so the arm is
+  parked, disabled and released before anyone is waiting on a keyboard. Do not move that prompt
   inside the session or into the curses loop. `_KEY_BINDINGS` is the one key table: the
   footer and the `?` guide are both derived from it, and tests assert the guide covers
   every key the loop handles, every column the table can draw and every state a joint can
@@ -108,7 +146,8 @@ Absurd checkpoints store.
   `JointMotionController`. Keep it that way -- no second path to the motors. `goto.py`
   resolves its route from the parameters file *before* opening a session, so an unknown or
   ambiguous destination costs no claim, and it must keep preferring an approved
-  `named_transitions` sequence over the direct line with no flag to override it.
+  `named_transitions` sequence over the direct line with no flag to override it. Both take
+  `--park`/`--no-park`; the parking move itself is the session's, not a second path.
 
 ## Working on workflow components
 

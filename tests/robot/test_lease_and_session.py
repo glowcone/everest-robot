@@ -1,3 +1,4 @@
+import signal
 import subprocess
 import sys
 import textwrap
@@ -16,7 +17,8 @@ from everest_robot.robot.lease import (
     RobotLease,
 )
 from everest_robot.robot.parameters import IdentityMismatch, RobotParameters
-from everest_robot.robot.session import RobotSession
+from everest_robot.robot.routing import RouteRefused
+from everest_robot.robot.session import RobotSession, defer_interrupt
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "gripper")
 LIMITS = (
@@ -28,7 +30,15 @@ CALIBRATION = "cal-2026-08-20"
 IDENTITY = RobotIdentity("maker-arm-02", "maker-arm-v1", CALIBRATION, JOINTS)
 
 
-def parameters() -> RobotParameters:
+ZERO = (0.0, -1.0, -0.1)
+# Somewhere the arm can plausibly be left standing by a teleoperation session: a long way
+# from ZERO on every joint, so a park either happens or visibly does not.
+AWAY = (0.9, 0.4, -1.5)
+
+
+def parameters(
+    *, positions: dict | None = None, transitions: dict | None = None
+) -> RobotParameters:
     return RobotParameters.from_mapping(
         {
             "schema_version": 1,
@@ -44,11 +54,13 @@ def parameters() -> RobotParameters:
                 "max_acceleration_rad_s2": 2.0,
                 "tolerance_rad": 0.02,
                 "settle_time_s": 0.2,
-                "timeout_s": 10.0,
+                # Matches the deployed file. A park runs at a quarter speed, so a timeout
+                # short enough to expire during one would be testing the wrong thing.
+                "timeout_s": 60.0,
                 "control_rate_hz": 50,
             },
-            "named_positions": {},
-            "named_transitions": {},
+            "named_positions": positions if positions is not None else {},
+            "named_transitions": transitions if transitions is not None else {},
             "policy": {"default_controller": "vla", "fps": 10, "max_duration_s": 5.0},
             "replay": {
                 "require_matching_robot_id": True,
@@ -62,13 +74,44 @@ def parameters() -> RobotParameters:
     )
 
 
+def preset(joints, **extra) -> dict:
+    return {
+        "joints": list(joints),
+        "calibration_id": CALIBRATION,
+        "approved_by": "operator",
+        "captured_at": "2026-08-21",
+        **extra,
+    }
+
+
+def parkable(**extra_positions) -> RobotParameters:
+    return parameters(positions={"zero": preset(ZERO), **extra_positions})
+
+
+def parking_session(arm: FakeArm, params: RobotParameters | None = None, **overrides):
+    """An open session that parks at ``zero``, sharing the arm's clock.
+
+    Sharing matters: a parking move is a real control loop, so the arm has to integrate on
+    the same time base the controller sleeps on or it never appears to move.
+    """
+
+    session = RobotSession(
+        arm,
+        params if params is not None else parkable(),
+        lease=overrides.pop("lease", None) or InMemoryLease("maker-arm-02"),
+        clock=arm.clock,
+        park_position=overrides.pop("park_position", "zero"),
+        **overrides,
+    )
+    return session.open()
+
+
 def make_arm(identity: RobotIdentity = IDENTITY, **overrides: object) -> FakeArm:
     return FakeArm(
         identity=identity,
         joint_limits=LIMITS,
         clock=ManualClock(),
-        positions=[0.0, -1.0, -0.1],
-        **overrides,
+        **({"positions": [0.0, -1.0, -0.1]} | overrides),
     )
 
 
@@ -179,8 +222,8 @@ def test_a_session_claims_connects_and_releases() -> None:
     assert arm.lifecycle is ArmLifecycle.DISCONNECTED
 
 
-def test_a_crash_disengages_the_arm_and_commands_nothing_on_the_way_out() -> None:
-    """Ctrl-C leaves the arm limp and movable by hand, without a parting lurch."""
+def test_a_crash_without_a_park_position_commands_nothing_on_the_way_out() -> None:
+    """--no-park: the arm is left limp and movable by hand, without a parting lurch."""
 
     arm = make_arm()
     lease = InMemoryLease("maker-arm-02")
@@ -201,7 +244,7 @@ def test_a_crash_disengages_the_arm_and_commands_nothing_on_the_way_out() -> Non
     assert not lease.held
 
 
-def test_an_orderly_close_disengages_the_same_way() -> None:
+def test_an_orderly_close_without_a_park_position_disengages_the_same_way() -> None:
     arm = make_arm()
     lease = InMemoryLease("maker-arm-02")
 
@@ -213,6 +256,189 @@ def test_an_orderly_close_disengages_the_same_way() -> None:
     assert arm.lifecycle is ArmLifecycle.DISCONNECTED
     assert len(arm.sent_commands) == commands
     assert not lease.held
+
+
+# ── parking on the way out ─────────────────────────────────────────────────────────
+def test_an_unknown_park_position_is_refused_before_the_robot_is_claimed() -> None:
+    """The whole point of resolving in the constructor: a teardown cannot recover."""
+
+    lease = InMemoryLease("maker-arm-02")
+
+    with pytest.raises(RouteRefused, match="nowhere"):
+        RobotSession(make_arm(), parkable(), lease=lease, park_position="nowhere")
+
+    assert not lease.held
+
+
+def test_an_orderly_close_drives_the_arm_home_before_torque_comes_off() -> None:
+    arm = make_arm(positions=list(AWAY))
+    lease = InMemoryLease("maker-arm-02")
+
+    session = parking_session(arm, lease=lease)
+    session.port.enable()
+    session.close()
+
+    assert session.parked == "zero"
+    assert arm.positions == pytest.approx(ZERO, abs=0.02)
+    # And only then is it released: parking under torque is the entire point.
+    assert arm.lifecycle is ArmLifecycle.DISCONNECTED
+    assert not lease.held
+
+
+def test_a_crash_mid_stage_still_drives_the_arm_home() -> None:
+    """The case this exists for: nobody chose the pose the exception stopped at."""
+
+    arm = make_arm(positions=list(AWAY))
+
+    session = parking_session(arm)
+    with pytest.raises(RuntimeError, match="stage failed"):
+        try:
+            session.port.enable()
+            raise RuntimeError("stage failed")
+        finally:
+            session.close(failed=True)
+
+    assert session.parked == "zero"
+    assert arm.positions == pytest.approx(ZERO, abs=0.02)
+    assert arm.lifecycle is ArmLifecycle.DISCONNECTED
+
+
+def test_a_keyboard_interrupt_is_treated_like_any_other_failure() -> None:
+    arm = make_arm(positions=list(AWAY))
+
+    session = parking_session(arm)
+    with pytest.raises(KeyboardInterrupt):
+        try:
+            session.port.enable()
+            raise KeyboardInterrupt
+        finally:
+            session.close(failed=True)
+
+    assert session.parked == "zero"
+    assert arm.positions == pytest.approx(ZERO, abs=0.02)
+
+
+def test_an_approved_transition_home_is_used_over_the_direct_line() -> None:
+    """Parking is a real move, so it obeys the same routing rule as `robot-goto`."""
+
+    arm = make_arm(positions=list(AWAY))
+    params = parameters(
+        positions={"zero": preset(ZERO), "clearance": preset((0.9, -0.5, -0.1))},
+        transitions={"home_via_clearance": {"waypoints": ["clearance", "zero"]}},
+    )
+
+    session = parking_session(arm, params)
+    session.port.enable()
+    session.close()
+
+    assert session.park_route is not None
+    assert session.park_route.transition == "home_via_clearance"
+    assert arm.positions == pytest.approx(ZERO, abs=0.02)
+
+
+def test_a_session_that_never_energized_the_arm_is_not_parked() -> None:
+    """A dry run or a read-only monitor has nothing to drop, so nothing is driven."""
+
+    arm = make_arm(positions=list(AWAY))
+
+    session = parking_session(arm)
+    session.close()
+
+    assert session.parked is not None
+    assert "never enabled" in session.parked
+    assert arm.sent_commands == []
+    assert arm.positions == pytest.approx(AWAY)
+
+
+def test_a_faulted_arm_is_released_where_it_stands_and_says_so() -> None:
+    """A fault means the pose cannot be trusted; interpolating from it would swing."""
+
+    arm = make_arm(positions=list(AWAY))
+
+    session = parking_session(arm)
+    session.port.enable()
+    arm.inject_fault("injected")
+    session.close()
+
+    assert session.parked is not None
+    assert session.parked.startswith("not parked:")
+    assert "fault" in session.parked
+    assert arm.positions == pytest.approx(AWAY)
+
+
+def test_a_failed_park_still_disables_disconnects_and_releases_the_claim() -> None:
+    """Every teardown stage runs even when the one before it did not work."""
+
+    arm = make_arm(positions=list(AWAY), refuse_targets=True)
+    lease = InMemoryLease("maker-arm-02")
+
+    session = parking_session(arm, lease=lease)
+    session.port.enable()
+    session.close()
+
+    assert session.parked is not None
+    assert session.parked.startswith("not parked:")
+    assert arm.lifecycle is ArmLifecycle.DISCONNECTED
+    assert not lease.held
+
+
+def test_park_on_success_false_parks_only_on_the_failure_path() -> None:
+    """`robot-goto` must not drive away from the position it was asked to reach."""
+
+    arrived = make_arm(positions=list(AWAY))
+    session = parking_session(arrived, park_on_success=False)
+    session.port.enable()
+    session.close(failed=False)
+
+    assert session.parked is None
+    assert arrived.positions == pytest.approx(AWAY)
+
+    stopped = make_arm(positions=list(AWAY))
+    session = parking_session(stopped, park_on_success=False)
+    session.port.enable()
+    session.close(failed=True)
+
+    assert session.parked == "zero"
+    assert stopped.positions == pytest.approx(ZERO, abs=0.02)
+
+
+def test_an_interrupt_arriving_mid_park_does_not_stop_the_arm_half_way_home() -> None:
+    """The Ctrl-C that ends a session is often held down; the park must survive it."""
+
+    arm = make_arm(positions=list(AWAY))
+    send_targets = arm.send_targets
+    fired = False
+
+    def interrupt_once(targets):
+        nonlocal fired
+        if not fired:
+            fired = True
+            signal.raise_signal(signal.SIGINT)
+        return send_targets(targets)
+
+    arm.send_targets = interrupt_once
+    session = parking_session(arm)
+    session.port.enable()
+    session.close(failed=True)
+
+    assert fired
+    assert session.parked == "zero"
+    assert arm.positions == pytest.approx(ZERO, abs=0.02)
+
+
+def test_the_first_interrupt_during_parking_is_absorbed_and_the_second_is_not() -> None:
+    """Ctrl-C is what starts most parks; it must not also be what cancels them."""
+
+    with defer_interrupt("first") as absorbed:
+        assert not absorbed()
+        signal.raise_signal(signal.SIGINT)
+        assert absorbed()
+
+        with pytest.raises(KeyboardInterrupt):
+            signal.raise_signal(signal.SIGINT)
+
+    # The handler is put back, so an interrupt after the park behaves normally again.
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
 def test_the_wrong_arm_ends_the_session_and_frees_the_claim() -> None:

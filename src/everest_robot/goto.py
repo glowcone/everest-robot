@@ -17,6 +17,11 @@ no flag to bypass an approved transition.
 Like ``robot-monitor`` this claims the robot lease for the whole run, so it cannot be used
 while a worker holds the arm, and a large move asks for confirmation before it energizes
 anything.
+
+A move that is interrupted or fails partway leaves the arm somewhere nobody chose, and
+releasing torque there drops it. So an interrupted or failed run returns to ``--park``
+(``zero`` by default) before disengaging; a run that reaches its destination stays there,
+because arriving is what the command is for.
 """
 
 from __future__ import annotations
@@ -24,14 +29,10 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 from everest_robot.robot.contracts import JointLimit, MotionResult
-from everest_robot.robot.parameters import (
-    NamedPosition,
-    ParameterError,
-    RobotParameters,
-)
+from everest_robot.robot.parameters import ParameterError, RobotParameters
+from everest_robot.robot.routing import Route, RouteRefused, resolve_route, transitions_ending_at
 from everest_robot.robot.session import RobotSession
 
 # Reduced speed by default. The capture guide's whole procedure is to drive a new path
@@ -42,95 +43,15 @@ DEFAULT_SPEED_SCALE = 0.25
 # nudge someone can watch and becomes a real move across the workspace.
 CONFIRM_ABOVE_RAD = 0.35
 CONFIRM_WORD = "GO"
+# Where an interrupted or failed move leaves the arm. A clean move does not park: reaching
+# the requested position is the whole point of this command, and driving away from it again
+# would make `robot-goto` unable to do its job.
+DEFAULT_PARK_POSITION = "zero"
 
-
-class GotoRefused(RuntimeError):
-    """The destination was rejected before anything was claimed or energized."""
-
-
-@dataclass(frozen=True, slots=True)
-class Route:
-    """How the arm is to reach one destination: directly, or along approved waypoints."""
-
-    destination: str
-    legs: tuple[NamedPosition, ...]
-    transition: str | None = None
-
-    @property
-    def waypoints(self) -> tuple[str, ...]:
-        return tuple(leg.name for leg in self.legs)
-
-    @property
-    def target(self) -> NamedPosition:
-        return self.legs[-1]
-
-    def describe(self) -> str:
-        if self.transition is None:
-            return f"direct to {self.destination}"
-        return f"transition {self.transition}: {' -> '.join(self.waypoints)}"
-
-
-def transitions_ending_at(parameters: RobotParameters, destination: str) -> tuple[str, ...]:
-    """Approved waypoint sequences that finish at ``destination``, in a stable order."""
-
-    return tuple(
-        sorted(
-            name
-            for name, transition in parameters.named_transitions.items()
-            if transition.waypoints[-1] == destination
-        )
-    )
-
-
-def resolve_route(
-    parameters: RobotParameters,
-    destination: str,
-    *,
-    transition: str | None = None,
-) -> Route:
-    """Decide how to reach ``destination``, from configuration alone.
-
-    An approved transition wins over a direct move whenever one ends at the destination:
-    the transition exists precisely because the direct interpolation was not shown to be
-    collision-free. Two of them ending at the same pose is an operator choice this command
-    will not make silently, so it refuses and names them.
-    """
-
-    try:
-        target = parameters.position(destination)
-    except ParameterError as error:
-        raise GotoRefused(str(error)) from None
-
-    if transition is not None:
-        try:
-            chosen = parameters.transition(transition)
-        except ParameterError as error:
-            raise GotoRefused(str(error)) from None
-        if chosen.waypoints[-1] != destination:
-            raise GotoRefused(
-                f"transition {transition!r} ends at {chosen.waypoints[-1]!r}, not at "
-                f"{destination!r}; it is not a way to get there"
-            )
-        return Route(
-            destination=destination,
-            legs=tuple(parameters.position(name) for name in chosen.waypoints),
-            transition=transition,
-        )
-
-    candidates = transitions_ending_at(parameters, destination)
-    if len(candidates) > 1:
-        raise GotoRefused(
-            f"{len(candidates)} approved transitions end at {destination!r} "
-            f"({', '.join(candidates)}); choose one with --transition"
-        )
-    if candidates:
-        chosen = parameters.transition(candidates[0])
-        return Route(
-            destination=destination,
-            legs=tuple(parameters.position(name) for name in chosen.waypoints),
-            transition=candidates[0],
-        )
-    return Route(destination=destination, legs=(target,))
+# Route resolution moved to everest_robot.robot.routing so the session teardown could use it
+# without the runtime importing a CLI. The names stay published here, under the one this
+# command has always raised.
+GotoRefused = RouteRefused
 
 
 def widest_displacement(
@@ -316,6 +237,22 @@ def main() -> None:
         action="store_true",
         help="skip the confirmation prompt for a large move",
     )
+    parser.add_argument(
+        "--park",
+        default=DEFAULT_PARK_POSITION,
+        help=(
+            "named position the arm returns to if the move is interrupted or fails, before "
+            f"torque comes off (default {DEFAULT_PARK_POSITION!r}); a move that completes "
+            "stays where it was sent"
+        ),
+    )
+    parser.add_argument(
+        "--no-park",
+        action="store_const",
+        const=None,
+        dest="park",
+        help="release torque where the arm stands instead of returning it to the rest pose",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.speed_scale <= 1.0:
@@ -348,14 +285,22 @@ def main() -> None:
     try:
         # No cameras: a named-position move consumes no images. Building the port is part
         # of what can fail on a misconfigured host, so it shares the session's reporting.
+        # An unknown --park destination is refused here too, before anything is claimed:
+        # a session that cannot bring the arm home should not start.
         session = RobotSession(
-            build_port(parameters), parameters, lease=build_lease(parameters), cameras=None
+            build_port(parameters),
+            parameters,
+            lease=build_lease(parameters),
+            cameras=None,
+            park_position=args.park,
+            park_on_success=False,
         )
         session.open()
     except Exception as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         raise SystemExit(1) from None
 
+    failed = True
     try:
         measured = tuple(session.snapshot().positions)
         joint_names = session.port.joint_names
@@ -373,9 +318,13 @@ def main() -> None:
         result = go_to(
             session, route, speed_scale=args.speed_scale, dry_run=args.dry_run
         )
-        raise SystemExit(_report(result))
+        status = _report(result)
+        # Only a move that actually arrived is allowed to leave the arm where it is. A
+        # failed one stopped somewhere nobody chose, which is the case parking is for.
+        failed = status != 0
+        raise SystemExit(status)
     finally:
-        session.close()
+        session.close(failed=failed)
 
 
 if __name__ == "__main__":

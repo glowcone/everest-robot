@@ -11,7 +11,10 @@ The whole procedure lives behind five subcommands, in the order they are run:
 3. ``check``    Print what the file contains without touching a camera or an arm.
 4. ``predict``  Point the camera at the carabiner and print the joint vector, no motion.
 5. ``track``    Continuously servo the gripper to the taught pre-grasp pose above whatever
-   the camera sees, at a locked speed, holding still whenever it sees nothing.
+   the camera sees, at a locked speed, holding still whenever it sees nothing. With
+   ``--policy`` this is the approach half of a pick: once the arm has settled on the
+   tracked pose, tracking stops and a trained checkpoint (ACT, SmolVLA, anything else
+   LeRobot loads) is handed the arm to do the rest.
 
 Everything lands in one JSON file (``--config``, default ``config/pixel_map.json``): the
 camera id, the detector and its ROI, the arm and calibration the samples were taught on,
@@ -20,9 +23,12 @@ wrist-roll offset. One file is the whole calibration.
 
 Why ``track`` needs no notion of height. The map is taught on *pre-grasp* poses, so
 "directly above the carabiner" is what every sample already encodes; tracking to the map's
-prediction tracks to directly-above by construction. Nothing here models the table plane,
-the camera's obliquity or the arm's kinematics, which is the point --
-:mod:`everest_robot.pixel_map` explains why.
+prediction tracks to directly-above by construction, and the policy takes over from that
+same taught pose. Nothing here models the table plane, the camera's obliquity or the arm's
+kinematics, which is the point -- :mod:`everest_robot.pixel_map` explains why.
+
+The two controllers never overlap: the tracker is stopped and holding, and the fixed
+camera released, before the rollout's first observation is read.
 
 Both ``collect`` and ``track`` claim the robot lease and own the arm for the duration.
 Never run either alongside a worker or a monitor: they would be two participants on one
@@ -65,6 +71,17 @@ DEFAULT_MAX_JUMP_PX = 150.0
 
 # How far each joint backs off before the final one-way move onto the target.
 DEFAULT_APPROACH_RAD = 0.05
+
+# When the servo counts as finished, for `track --policy`. Every joint's *measured*
+# position must be this close to the tracked target for this many consecutive ticks --
+# roughly a third of a second at the default rate, which is long enough that a detection
+# flickering near the current pose does not read as an arrival.
+DEFAULT_ARRIVE_RAD = 0.02
+DEFAULT_ARRIVE_TICKS = 5
+
+# Where the powered subcommands leave the arm before torque comes off. Both of them end
+# with the arm held out over the pickup zone, which is the worst place to drop it.
+DEFAULT_PARK_POSITION = "zero"
 
 
 # ── camera ─────────────────────────────────────────────────────────────────────────
@@ -222,22 +239,32 @@ def _draw_hull(frame: Any, hull: Any) -> None:
 
 # ── the robot side ─────────────────────────────────────────────────────────────────
 def _open_session(args: argparse.Namespace) -> Any:
-    """Claim and connect the deployed arm. The caller closes it."""
+    """Claim and connect the deployed arm. The caller closes it.
+
+    ``--park`` is handed to the session rather than run by the command, so the arm comes
+    home on *every* exit -- a clean quit, a detector failure, an unhandled exception,
+    Ctrl-C -- and not only on the paths a command remembered to cover.
+    """
 
     from everest_robot.robot.deployment import build_lease, build_port, load_parameters
     from everest_robot.robot.session import RobotSession
 
+    park = getattr(args, "park", None)
     if args.fake:
         from everest_robot.jog import open_fake_session
 
         print("FAKE ARM: nothing below this line describes a physical robot.\n")
-        return open_fake_session()
+        return open_fake_session(park)
 
     parameters = load_parameters()
     # No cameras on the session: the fixed camera here is not a policy observation, and
     # routing it through CameraRuntime would make it look like one.
     session = RobotSession(
-        build_port(parameters), parameters, lease=build_lease(parameters), cameras=None
+        build_port(parameters),
+        parameters,
+        lease=build_lease(parameters),
+        cameras=None,
+        park_position=park,
     )
     return session.open()
 
@@ -402,62 +429,66 @@ def cmd_collect(args: argparse.Namespace) -> int:
             "during deployment. Backlash makes the reached pose depend on it."
         )
 
+        # Ctrl-C ends the teaching loop the same way `q` does. The samples taught so far
+        # are written below either way: an interrupted session must not throw away the
+        # poses the operator has already stood there and taught.
         try:
-            while True:
-                frame = read_frame(capture, camera)
-                detection: CarabinerPixel | None
-                try:
-                    detection = detect_carabiner(frame, roi)
-                    miss = ""
-                except (RuntimeError, ValueError) as error:
-                    detection = None
-                    miss = str(error)
+            with contextlib.suppress(KeyboardInterrupt):
+                while True:
+                    frame = read_frame(capture, camera)
+                    detection: CarabinerPixel | None
+                    try:
+                        detection = detect_carabiner(frame, roi)
+                        miss = ""
+                    except (RuntimeError, ValueError) as error:
+                        detection = None
+                        miss = str(error)
 
-                status = [
-                    f"samples {len(samples)}   camera {camera.index_or_path}",
-                    (
-                        f"pixel ({detection.centroid[0]:.0f}, {detection.centroid[1]:.0f})  "
-                        f"spine {math.degrees(detection.spine_rad):+.0f} deg"
-                        if detection is not None
-                        else f"NO DETECTION  {miss[:60]}"
-                    ),
-                ]
-                if args.no_window:
-                    key = _prompt_key(status)
-                else:
-                    _draw(frame, roi, detection, status)
-                    cv2.imshow("pixel-map collect", frame)
-                    key = cv2.waitKey(1) & 0xFF
+                    status = [
+                        f"samples {len(samples)}   camera {camera.index_or_path}",
+                        (
+                            f"pixel ({detection.centroid[0]:.0f}, {detection.centroid[1]:.0f})  "
+                            f"spine {math.degrees(detection.spine_rad):+.0f} deg"
+                            if detection is not None
+                            else f"NO DETECTION  {miss[:60]}"
+                        ),
+                    ]
+                    if args.no_window:
+                        key = _prompt_key(status)
+                    else:
+                        _draw(frame, roi, detection, status)
+                        cv2.imshow("pixel-map collect", frame)
+                        key = cv2.waitKey(1) & 0xFF
 
-                if key in {ord("q"), 27}:
-                    break
-                if key == ord("u") and samples:
-                    dropped = samples.pop()
-                    print(f"dropped sample at ({dropped.pixel[0]:.0f}, {dropped.pixel[1]:.0f})")
-                elif key == ord("c"):
-                    if detection is None:
-                        print("refused: no detection to pair with the pose")
-                        continue
-                    state = session.port.read_state()
-                    if not state.all_finite:
-                        print("refused: the arm has missing position feedback")
-                        continue
-                    samples.append(
-                        Sample(
-                            pixel=detection.centroid,
-                            joints=tuple(float(value) for value in state.positions),
-                            spine_rad=detection.spine_rad,
-                            captured_at=now_stamp(),
+                    if key in {ord("q"), 27}:
+                        break
+                    if key == ord("u") and samples:
+                        dropped = samples.pop()
+                        print(f"dropped sample at ({dropped.pixel[0]:.0f}, {dropped.pixel[1]:.0f})")
+                    elif key == ord("c"):
+                        if detection is None:
+                            print("refused: no detection to pair with the pose")
+                            continue
+                        state = session.port.read_state()
+                        if not state.all_finite:
+                            print("refused: the arm has missing position feedback")
+                            continue
+                        samples.append(
+                            Sample(
+                                pixel=detection.centroid,
+                                joints=tuple(float(value) for value in state.positions),
+                                spine_rad=detection.spine_rad,
+                                captured_at=now_stamp(),
+                            )
                         )
-                    )
-                    print(
-                        f"[{len(samples):>3}] pixel ({detection.centroid[0]:7.1f},"
-                        f" {detection.centroid[1]:7.1f})  q = "
-                        + ", ".join(f"{value:+.4f}" for value in state.positions)
-                    )
-                if controller is not None and controller.error:
-                    print(f"teleoperation stopped: {controller.error}", file=sys.stderr)
-                    break
+                        print(
+                            f"[{len(samples):>3}] pixel ({detection.centroid[0]:7.1f},"
+                            f" {detection.centroid[1]:7.1f})  q = "
+                            + ", ".join(f"{value:+.4f}" for value in state.positions)
+                        )
+                    if controller is not None and controller.error:
+                        print(f"teleoperation stopped: {controller.error}", file=sys.stderr)
+                        break
         finally:
             capture.release()
             if not args.no_window:
@@ -477,11 +508,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
         else:
             _print_fit(calibration)
     finally:
-        # Torque off, without a parting hold command. Ctrl-C during a teaching session
-        # should leave the arm limp and movable by hand, not snapped to wherever it was
-        # last told to go.
+        # The leader goes first, holding the follower where it is so it cannot drift while
+        # the bus is handed over; the session then drives it home and releases torque. On
+        # a hand-taught session (--no-teleop) the arm was never enabled, so the session
+        # skips parking and it stays limp and movable, which is what that mode is for.
         if controller is not None:
-            controller.close(hold=False)
+            controller.close()
         session.close()
     return 0
 
@@ -626,10 +658,14 @@ def cmd_track(args: argparse.Namespace) -> int:
     Speed locked and detection gated: the arm moves at most ``--max-velocity`` rad/s per
     joint, and holds whenever the detector misses, the pixel jumps, or the pixel leaves
     the calibrated region. It never coasts toward a stale target.
+
+    With ``--policy`` the servo is the *approach* rather than the whole job: once the arm
+    has actually settled on the tracked pose, tracking stops and the trained checkpoint
+    takes over from there. The two never command the arm at the same time.
     """
 
     cv2 = _cv2()
-    from everest_robot.robot.visual_tracking import TrackerStopped, VisualTracker
+    from everest_robot.robot.visual_tracking import ArrivalGate, TrackerStopped, VisualTracker
 
     calibration = PixelJointMap.load(args.config)
     if calibration.model is None:
@@ -639,9 +675,16 @@ def cmd_track(args: argparse.Namespace) -> int:
     if roi is None:
         raise PixelMapError("this calibration stored no ROI; pass --roi X Y W H")
 
+    # The checkpoint is resolved and loaded before the robot is claimed. A missing path, a
+    # checkpoint trained on a different arm, or a VLA given no task is an operator's error,
+    # and it must not cost a lease or leave an arm energized while a model downloads.
+    handle = _load_policy(args)
+    gate = ArrivalGate(tolerance_rad=args.arrive_rad, ticks=args.arrive_ticks)
+
     session = _open_session(args)
     capture = None
     tracker = None
+    result = None
     try:
         if not args.fake:
             calibration.robot.verify(_stamp_of(session))
@@ -650,6 +693,12 @@ def cmd_track(args: argparse.Namespace) -> int:
                 f"calibration joints {', '.join(calibration.joint_names)} do not match this "
                 f"arm's {', '.join(session.port.joint_names)}"
             )
+        runner, policy_cameras = (None, None) if handle is None else _policy_runner(session, args)
+        if handle is not None:
+            # Schema, identity and camera checks now, while nothing is energized: a
+            # checkpoint that cannot drive this arm should never get an approach move.
+            _refuse_incompatible_policy(runner, handle, args)
+
         capture = open_capture(camera)
         tracker = VisualTracker(
             session.port,
@@ -661,15 +710,30 @@ def cmd_track(args: argparse.Namespace) -> int:
         if not _confirm_first_target(session, calibration, capture, camera, roi, args):
             return 1
         tracker.start()
-        reasons = _track_loop(session, calibration, tracker, capture, camera, roi, args, cv2)
+        reasons, arrived = _track_loop(
+            session, calibration, tracker, capture, camera, roi, args, cv2, gate
+        )
+        if arrived and handle is not None:
+            # Hand over deliberately: stop servoing and hold, then let go of the fixed
+            # camera before the policy's cameras are opened -- they may be the same device,
+            # and a second reader gets a capture that opens and never yields a frame.
+            tracker.stop()
+            capture.release()
+            capture = None
+            if not args.no_window:
+                with contextlib.suppress(Exception):
+                    cv2.destroyAllWindows()
+            result = _run_policy(runner, policy_cameras, handle, args)
     except TrackerStopped as error:
         print(f"tracker stopped: {error}", file=sys.stderr)
         return 1
     finally:
-        # No parting hold: the session teardown below cuts torque immediately after, so
-        # a hold could only snap the arm toward its last target on the way out.
+        # Stop servoing and hold, so the arm cannot drift on a stale target while the
+        # camera and windows are torn down; the session then parks it and releases torque.
+        # Parking lives in the session rather than here so it also covers the paths this
+        # block never sees -- an exception before the tracker exists, or during teardown.
         if tracker is not None:
-            tracker.stop(hold=False)
+            tracker.stop()
         if capture is not None:
             capture.release()
         if not args.no_window:
@@ -680,7 +744,109 @@ def cmd_track(args: argparse.Namespace) -> int:
     print("\nticks by outcome:")
     for reason, count in sorted(reasons.items(), key=lambda item: -item[1]):
         print(f"  {count:>6}  {reason}")
+    if handle is not None and result is None:
+        if args.dry_run:
+            # Nothing was commanded, so the arm cannot have arrived. The checkpoint was
+            # still resolved and checked against this robot, which is what a rehearsal is.
+            print(f"\ndry run: {handle.controller} was loaded and checked, never called.")
+        else:
+            print("\nthe arm never settled on a target, so the policy was not called.")
+            return 1
+    if result is not None:
+        _print_policy_result(result)
+        return 0 if result.failure_reason is None else 1
     return 0
+
+
+# ── the policy handoff ─────────────────────────────────────────────────────────────
+def _load_policy(args: argparse.Namespace) -> Any:
+    """Load the checkpoint named on the command line, or return ``None``. No hardware."""
+
+    if not args.policy:
+        return None
+
+    from everest_robot.robot.deployment import load_policy_handle
+    from everest_robot.robot.policy import PolicyLoadError
+
+    try:
+        handle = load_policy_handle(
+            args.policy,
+            task=args.policy_task,
+            device=args.policy_device,
+            revision=args.policy_revision,
+        )
+    except PolicyLoadError as error:
+        raise PixelMapError(str(error)) from None
+    print(
+        f"policy     {handle.controller} from {handle.checkpoint}"
+        + (f'  task "{args.policy_task}"' if args.policy_task else "")
+    )
+    return handle
+
+
+def _policy_runner(session: Any, args: argparse.Namespace) -> tuple[Any, Any]:
+    """A rollout runner over the already-claimed arm, plus the cameras it will need.
+
+    The cameras are built but not connected: the fixed calibration camera is still open at
+    this point, and the rollout's cameras are only opened once it is released. They are the
+    deployment's (``EVEREST_CAMERAS``), not this calibration's -- the fixed camera is what
+    aims the arm, and the policy's own views are what it was trained on.
+    """
+
+    from everest_robot.robot.cameras import CameraRuntime
+    from everest_robot.robot.deployment import joint_frame
+    from everest_robot.robot.lerobot_bridge import RobotBridgeCore
+    from everest_robot.robot.policy import PolicyRunner
+
+    cameras = CameraRuntime.from_env()
+    bridge = RobotBridgeCore(
+        session.port, cameras=cameras, frame=joint_frame(session.parameters)
+    )
+    runner = PolicyRunner(
+        bridge,
+        session.parameters,
+        allow_non_identity_frame=args.allow_frame_offsets,
+    )
+    return runner, cameras
+
+
+def _refuse_incompatible_policy(runner: Any, handle: Any, args: argparse.Namespace) -> None:
+    """Run every check the rollout would run, without energizing anything."""
+
+    check = runner.run(handle, task=args.policy_task, fps=args.policy_fps, dry_run=True)
+    if check.failure_reason is not None:
+        raise PixelMapError(f"{check.failure_reason.value}: {check.failure_detail}")
+
+
+def _run_policy(runner: Any, cameras: Any, handle: Any, args: argparse.Namespace) -> Any:
+    """Hand the arm to the checkpoint. The tracker is already stopped and holding."""
+
+    print(f"\narrived; handing over to {handle.controller}")
+    cameras.connect()
+    try:
+        return runner.run(
+            handle,
+            task=args.policy_task,
+            fps=args.policy_fps,
+            max_steps=args.policy_steps,
+            max_duration_s=args.policy_duration,
+        )
+    finally:
+        cameras.disconnect()
+
+
+def _print_policy_result(result: Any) -> None:
+    print(f"\npolicy     {result.controller} from {result.checkpoint}")
+    print(f"ended      {result.termination.value}")
+    print(
+        f"ran        {result.steps} steps in {result.elapsed_s:.1f} s at {result.fps:g} fps "
+        f"({result.missed_deadlines} missed deadlines, "
+        f"worst step {result.max_step_latency_s * 1000:.0f} ms)"
+    )
+    if result.clipped_joints:
+        print(f"clipped    {', '.join(result.clipped_joints)}")
+    if result.failure_reason is not None:
+        print(f"failed     {result.failure_reason.value}: {result.failure_detail}", file=sys.stderr)
 
 
 def _confirm_first_target(
@@ -727,12 +893,22 @@ def _track_loop(
     roi: Sequence[int],
     args: argparse.Namespace,
     cv2: Any,
-) -> dict[str, int]:
+    gate: Any,
+) -> tuple[dict[str, int], bool]:
+    """Servo until the operator quits, the tracker stops, or the arm arrives.
+
+    Arrival only ends the loop when there is something to hand over to; without
+    ``--policy`` this tracks for as long as it is left running, which is what makes it
+    usable for eyeballing a fresh calibration.
+    """
+
     from everest_robot.robot.clock import SystemClock
 
     clock = SystemClock()
     reasons: dict[str, int] = {}
     previous: tuple[float, float] | None = None
+    hand_over = args.policy is not None
+    arrived = False
 
     with contextlib.suppress(KeyboardInterrupt):
         while tracker.stopped_reason is None:
@@ -745,6 +921,7 @@ def _track_loop(
 
             tick = tracker.tick(target, reason)
             reasons[tick.reason] = reasons.get(tick.reason, 0) + 1
+            arrived = gate.update(tick)
 
             if not args.no_window:
                 lines = [
@@ -754,6 +931,11 @@ def _track_loop(
                 ]
                 if tick.remaining_rad:
                     lines.append(f"remaining {tick.remaining_rad:.3f} rad")
+                if hand_over:
+                    lines.append(
+                        f"settled {gate.consecutive}/{gate.ticks} ticks within "
+                        f"{gate.tolerance_rad:g} rad"
+                    )
                 _draw(frame, roi, detection, lines)
                 if calibration.hull is not None:
                     _draw_hull(frame, calibration.hull)
@@ -763,11 +945,13 @@ def _track_loop(
             elif tick.index % max(1, int(args.rate)) == 0:
                 print(f"[{tick.index:>6}] {'move' if tick.moved else 'hold'}  {tick.reason}")
 
+            if arrived and hand_over:
+                break
             clock.sleep(tracker.period_s - (clock.monotonic() - started))
 
     if tracker.stopped_reason is not None:
         print(f"tracker stopped: {tracker.stopped_reason}", file=sys.stderr)
-    return reasons
+    return reasons, arrived and hand_over
 
 
 def _target_from_frame(
@@ -804,6 +988,30 @@ def _target_from_frame(
 
 
 # ── entry point ────────────────────────────────────────────────────────────────────
+def _add_park_arguments(parser: argparse.ArgumentParser) -> None:
+    """Where the arm goes before torque comes off, for the two powered subcommands.
+
+    The session enforces this on every exit path, so it is not a "when it ends cleanly"
+    option: the whole point is that an exception or a Ctrl-C is covered too.
+    """
+
+    parser.add_argument(
+        "--park",
+        default=DEFAULT_PARK_POSITION,
+        help=(
+            "approved named position the arm is driven to before torque comes off, "
+            f"however the command ends (default {DEFAULT_PARK_POSITION!r})"
+        ),
+    )
+    parser.add_argument(
+        "--no-park",
+        action="store_const",
+        const=None,
+        dest="park",
+        help="release torque where the arm stopped instead of driving it home first",
+    )
+
+
 def _add_camera_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
     parser.add_argument(
         "--camera",
@@ -891,6 +1099,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--sync-threshold", type=float, default=0.8)
     collect.add_argument("--yes", action="store_true", help="skip the enable confirmation")
+    _add_park_arguments(collect)
     collect.set_defaults(handler=cmd_collect)
 
     fit = subparsers.add_parser(
@@ -929,23 +1138,82 @@ def build_parser() -> argparse.ArgumentParser:
         help="consecutive good detections required before motion resumes",
     )
     track.add_argument("--max-jump-px", type=float, default=DEFAULT_MAX_JUMP_PX)
+    _add_park_arguments(track)
     track.add_argument(
         "--no-roll-tracking", action="store_true", help="leave wrist roll where it is"
     )
     track.add_argument(
-        "--dry-run", action="store_true", help="run the whole loop without energizing the arm"
+        "--dry-run", action="store_true",
+        help="run the whole loop without energizing the arm. The arm never arrives, so a "
+             "--policy is loaded and checked but never called.",
     )
     track.add_argument("--no-window", action="store_true")
     track.add_argument("--yes", action="store_true", help="skip the enable confirmation")
+    _add_policy_arguments(track)
     track.set_defaults(handler=cmd_track)
     return parser
 
 
+def _add_policy_arguments(parser: argparse.ArgumentParser) -> None:
+    """The handoff: what runs after the approach, and when the approach counts as done."""
+
+    parser.add_argument(
+        "--policy",
+        help="MOVES THE ARM: a trained LeRobot checkpoint (a local directory or a hub id) "
+             "handed the arm once it settles on the tracked pose. ACT, SmolVLA and any "
+             "other architecture load through the same path -- the checkpoint names its "
+             "own. Without this the loop just tracks.",
+    )
+    parser.add_argument(
+        "--policy-task",
+        help="the language instruction the checkpoint was trained with. Required for a "
+             "language-conditioned policy (SmolVLA, pi0); ignored by ACT.",
+    )
+    parser.add_argument(
+        "--policy-fps", type=float, default=None,
+        help="rollout rate; must be the rate the checkpoint was trained at "
+             "(default: the parameters file's policy.fps)",
+    )
+    parser.add_argument(
+        "--policy-steps", type=int, default=None, help="stop the rollout after this many steps"
+    )
+    parser.add_argument(
+        "--policy-duration", type=float, default=None,
+        help="stop the rollout after this many seconds "
+             "(default: the parameters file's policy.max_duration_s)",
+    )
+    parser.add_argument(
+        "--policy-device", default=None,
+        help="torch device for inference; defaults to EVEREST_POLICY_DEVICE, then to the "
+             "checkpoint's own config",
+    )
+    parser.add_argument("--policy-revision", default=None, help="hub revision of the checkpoint")
+    parser.add_argument(
+        "--allow-frame-offsets", action="store_true",
+        help="acknowledge that this arm's lerobot_frame has non-zero offsets and that the "
+             "checkpoint was trained in that frame. See docs/lerobot-frame-reconciliation.md.",
+    )
+    parser.add_argument(
+        "--arrive-rad", type=float, default=DEFAULT_ARRIVE_RAD,
+        help="how close every joint's measured position must be to the tracked target "
+             f"before the policy is called (default {DEFAULT_ARRIVE_RAD})",
+    )
+    parser.add_argument(
+        "--arrive-ticks", type=int, default=DEFAULT_ARRIVE_TICKS,
+        help=f"consecutive settled ticks the arrival needs (default {DEFAULT_ARRIVE_TICKS})",
+    )
+
+
 def main() -> None:
+    from everest_robot.robot.routing import RouteRefused
+
     args = build_parser().parse_args()
     try:
         raise SystemExit(args.handler(args))
-    except PixelMapError as error:
+    # A --park name this arm does not have is refused in the session constructor, before
+    # the claim. It is an operator's typo, so it gets an operator's message rather than a
+    # traceback out of a teardown they have not reached yet.
+    except (PixelMapError, RouteRefused) as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         raise SystemExit(1) from None
 
