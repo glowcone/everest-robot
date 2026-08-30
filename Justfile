@@ -7,8 +7,9 @@
 #   attach-carabiner  the carabiner attachment state machine  (just start)
 #   replay-session    replay of a stored dataset episode      (just replay ...)
 #
-# Anything that can move a real arm is grouped under "replay" and "robot", and every one of
-# those recipes is safe to read before it is safe to run: see docs/session-replay.md.
+# Anything that can move a real arm is grouped under "replay", and every one of those
+# recipes is safe to read before it is safe to run: see docs/session-replay.md. The "robot"
+# group is read-only: those recipes claim the arm but never energize it.
 
 set dotenv-load
 
@@ -31,6 +32,25 @@ setup-hardware:
 [group('setup')]
 config:
     uv run robot-config
+
+# ── robot ──────────────────────────────────────────────────────────────────────────
+# Read-only instruments. They claim the arm, so a worker cannot be holding it, but they
+# never enable the motors and never command a target.
+
+# Watch every joint's encoder feedback in a TUI. Claims the arm; enables nothing.
+[group('robot')]
+monitor poll_hz="10":
+    uv run robot-monitor --poll-hz {{ poll_hz }}
+
+# Print one joint-feedback snapshot as plain text. Redirect it next to a captured pose.
+[group('robot')]
+monitor-once:
+    uv run robot-monitor --once
+
+# Show the TUI against the deterministic fake arm. No CAN, no claim, no real numbers.
+[group('robot')]
+monitor-fake:
+    uv run robot-monitor --fake
 
 # ── database ───────────────────────────────────────────────────────────────────────
 

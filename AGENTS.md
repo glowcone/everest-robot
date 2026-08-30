@@ -1,7 +1,8 @@
 # Repository guidance
 
 Use `just` as the primary interface for development and operations. Run `just` to list the
-recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `database`
+recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robot`
+(`monitor`, `monitor-once`, `monitor-fake` -- read-only), `database`
 (`db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
@@ -58,6 +59,10 @@ Absurd checkpoints store.
   A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
   backend, parameters path). Do not read the environment anywhere else in the runtime.
+- `monitor.py` is read-only and must stay that way: it calls `read_state()` and `limits()`
+  and nothing else. It claims the lease because reading a connected arm makes the driver
+  poll the bus. Its terminal rendering lives in `everest_robot.monitor`; keep derivation in
+  the runtime module so it stays testable against `FakeArm`.
 
 ## Working on workflow components
 
@@ -92,7 +97,8 @@ task-level retries for transient failures. Long-running model or motion calls mu
 heartbeats often enough to retain their worker claim.
 
 The CLI entry points are `src/everest_robot/client.py`,
-`src/everest_robot/worker.py`, and `src/everest_robot/database.py`. Keep hardware-specific
+`src/everest_robot/worker.py`, `src/everest_robot/database.py`, and
+`src/everest_robot/monitor.py`. Keep hardware-specific
 configuration out of these modules; pass selection and tuning data through validated task
 parameters or environment-backed configuration.
 

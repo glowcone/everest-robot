@@ -104,6 +104,34 @@ dataset carries no record of which arm produced it, so someone has to say so. An
 interrupted replay is never restarted automatically — see the recovery notes in the replay
 doc.
 
+### Reading the joints
+
+`just monitor` opens a terminal display of every joint's encoder feedback: the angle in
+radians and degrees, how far it has moved since a marked reference, velocity, torque,
+temperature, and where the joint sits inside the driver's soft limits.
+
+```bash
+just monitor          # the TUI, polling at 10 Hz
+just monitor 2        # slower, when you only want to watch one number settle
+just monitor-once     # one snapshot as plain text; redirect it next to a captured pose
+just monitor-fake     # the display against the deterministic fake arm, no hardware
+```
+
+Keys: `q` quit, `z` mark the current pose as the reference deltas are measured from, `Z`
+clear it, `space` pause.
+
+It reads and nothing else — it never enables the motors and never sends a target — so it
+is the right tool for step 1 of
+[`docs/named-position-capture.md`](docs/named-position-capture.md), where the arm is moved
+by hand with motors disabled and the pose is read back. Press `z` at the start of a
+measurement and the `d deg` column reports exactly how far each joint has been moved.
+
+It does claim the robot lease, which is not a formality: reading feedback from a connected
+arm makes the driver poll the CAN bus, so the monitor is a bus participant rather than a
+passive tap. Run it *instead of* a worker, not alongside one. A joint whose feedback
+counter stops advancing is flagged `QUIET`, which is a different failure from a value that
+is fresh but wrong.
+
 ### Configuration
 
 Two files hold *robot behaviour*, and both are versioned:
@@ -139,6 +167,7 @@ The runtime prefers refusing to guessing, so most surprises are a deliberate che
 | `is not a full 40-character commit SHA` | Replay pins immutable revisions; a branch name would replay different motion on different days. |
 | `parameters do not match the connected arm` | The calibration identity in the parameters file differs from the deployment's. Presets and datasets from another calibration describe different physical poses. |
 | `lies outside the active limits` | The episode leaves the driver's soft limits by more than the configured tolerance. The preflight report says by how much and on which joint. |
+| `is claimed by another worker` / `by another process` | Something else holds the robot lease. `just monitor` takes it too; only one process may own the arm. |
 | `maker_arm is not installed` | `just setup-hardware`. |
 | `NotImplementedError` from a workflow stage | That stage has no hardware implementation yet — see Integration points below. |
 
@@ -157,8 +186,8 @@ every layer has a deterministic fake.
 
 `src/everest_robot/robot/` holds the runtime that drives a real Maker Arm: an exclusive
 lease and session lifecycle, a strictly validated robot parameters file, bounded motion
-between operator-approved named positions, LeRobot's `Robot` contract over the arm, and a
-synchronous policy rollout runner. The production driver decision is recorded in
+between operator-approved named positions, LeRobot's `Robot` contract over the arm, a
+synchronous policy rollout runner, and the read-only joint monitor behind `just monitor`. The production driver decision is recorded in
 [`docs/adr/0001-production-motor-protocol.md`](docs/adr/0001-production-motor-protocol.md):
 the arm keeps running maker-arm-sdk's RobStride private protocol, which stays the hardware
 safety boundary.

@@ -185,17 +185,23 @@ class FakeArm:
         now = self.clock.monotonic()
         elapsed = max(0.0, now - self._last_integration_s)
         self._last_integration_s = now
-        if elapsed == 0.0 or self._lifecycle is not ArmLifecycle.ENABLED:
+        if elapsed == 0.0 or self._lifecycle is ArmLifecycle.DISCONNECTED:
             return
 
-        step = self.max_velocity_rad_s * elapsed
-        for index, (position, target) in enumerate(zip(self.positions, self._targets, strict=True)):
-            delta = target - position
-            if delta == 0.0:
-                continue
-            self.positions[index] = position + math.copysign(min(abs(delta), step), delta)
-        # Real motors report on every control tick whether or not they moved; freshness is
-        # what the layer above checks, so the counters advance either way.
+        if self._lifecycle is ArmLifecycle.ENABLED:
+            step = self.max_velocity_rad_s * elapsed
+            for index, (position, target) in enumerate(
+                zip(self.positions, self._targets, strict=True)
+            ):
+                delta = target - position
+                if delta == 0.0:
+                    continue
+                self.positions[index] = position + math.copysign(min(abs(delta), step), delta)
+        # Real motors report on every control tick whether or not they moved, and the
+        # driver polls the bus while merely connected (see MakerArmPort.read_state), so the
+        # counters advance in every connected state -- not only under torque. Freshness is
+        # what the layer above checks, so getting this wrong would make a read-only
+        # observer of a disabled arm see staleness that the real driver never reports.
         self._bump_feedback()
 
     def _bump_feedback(self) -> None:
