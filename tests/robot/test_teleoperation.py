@@ -110,6 +110,34 @@ def test_mapping_outside_follower_limits_is_rejected_before_enable() -> None:
     assert not leader.connected
 
 
+def test_gripper_mapping_past_its_limit_is_clamped_not_refused() -> None:
+    """Closing a MakerMod gripper commands past the object on purpose (stall grip).
+
+    The Star gripper mapping rests exactly on the follower's soft limit, so squeezing
+    the leader always maps past it; that must clamp, while an arm joint outside its
+    limits still refuses (see test above).
+    """
+
+    arm = connected_arm()
+    leader = FakeLeader({0: 0.0, 1: -1.0, 2: 0.5})
+    controller = TeleoperationController(
+        arm, leader, IdentityMapper(), rate_hz=100.0, max_velocity_rad_s=0.2
+    )
+
+    difference = controller.connect_and_measure()
+    assert difference == pytest.approx(0.5)  # gripper clamped from +0.5 to its 0.0 limit
+
+    controller.start()
+    time.sleep(0.04)
+    controller.stop()
+
+    assert controller.error is None
+    assert arm.sent_commands
+    # Every gripper command stays at or inside the clamped limit.
+    assert all(command[2] <= 0.0 + 1e-9 for command in arm.sent_commands)
+    controller.close()
+
+
 def test_persistent_leader_loss_stops_and_holds() -> None:
     arm = connected_arm()
     leader = FakeLeader()

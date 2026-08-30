@@ -18,6 +18,14 @@ maker-arm-sdk, per the ADR:
 The teleoperation loop mitigates these at its level: it calls
 :meth:`hold_current_position` on any failure and torque is released on disconnect.
 
+**Concurrency.** The calibration monitor reads feedback on the TUI thread while the
+teleoperation loop commands on its own thread. ``RobstrideMotorsBus`` (and the slcan
+serial line under it) is not thread-safe -- interleaved ``recv()`` calls shear frames
+apart and desync the slcan parser -- so every bus operation here is serialized behind one
+lock. slcan line garbage (a torn frame surfaces as ``ValueError`` from python-can) is
+treated as "no feedback for this sample", never as a crash, and the RX queue is flushed
+at connect and before the enable gate to drop residue from a previous session.
+
 **Frame.** The bus speaks degrees in the LeRobot zero pose; the port contract is radians in
 maker-arm calibrated coordinates. Conversion goes through the
 :class:`~everest_robot.robot.lerobot_bridge.JointFrame` built from the parameters file's
@@ -32,6 +40,7 @@ frame is refused outright: it would command a wrong pose.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -103,6 +112,9 @@ class RobstrideMitPort:
                 "file and the MakerFollower tables are describing different arms"
             )
         self._bus = bus
+        # One lock around every bus operation: the TUI thread reads feedback while the
+        # teleoperation thread commands, and neither the bus nor slcan tolerates that.
+        self._bus_lock = threading.RLock()
         self._identity = identity
         self._frame = frame
         self._limits_deg = {name: limits_deg[name] for name in identity.joint_names}
@@ -147,6 +159,14 @@ class RobstrideMitPort:
             )
 
         motor_class, norm_mode, bus_class, config_class, motor_models = load_lerobot_mit()
+
+        # The bus logs dropped replies and missed responses as warnings on stderr,
+        # which scribbles over the curses TUI. The monitor already reports the same
+        # conditions structurally (nan positions, stale feedback counters), so only
+        # errors keep the console.
+        import logging
+
+        logging.getLogger("lerobot.motors.robstride.robstride").setLevel(logging.ERROR)
         config = config_class()
         unknown = [
             name
@@ -216,7 +236,11 @@ class RobstrideMitPort:
     def connect(self, timeout: float = 2.0) -> None:
         # The bus's handshake carries its own per-motor timeout; ``timeout`` is part of
         # the port contract but has no finer-grained hook here.
-        self._bus.connect(handshake=True)
+        with self._bus_lock:
+            self._bus.connect(handshake=True)
+            # Drop residual frames a previous session left on the adapter: a partial
+            # slcan line desyncs python-can's parser into ValueError on the first read.
+            self._flush_rx()
         self._lifecycle = ArmLifecycle.CONNECTED
         self._fault_reason = None
 
@@ -224,11 +248,17 @@ class RobstrideMitPort:
         if self._lifecycle is ArmLifecycle.DISCONNECTED:
             return
         try:
-            self._bus.disconnect(disable_torque=True)
+            with self._bus_lock:
+                self._bus.disconnect(disable_torque=True)
         finally:
             self._lifecycle = ArmLifecycle.DISCONNECTED
             self._turn_offsets_deg = dict.fromkeys(self.joint_names, 0.0)
             self._last_positions_rad = None
+
+    def _flush_rx(self) -> None:
+        flush = getattr(self._bus, "flush_rx_queue", None)
+        if flush is not None:
+            flush()
 
     def enable(self) -> None:
         """Write gains, reconcile whole-turn encoder wraps, gate on limits, arm.
@@ -242,48 +272,53 @@ class RobstrideMitPort:
         if self._lifecycle is not ArmLifecycle.CONNECTED:
             raise RuntimeError(f"cannot enable from {self._lifecycle}")
 
-        # Gains ride along in every MIT frame; the bus default kp=10 is far too soft to
-        # hold the arm against gravity, so they must be stored before the first command.
-        self._bus.sync_write("Kp", {name: kp for name, (kp, _) in self._gains.items()})
-        self._bus.sync_write("Kd", {name: kd for name, (_, kd) in self._gains.items()})
+        with self._bus_lock:
+            # Gains ride along in every MIT frame; the bus default kp=10 is far too soft
+            # to hold the arm against gravity, so they must be stored before the first
+            # command.
+            self._bus.sync_write("Kp", {name: kp for name, (kp, _) in self._gains.items()})
+            self._bus.sync_write("Kd", {name: kd for name, (_, kd) in self._gains.items()})
 
-        problems: list[str] = []
-        offsets = dict.fromkeys(self.joint_names, 0.0)
-        for name in self.joint_names:
-            raw = float(self._bus.read("Present_Position", name))
-            low, high = self._limits_deg[name]
-            low, high = low - WRAP_GRACE_DEG, high + WRAP_GRACE_DEG
-            if low <= raw <= high:
-                continue
-            for shift in (-FULL_TURN_DEG, FULL_TURN_DEG):
-                if low <= raw + shift <= high:
-                    offsets[name] = shift
-                    break
-            else:
-                problems.append(
-                    f"{name} reads {raw:+.1f} deg, outside its soft limits "
-                    f"{self._limits_deg[name]} and not by a whole turn"
+            self._flush_rx()
+            problems: list[str] = []
+            offsets = dict.fromkeys(self.joint_names, 0.0)
+            for name in self.joint_names:
+                raw = float(self._bus.read("Present_Position", name))
+                low, high = self._limits_deg[name]
+                low, high = low - WRAP_GRACE_DEG, high + WRAP_GRACE_DEG
+                if low <= raw <= high:
+                    continue
+                for shift in (-FULL_TURN_DEG, FULL_TURN_DEG):
+                    if low <= raw + shift <= high:
+                        offsets[name] = shift
+                        break
+                else:
+                    problems.append(
+                        f"{name} reads {raw:+.1f} deg, outside its soft limits "
+                        f"{self._limits_deg[name]} and not by a whole turn"
+                    )
+            if problems:
+                raise RuntimeError(
+                    "refusing to enable: " + "; ".join(problems) + ". The motor zero no "
+                    "longer matches the calibration pose; re-zero the arm before enabling."
                 )
-        if problems:
-            raise RuntimeError(
-                "refusing to enable: " + "; ".join(problems) + ". The motor zero no "
-                "longer matches the calibration pose; re-zero the arm before enabling."
-            )
 
-        self._turn_offsets_deg = offsets
-        self._bus.enable_torque()
+            self._turn_offsets_deg = offsets
+            self._bus.enable_torque()
         self._lifecycle = ArmLifecycle.ENABLED
 
     def disable(self) -> None:
         if self._lifecycle is ArmLifecycle.ENABLED:
-            self._bus.disable_torque()
+            with self._bus_lock:
+                self._bus.disable_torque()
             self._lifecycle = ArmLifecycle.CONNECTED
 
     def estop(self) -> None:
         if self._lifecycle is ArmLifecycle.DISCONNECTED:
             return
         try:
-            self._bus.disable_torque()
+            with self._bus_lock:
+                self._bus.disable_torque()
         finally:
             if self._lifecycle is ArmLifecycle.ENABLED:
                 self._lifecycle = ArmLifecycle.CONNECTED
@@ -293,8 +328,9 @@ class RobstrideMitPort:
             return
         # update_motor_state re-queries via CLEAR_FAULT and raises if a motor still
         # reports a fault, so reaching the end of the loop is the all-clear.
-        for name in self.joint_names:
-            self._bus.update_motor_state(name)
+        with self._bus_lock:
+            for name in self.joint_names:
+                self._bus.update_motor_state(name)
         self._fault_reason = None
         self._lifecycle = ArmLifecycle.CONNECTED
 
@@ -312,8 +348,10 @@ class RobstrideMitPort:
 
         The bus caches per-motor state for ~20 ms and refreshes lazily on read, so this
         is one request/reply per stale motor. A motor that reports a fault moves the
-        port to ``FAULT``; a motor that does not reply yields ``nan`` for this sample,
-        which is the contract's "no feedback" value, not a fault.
+        port to ``FAULT``; a motor that does not reply -- or whose reply arrives torn
+        (slcan line garbage surfaces as ``ValueError``/``OSError`` from python-can) --
+        yields ``nan`` for this sample, which is the contract's "no feedback" value,
+        not a fault.
         """
 
         degrees: list[float] = []
@@ -321,34 +359,35 @@ class RobstrideMitPort:
         torques: list[float] = []
         temperatures: list[float] = []
         fault_bits: list[int] = []
-        for name in self.joint_names:
-            try:
-                position = float(self._bus.read("Present_Position", name))
-                velocity = float(self._bus.read("Present_Velocity", name))
-                torque = float(self._bus.read("Present_Torque", name))
-                temperature = float(self._bus.read("Temperature_MOS", name))
-                fault = 0
-            except RuntimeError as error:
-                self._lifecycle = ArmLifecycle.FAULT
-                self._fault_reason = f"{name}: {error}"
-                position = velocity = torque = temperature = math.nan
-                fault = 1
-            except ConnectionError:
-                position = velocity = torque = temperature = math.nan
-                fault = 0
-            degrees.append(position + self._turn_offsets_deg[name])
-            velocities.append(math.radians(velocity))
-            torques.append(torque)
-            temperatures.append(temperature)
-            fault_bits.append(fault)
-
         sequence: list[int] = []
-        for name in self.joint_names:
-            fed_back = self._bus.last_feedback_time.get(name)
-            if fed_back is not None and fed_back != self._feedback_seen[name]:
-                self._sequence[name] += 1
-                self._feedback_seen[name] = fed_back
-            sequence.append(self._sequence[name])
+        with self._bus_lock:
+            for name in self.joint_names:
+                try:
+                    position = float(self._bus.read("Present_Position", name))
+                    velocity = float(self._bus.read("Present_Velocity", name))
+                    torque = float(self._bus.read("Present_Torque", name))
+                    temperature = float(self._bus.read("Temperature_MOS", name))
+                    fault = 0
+                except RuntimeError as error:
+                    self._lifecycle = ArmLifecycle.FAULT
+                    self._fault_reason = f"{name}: {error}"
+                    position = velocity = torque = temperature = math.nan
+                    fault = 1
+                except (ConnectionError, ValueError, OSError):
+                    position = velocity = torque = temperature = math.nan
+                    fault = 0
+                degrees.append(position + self._turn_offsets_deg[name])
+                velocities.append(math.radians(velocity))
+                torques.append(torque)
+                temperatures.append(temperature)
+                fault_bits.append(fault)
+
+            for name in self.joint_names:
+                fed_back = self._bus.last_feedback_time.get(name)
+                if fed_back is not None and fed_back != self._feedback_seen[name]:
+                    self._sequence[name] += 1
+                    self._feedback_seen[name] = fed_back
+                sequence.append(self._sequence[name])
 
         positions = self._frame.to_radians(degrees)
         self._last_positions_rad = positions
@@ -376,11 +415,18 @@ class RobstrideMitPort:
         command = clip_to_limits(values, self.limits())
         self.last_command = command
         degrees = self._frame.to_degrees(command.targets)
-        self._bus.sync_write(
-            "Goal_Position",
-            {
-                name: value - self._turn_offsets_deg[name]
-                for name, value in zip(self.joint_names, degrees, strict=True)
-            },
-        )
+        try:
+            with self._bus_lock:
+                # One motor at a time, each waiting for its own reply, mirroring
+                # MakerFollower: a 7-frame burst overflows the CANable's shallow RX
+                # FIFO and drops replies (the bus then logs straight over the TUI).
+                for name, value in zip(self.joint_names, degrees, strict=True):
+                    self._bus.write(
+                        "Goal_Position", name, value - self._turn_offsets_deg[name]
+                    )
+        except (ConnectionError, ValueError, OSError):
+            # A torn slcan line or a dropped reply mid-send. The motors already
+            # commanded keep their frame; reporting a refusal lets the caller hold and
+            # retry rather than trusting a command that may not have gone out in full.
+            return False
         return True

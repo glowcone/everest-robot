@@ -33,12 +33,22 @@ class LeaderPort(Protocol):
 
 
 class Star102LeaderPort:
-    """Star Arm 102 UART bus, exposing only reliable servo readings."""
+    """Star Arm 102 UART bus, exposing every servo that answered this cycle.
+
+    The library's ``reliable`` flag is not used to gate readings: its glitch filter
+    treats a raw angle of ~0 deg as a suspected power-cycle glitch, so a joint genuinely
+    resting at zero -- which is how a leader arm sits -- is flagged unreliable forever
+    (measured on this arm: servos parked at 0.0 deg read 4% "reliable", the same servos
+    bent read 100%). Loss detection uses per-servo ``read_angle`` instead, which raises
+    when a servo truly does not answer; a missing servo is simply absent from the
+    returned mapping and the controller's leader-loss timeout does the rest.
+    """
 
     def __init__(self, port: str, servo_ids: Sequence[int] = tuple(range(7))) -> None:
         self.port = port
         self._servo_ids = tuple(int(value) for value in servo_ids)
         self._bus: Any = None
+        self._bus_error: type[Exception] = Exception
 
     @property
     def servo_ids(self) -> tuple[int, ...]:
@@ -46,22 +56,28 @@ class Star102LeaderPort:
 
     def connect(self) -> None:
         try:
-            from motorbridge_smart_servo import FashionStarServo
+            from motorbridge_smart_servo import FashionStarServo, ServoBusError
         except ImportError as error:  # pragma: no cover - hardware-extra failure
             raise RuntimeError(
                 "motorbridge-smart-servo is unavailable; run `just setup-hardware`"
             ) from error
+        self._bus_error = ServoBusError
         self._bus = FashionStarServo(self.port, baudrate=1_000_000)
+        # The native layer raises after N consecutive misses on its own; disable that so
+        # loss policy lives in one place, the controller's leader-loss timeout.
+        self._bus.set_loss_threshold(0)
 
     def read_positions(self) -> Mapping[int, float]:
         if self._bus is None:
             raise RuntimeError("the Star leader is not connected")
-        data = self._bus.sync_monitor(list(self._servo_ids))
-        return {
-            servo_id: float(data[servo_id].angle_deg)
-            for servo_id in self._servo_ids
-            if data.get(servo_id) is not None and data[servo_id].reliable
-        }
+        readings: dict[int, float] = {}
+        for servo_id in self._servo_ids:
+            try:
+                sample = self._bus.read_angle(servo_id, multi_turn=True)
+            except self._bus_error:
+                continue  # no answer this cycle; the loss timeout accounts for it
+            readings[servo_id] = float(sample.raw_deg)
+        return readings
 
     def disconnect(self) -> None:
         bus, self._bus = self._bus, None
@@ -93,6 +109,7 @@ class TeleoperationController:
         rate_hz: float = 25.0,
         max_velocity_rad_s: float = 0.25,
         leader_loss_timeout_s: float = 0.5,
+        clamp_joints: Sequence[str] = ("gripper",),
     ) -> None:
         if rate_hz <= 0 or not math.isfinite(rate_hz):
             raise ValueError("rate_hz must be finite and positive")
@@ -106,6 +123,7 @@ class TeleoperationController:
         self.rate_hz = float(rate_hz)
         self.max_velocity_rad_s = float(max_velocity_rad_s)
         self.leader_loss_timeout_s = float(leader_loss_timeout_s)
+        self.clamp_joints = frozenset(clamp_joints)
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._thread: threading.Thread | None = None
@@ -226,17 +244,32 @@ class TeleoperationController:
                 self.follower.hold_current_position()
 
     def _mapped_targets(self, readings: Mapping[int, float]) -> tuple[float, ...]:
-        targets = tuple(float(value) for value in self.mapper.map(dict(readings)))
-        if len(targets) != len(self.follower.joint_names):
+        """Map leader readings to follower joint targets, gated by the soft limits.
+
+        An arm joint mapping outside the follower's limits is refused: the fixed Star
+        mapping should never produce it, so it means the mapping or the frame is wrong.
+        Joints in ``clamp_joints`` (the gripper) are clamped instead: closing a MakerMod
+        gripper deliberately commands a position past the object so the motor stalls
+        compliantly (grip force is kp times position error), and the gripper mapping's
+        rest point sits exactly on the follower's soft limit, so squeezing the leader
+        always maps past it. The follower clamps to its own limits regardless; clamping
+        here just applies the same policy before the gate.
+        """
+
+        mapped = tuple(float(value) for value in self.mapper.map(dict(readings)))
+        if len(mapped) != len(self.follower.joint_names):
             raise RuntimeError(
-                f"Star mapping produced {len(targets)} joints; follower expects "
+                f"Star mapping produced {len(mapped)} joints; follower expects "
                 f"{len(self.follower.joint_names)}"
             )
-        violations = [
-            limit.name
-            for target, limit in zip(targets, self.follower.limits(), strict=True)
-            if not math.isfinite(target) or not limit.contains(target)
-        ]
+        targets: list[float] = []
+        violations: list[str] = []
+        for target, limit in zip(mapped, self.follower.limits(), strict=True):
+            if math.isfinite(target) and limit.name in self.clamp_joints:
+                target = limit.clamp(target)
+            if not math.isfinite(target) or not limit.contains(target):
+                violations.append(limit.name)
+            targets.append(target)
         if violations:
             raise RuntimeError(f"Star mapping is outside follower limits: {', '.join(violations)}")
-        return targets
+        return tuple(targets)

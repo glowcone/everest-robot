@@ -9,6 +9,8 @@ ADR addendum, not here.
 from __future__ import annotations
 
 import math
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +47,10 @@ class StubBus:
     torque_enabled: bool = False
     faulted: dict[str, str] = field(default_factory=dict)
     silent: set[str] = field(default_factory=set)
+    # slcan line garbage: python-can's parser raises ValueError on a torn frame.
+    garbled: set[str] = field(default_factory=set)
+    fail_writes: bool = False
+    flushes: int = 0
     goal_writes: list[dict[str, float]] = field(default_factory=list)
     gain_writes: dict[str, dict[str, float]] = field(default_factory=dict)
     last_feedback_time: dict[str, float | None] = field(
@@ -66,13 +72,26 @@ class StubBus:
     def disable_torque(self) -> None:
         self.torque_enabled = False
 
+    def flush_rx_queue(self) -> int:
+        self.flushes += 1
+        return 0
+
     def sync_write(self, data_name: str, values: dict[str, float]) -> None:
-        if data_name in ("Kp", "Kd"):
-            self.gain_writes[data_name] = dict(values)
-        elif data_name == "Goal_Position":
-            self.goal_writes.append(dict(values))
-        else:  # pragma: no cover - would be a port bug
+        if data_name not in ("Kp", "Kd"):  # pragma: no cover - would be a port bug
             raise ValueError(data_name)
+        self.gain_writes[data_name] = dict(values)
+
+    def write(self, data_name: str, motor: str, value: float) -> None:
+        if data_name != "Goal_Position":  # pragma: no cover - would be a port bug
+            raise ValueError(data_name)
+        if self.fail_writes:
+            raise ValueError("invalid literal for int() with base 16: '0tFD8057'")
+        self._check(motor)
+        # The port writes each joint once per send, in order; a repeated motor name
+        # therefore starts the next command.
+        if not self.goal_writes or motor in self.goal_writes[-1]:
+            self.goal_writes.append({})
+        self.goal_writes[-1][motor] = value
 
     def read(self, data_name: str, motor: str) -> float:
         self._check(motor)
@@ -96,6 +115,8 @@ class StubBus:
             raise RuntimeError(self.faulted[motor])
         if motor in self.silent:
             raise ConnectionError(f"no response from {motor}")
+        if motor in self.garbled:
+            raise ValueError("invalid literal for int() with base 16: '0tFD8057'")
 
 
 def make_port(**overrides: Any) -> RobstrideMitPort:
@@ -362,3 +383,83 @@ def test_clear_faults_stays_in_fault_while_a_motor_still_reports_one() -> None:
     with pytest.raises(RuntimeError):
         port.clear_faults()
     assert port.lifecycle is ArmLifecycle.FAULT
+
+
+# ── slcan robustness ───────────────────────────────────────────────────────────────
+def test_connect_and_enable_flush_residue_from_a_previous_session() -> None:
+    port = make_port()
+    port.connect()
+    assert port._bus.flushes == 1
+    port.enable()
+    assert port._bus.flushes == 2
+
+
+def test_a_torn_slcan_frame_reads_nan_without_crashing_or_faulting() -> None:
+    port = make_port(garbled={"shoulder_lift"})
+    port.connect()
+    state = port.read_state()
+
+    assert math.isnan(state.positions[1])
+    assert state.lifecycle is ArmLifecycle.CONNECTED
+    assert not state.has_fault
+
+
+def test_a_torn_slcan_frame_during_a_command_reports_a_refusal() -> None:
+    port = enabled_port()
+    port._bus.fail_writes = True
+
+    assert port.send_targets(FRAME.to_radians([-100.0, -60.0, -10.0])) is False
+
+
+def test_concurrent_reads_and_commands_are_serialized_on_the_bus() -> None:
+    """The TUI thread polls read_state while the teleop thread sends targets.
+
+    The bus (and the slcan serial line under it) is not reentrant: interleaved recv()
+    calls shear frames apart, which is exactly the crash seen on hardware. The stub
+    fails the test if two threads are ever inside it at once.
+    """
+
+    port = enabled_port()
+    bus = port._bus
+    entered = threading.Lock()
+    overlaps: list[str] = []
+
+    original_read, original_write = bus.read, bus.write
+
+    def guarded(call: Any, *args: Any) -> Any:
+        if not entered.acquire(blocking=False):
+            overlaps.append("concurrent bus access")  # pragma: no cover - the failure
+            return call(*args)
+        try:
+            time.sleep(0.0002)
+            return call(*args)
+        finally:
+            entered.release()
+
+    bus.read = lambda *args: guarded(original_read, *args)
+    bus.write = lambda *args: guarded(original_write, *args)
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+    targets = FRAME.to_radians([-100.0, -60.0, -10.0])
+
+    def hammer(action: Any) -> None:
+        try:
+            while not stop.is_set():
+                action()
+        except BaseException as error:  # pragma: no cover - the failure
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=hammer, args=(port.read_state,)),
+        threading.Thread(target=hammer, args=(lambda: port.send_targets(targets),)),
+    ]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.15)
+    stop.set()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert overlaps == []
+    assert errors == []
