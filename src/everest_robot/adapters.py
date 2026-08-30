@@ -20,6 +20,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from everest_robot.attachment_fsm import (
+    AttachmentState,
+    ClipRLStep,
+    InitialObservation,
+    SearchCVStep,
+    SearchRLStep,
+)
 from everest_robot.domain import (
     AttachmentResult,
     CarabinerPickupResult,
@@ -27,6 +34,7 @@ from everest_robot.domain import (
     RecoveryTarget,
     VerificationResult,
 )
+from everest_robot.robot.contracts import ArmLifecycle
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from everest_robot.domain import ReplayRequest, ReplayResult
@@ -78,6 +86,123 @@ class ScaffoldRobot:
                 reason="scaffolded verification failure",
             )
         return VerificationResult(secure=True, confidence=0.99)
+
+
+@dataclass
+class ScaffoldAttachmentFSMHandlers:
+    """Deterministic no-hardware implementation for the standalone FSM entrypoint."""
+
+    initial_detection: bool = False
+    entered: list[AttachmentState] = field(default_factory=list)
+    hold_reasons: list[str] = field(default_factory=list)
+
+    def enter_state(
+        self, state: AttachmentState, previous: AttachmentState | None
+    ) -> None:
+        del previous
+        self.entered.append(state)
+
+    def observe_initial(self) -> InitialObservation:
+        confidence = 0.99 if self.initial_detection else None
+        return InitialObservation(False, self.initial_detection, confidence)
+
+    def search_rl_step(self) -> SearchRLStep:
+        return SearchRLStep(carabiner_detected=True, confidence=0.99)
+
+    def search_cv_step(self) -> SearchCVStep:
+        return SearchCVStep(
+            target_visible=True,
+            followed=True,
+            confidence=0.99,
+            pixel_error=0.0,
+        )
+
+    def clip_rl_step(self) -> ClipRLStep:
+        return ClipRLStep(
+            attachment_verified=True,
+            carabiner_visible=False,
+            carabiner_grasped=True,
+            confidence=0.99,
+        )
+
+    def hold(self, reason: str) -> None:
+        self.hold_reasons.append(reason)
+
+
+@dataclass
+class EverestAttachmentFSMHandlers:
+    """Production integration surface for ADR-0003.
+
+    Every method deliberately refuses until its owning subsystem is integrated. Keeping
+    these stubs on the hardware adapter makes it impossible for orchestration to import a
+    camera, policy implementation, or motor driver directly.
+    """
+
+    session: RobotSession
+
+    def enter_state(
+        self, state: AttachmentState, previous: AttachmentState | None
+    ) -> None:
+        del previous
+        if state in {AttachmentState.SEARCH_RL, AttachmentState.CLIP_RL}:
+            raise NotImplementedError(
+                f"{state.value} entry needs a persistent one-action policy session that "
+                "resets from the current post-transition observation; do not emulate it "
+                "with PolicyRunner.run(max_steps=1)"
+            )
+
+    def observe_initial(self) -> InitialObservation:
+        raise NotImplementedError(
+            "INITIAL needs one coherent camera observation plus non-moving attachment "
+            "verification; integrate the detector and verifier here"
+        )
+
+    def search_rl_step(self) -> SearchRLStep:
+        raise NotImplementedError(
+            "SEARCH_RL needs exactly one action from a persistent policy session followed "
+            "by a fresh carabiner detection; integrate the checkpoint loader and detector"
+        )
+
+    def search_cv_step(self) -> SearchCVStep:
+        raise NotImplementedError(
+            "SEARCH_CV needs one bounded VisualTracker tick driven by the calibrated pixel "
+            "map and must expose the CV follower's target_visible and followed signals"
+        )
+
+    def clip_rl_step(self) -> ClipRLStep:
+        raise NotImplementedError(
+            "CLIP_RL needs one action from a freshly seeded persistent policy session, "
+            "then attachment, grasp, visibility, and alignment checks"
+        )
+
+    def hold(self, reason: str) -> None:
+        del reason
+        if self.session.port.lifecycle is ArmLifecycle.ENABLED:
+            self.session.port.hold_current_position()
+
+
+@contextmanager
+def attachment_fsm_handlers(params: dict[str, Any]) -> Iterator[Any]:
+    """Build the standalone FSM handlers under the same deployment and lease boundary."""
+
+    import os
+
+    backend = str(params.get("backend") or os.getenv("EVEREST_ROBOT_BACKEND", "scaffold"))
+    if backend == "scaffold":
+        yield ScaffoldAttachmentFSMHandlers(
+            initial_detection=bool(params.get("initial_detection", False))
+        )
+        return
+    if backend != "hardware":
+        raise ValueError(f"unknown robot backend {backend!r} (expected scaffold or hardware)")
+
+    from everest_robot.robot.deployment import open_session
+
+    session = open_session()
+    try:
+        yield EverestAttachmentFSMHandlers(session)
+    finally:
+        session.close()
 
 
 @dataclass

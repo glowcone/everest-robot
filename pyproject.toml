@@ -27,6 +27,7 @@ hardware = [
 
 [project.scripts]
 robot-worker = "everest_robot.worker:main"
+robot-attach-fsm = "everest_robot.fsm_cli:main"
 robot-raise = "everest_robot.jog:main"
 robot-goto = "everest_robot.goto:main"
 robot-start = "everest_robot.client:start"

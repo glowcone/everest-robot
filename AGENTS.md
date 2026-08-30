@@ -7,7 +7,7 @@ recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robo
 `database`
 (`db-backend`, `db-up`, `db-init`, `db-reset`, `psql`), `calibration` (the numbered
 `pixel-*` path that teaches and then uses the fixed camera's pixel-to-joint map),
-`workflow` (`worker`, `start`, `tasks`, `task`,
+`workflow` (`attach-fsm-fake`, `attach-fsm`, `worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
 automatically. Run `just check` before handing off changes.
@@ -33,6 +33,14 @@ Keep robot hardware, policy, and perception code behind the adapter boundary in
 `src/everest_robot/adapters.py`. Keep durable orchestration and checkpoint naming in
 `src/everest_robot/workflow.py`. Any physical side effect must be designed to tolerate
 retries and brief overlapping execution.
+
+The real-time attachment state machine is the deliberate exception to the durable workflow:
+`src/everest_robot/attachment_fsm.py` owns only states, transition guards, budgets, and its
+diagnostic trace. It has no Absurd or hardware dependency. Its production handlers remain
+behind `EverestAttachmentFSMHandlers` in `adapters.py`, and one invocation holds one
+`RobotSession` lease throughout. Read `docs/adr/0003-realtime-attachment-fsm.md` and
+`docs/attachment-fsm.md` before integrating a handler. Never put an Absurd checkpoint or
+database call inside its action loop.
 
 ## The robot SDK layer
 
@@ -65,6 +73,11 @@ Absurd checkpoints store.
   (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
   cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
   leave it held on `BaseException`, not only on its own failure paths.
+- The FSM requires one policy action at a time without losing policy context. Do not call
+  `PolicyRunner.run(max_steps=1)` repeatedly: it resets policy/processor state, recording,
+  and arm hold on every call. Extend the runtime with a persistent start/step/finish policy
+  session, discard cached actions whenever CV intervenes, and seed each RL state from a
+  fresh observation.
 - `recording.py` and `policy.LeRobotPolicyHandle` are guarded stubs pending the
   dataset-writing decision. Keep them refusing with an actionable message rather than
   guessing a format or a feature mapping.
@@ -142,10 +155,18 @@ Absurd to replay its stored value instead of executing new physical work. Keep t
 task-level retries for transient failures. Long-running model or motion calls must send
 heartbeats often enough to retain their worker claim.
 
+The standalone attachment FSM is not durable orchestration. Its handler methods perform at
+most one physical action and return the typed result that the FSM uses for its transition;
+handlers must not contain hidden retry loops or choose the next state. `INITIAL` is
+motion-free, `SEARCH_CV` reuses `VisualTracker`, and `SEARCH_RL`/`CLIP_RL` use distinct
+persistent policy sessions even when they share a checkpoint. There is no automatic neutral
+or known-position move. Keep total, per-state, and wall-clock budgets finite, and treat the
+trace as diagnostics rather than resumable physical state.
+
 The CLI entry points are `src/everest_robot/client.py`,
 `src/everest_robot/worker.py`, `src/everest_robot/database.py`,
 `src/everest_robot/monitor.py`, `src/everest_robot/goto.py`, and
-`src/everest_robot/jog.py`. Keep hardware-specific
+`src/everest_robot/jog.py`, plus the local `src/everest_robot/fsm_cli.py`. Keep hardware-specific
 configuration out of these modules; pass selection and tuning data through validated task
 parameters or environment-backed configuration.
 

@@ -150,6 +150,19 @@ psql:
     uv run robot-db psql
 
 # ── workflows ──────────────────────────────────────────────────────────────────────
+# `attach-fsm` is the local real-time orchestrator from ADR-0003. It holds one robot lease
+# for the complete attempt and does not require Absurd or PostgreSQL. The hardware handlers
+# are guarded stubs until their integrations land; `attach-fsm-fake` exercises the FSM.
+
+# Exercise the attachment FSM with deterministic handlers. No camera, database, or motion.
+[group('workflow')]
+attach-fsm-fake initial_detection="":
+    uv run robot-attach-fsm --backend scaffold {{ initial_detection }}
+
+# Run one local attachment FSM attempt. POWERED once all guarded handlers are integrated.
+[group('workflow')]
+attach-fsm:
+    uv run robot-attach-fsm --backend hardware
 
 # Run the durable workflow worker. Leave it running; it serves both task types.
 [group('workflow')]

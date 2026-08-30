@@ -1,0 +1,182 @@
+from collections import deque
+from dataclasses import dataclass, field
+
+import pytest
+
+from everest_robot.attachment_fsm import (
+    AttachmentAbort,
+    AttachmentFSM,
+    AttachmentFSMConfig,
+    AttachmentState,
+    ClipRLStep,
+    InitialObservation,
+    SearchCVStep,
+    SearchRLStep,
+)
+
+
+@dataclass
+class ScriptedHandlers:
+    initial: InitialObservation = InitialObservation(False, False)
+    search: deque[SearchRLStep] = field(
+        default_factory=lambda: deque([SearchRLStep(True)])
+    )
+    cv: deque[SearchCVStep] = field(
+        default_factory=lambda: deque([SearchCVStep(True, True)])
+    )
+    clip: deque[ClipRLStep] = field(
+        default_factory=lambda: deque([ClipRLStep(True, carabiner_grasped=True)])
+    )
+    entered: list[tuple[AttachmentState, AttachmentState | None]] = field(
+        default_factory=list
+    )
+    holds: list[str] = field(default_factory=list)
+
+    def enter_state(
+        self, state: AttachmentState, previous: AttachmentState | None
+    ) -> None:
+        self.entered.append((state, previous))
+
+    def observe_initial(self) -> InitialObservation:
+        return self.initial
+
+    def search_rl_step(self) -> SearchRLStep:
+        return self.search.popleft()
+
+    def search_cv_step(self) -> SearchCVStep:
+        return self.cv.popleft()
+
+    def clip_rl_step(self) -> ClipRLStep:
+        return self.clip.popleft()
+
+    def hold(self, reason: str) -> None:
+        self.holds.append(reason)
+
+
+def destinations(result):
+    return [transition.destination for transition in result.transitions]
+
+
+def test_initial_observation_can_finish_without_motion():
+    handlers = ScriptedHandlers(initial=InitialObservation(True, True))
+
+    result = AttachmentFSM(handlers).run()
+
+    assert result.final_state is AttachmentState.SUCCESS
+    assert result.actions == 0
+    assert destinations(result) == [AttachmentState.SUCCESS]
+    assert handlers.entered == [(AttachmentState.INITIAL, None)]
+
+
+def test_initial_detection_skips_search_policy():
+    handlers = ScriptedHandlers(initial=InitialObservation(False, True))
+
+    result = AttachmentFSM(handlers).run()
+
+    assert result.succeeded
+    assert result.actions == 2
+    assert destinations(result) == [
+        AttachmentState.SEARCH_CV,
+        AttachmentState.CLIP_RL,
+        AttachmentState.SUCCESS,
+    ]
+
+
+def test_nominal_path_searches_follows_and_clips():
+    handlers = ScriptedHandlers()
+
+    result = AttachmentFSM(handlers).run()
+
+    assert result.succeeded
+    assert result.actions == 3
+    assert destinations(result) == [
+        AttachmentState.SEARCH_RL,
+        AttachmentState.SEARCH_CV,
+        AttachmentState.CLIP_RL,
+        AttachmentState.SUCCESS,
+    ]
+    assert result.state_actions == {"clip_rl": 1, "search_cv": 1, "search_rl": 1}
+
+
+def test_cv_loss_returns_to_rl_search():
+    handlers = ScriptedHandlers(
+        search=deque([SearchRLStep(True), SearchRLStep(True)]),
+        cv=deque([SearchCVStep(False, False), SearchCVStep(True, True)]),
+    )
+
+    result = AttachmentFSM(handlers).run()
+
+    assert result.succeeded
+    assert destinations(result) == [
+        AttachmentState.SEARCH_RL,
+        AttachmentState.SEARCH_CV,
+        AttachmentState.SEARCH_RL,
+        AttachmentState.SEARCH_CV,
+        AttachmentState.CLIP_RL,
+        AttachmentState.SUCCESS,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("clip_result", "recovery"),
+    [
+        (ClipRLStep(False, True, True, False), AttachmentState.SEARCH_CV),
+        (ClipRLStep(False, False, False, False), AttachmentState.SEARCH_RL),
+    ],
+)
+def test_clip_recovery_uses_observed_carabiner_state(clip_result, recovery):
+    handlers = ScriptedHandlers(
+        search=deque([SearchRLStep(True), SearchRLStep(True)]),
+        cv=deque([SearchCVStep(True, True), SearchCVStep(True, True)]),
+        clip=deque([clip_result, ClipRLStep(True, carabiner_grasped=True)]),
+    )
+
+    result = AttachmentFSM(handlers).run()
+
+    assert result.succeeded
+    assert recovery in destinations(result)
+
+
+def test_state_budget_stops_a_policy_that_never_finds_the_target():
+    handlers = ScriptedHandlers(search=deque([SearchRLStep(False)] * 3))
+    config = AttachmentFSMConfig(max_search_rl_actions=2)
+
+    result = AttachmentFSM(handlers, config).run()
+
+    assert result.final_state is AttachmentState.FAILED
+    assert result.actions == 2
+    assert result.reason == "search_rl action budget exhausted"
+    assert handlers.holds == [result.reason]
+
+
+def test_a_handled_safety_stop_becomes_aborted_and_holds():
+    handlers = ScriptedHandlers()
+
+    def abort():
+        raise AttachmentAbort("operator cancelled")
+
+    handlers.search_rl_step = abort  # type: ignore[method-assign]
+    result = AttachmentFSM(handlers).run()
+
+    assert result.final_state is AttachmentState.ABORTED
+    assert result.reason == "operator cancelled"
+    assert handlers.holds == ["operator cancelled"]
+
+
+def test_an_unexpected_base_exception_holds_and_propagates():
+    handlers = ScriptedHandlers()
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    handlers.search_rl_step = interrupt  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        AttachmentFSM(handlers).run()
+    assert handlers.holds == ["unhandled exception"]
+
+
+def test_invalid_budgets_are_refused_before_running():
+    with pytest.raises(ValueError, match="max_total_actions"):
+        AttachmentFSMConfig(max_total_actions=0)
+    with pytest.raises(ValueError, match="max_duration_s"):
+        AttachmentFSMConfig(max_duration_s=float("inf"))
