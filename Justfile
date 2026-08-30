@@ -7,9 +7,8 @@
 #   attach-carabiner  the carabiner attachment state machine  (just start)
 #   replay-session    replay of a stored dataset episode      (just replay ...)
 #
-# Anything that can move a real arm is grouped under "replay", and every one of those
-# recipes is safe to read before it is safe to run: see docs/session-replay.md. The "robot"
-# group is read-only: those recipes claim the arm but never energize it.
+# Powered calibration teleoperation lives in `monitor`; replay motion stays in the ordered
+# replay group. Every robot recipe claims the arm exclusively.
 
 set dotenv-load
 
@@ -34,13 +33,18 @@ config:
     uv run robot-config
 
 # ── robot ──────────────────────────────────────────────────────────────────────────
-# Read-only instruments. They claim the arm, so a worker cannot be holding it, but they
-# never enable the motors and never command a target.
+# Calibration teleoperation plus explicit read-only instruments. All claim the arm, so a
+# worker cannot be holding it.
 
-# Watch every joint's encoder feedback in a TUI. Claims the arm; enables nothing.
+# Follow the Star leader at bounded speed while watching follower encoders. POWERED.
 [group('robot')]
 monitor poll_hz="10":
     uv run robot-monitor --poll-hz {{ poll_hz }}
+
+# Watch encoders with follower torque disabled and no Star leader.
+[group('robot')]
+monitor-read-only poll_hz="10":
+    uv run robot-monitor --read-only --poll-hz {{ poll_hz }}
 
 # Print one joint-feedback snapshot as plain text. Redirect it next to a captured pose.
 [group('robot')]

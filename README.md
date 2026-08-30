@@ -112,33 +112,30 @@ dataset carries no record of which arm produced it, so someone has to say so. An
 interrupted replay is never restarted automatically — see the recovery notes in the replay
 doc.
 
-### Reading the joints
+### Calibration teleoperation and joint feedback
 
-`just monitor` opens a terminal display of every joint's encoder feedback: the angle in
-radians and degrees, how far it has moved since a marked reference, velocity, torque,
-temperature, and where the joint sits inside the driver's soft limits.
+`just monitor` opens a powered calibration session: it owns the follower lease, follows the
+Star 102 leader at bounded speed, and displays every follower joint's encoder feedback.
 
 ```bash
-just monitor          # the TUI, polling at 10 Hz
-just monitor 2        # slower, when you only want to watch one number settle
+just monitor           # POWERED Star-leader following plus the 10 Hz TUI
+just monitor 2         # same control loop, slower display refresh
+just monitor-read-only # torque-disabled hand positioning, no leader
 just monitor-once     # one snapshot as plain text; redirect it next to a captured pose
 just monitor-fake     # the display against the deterministic fake arm, no hardware
 ```
 
-Keys: `q` quit, `z` mark the current pose as the reference deltas are measured from, `Z`
-clear it, `space` pause.
+Keys: `q` stop and hold, `p` capture a copyable pose, `z` mark the current pose as the
+reference, `Z` clear it, and `space` pause/resume leader following.
 
-It reads and nothing else — it never enables the motors and never sends a target — so it
-is the right tool for step 1 of
-[`docs/named-position-capture.md`](docs/named-position-capture.md), where the arm is moved
-by hand with motors disabled and the pose is read back. Press `z` at the start of a
-measurement and the `d deg` column reports exactly how far each joint has been moved.
+Set `EVEREST_STAR_PORT` before using powered mode. Startup reads all seven leader servos,
+compares the mapped pose with the follower, and requires confirmation for a large difference
+before enabling. Press `p`, then `q`, to print canonical joint radians and calibration identity
+after the TUI exits. Use `just monitor-read-only` when the arm should remain torque-disabled.
 
-It does claim the robot lease, which is not a formality: reading feedback from a connected
-arm makes the driver poll the CAN bus, so the monitor is a bus participant rather than a
-passive tap. Run it *instead of* a worker, not alongside one. A joint whose feedback
-counter stops advancing is flagged `QUIET`, which is a different failure from a value that
-is fresh but wrong.
+All modes claim the robot lease. Powered following and monitoring therefore happen in the
+same process; run it *instead of* a worker, not alongside one. A joint whose feedback counter
+stops advancing is flagged `QUIET`.
 
 ### Configuration
 
@@ -195,7 +192,8 @@ every layer has a deterministic fake.
 `src/everest_robot/robot/` holds the runtime that drives a real Maker Arm: an exclusive
 lease and session lifecycle, a strictly validated robot parameters file, bounded motion
 between operator-approved named positions, LeRobot's `Robot` contract over the arm, a
-synchronous policy rollout runner, and the read-only joint monitor behind `just monitor`. The production driver decision is recorded in
+synchronous policy rollout runner, and the lease-local calibration teleoperator/monitor
+behind `just monitor`. The production driver decision is recorded in
 [`docs/adr/0001-production-motor-protocol.md`](docs/adr/0001-production-motor-protocol.md):
 the arm keeps running maker-arm-sdk's RobStride private protocol, which stays the hardware
 safety boundary.

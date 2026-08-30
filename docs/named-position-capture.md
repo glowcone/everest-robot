@@ -10,15 +10,22 @@ positions, and one operator has a hand on the e-stop for every step below.
 
 ## 1. Measure the pose
 
-1. Bring the arm up and read joint feedback without enabling motion:
-   `uv run maker-arm check` (or `Arm.connect()` followed by `get_joint_positions()`).
-2. Move the arm to the target pose by hand, with motors disabled, or by teleoperation at
-   reduced speed. Do not type the pose in.
-3. Read `get_joint_positions()` again. These are the values to record, in the order given
-   by `robot.joint_order`, in radians, in calibrated joint coordinates.
+1. Set `EVEREST_STAR_PORT` to the Star 102 leader's UART port and run `just monitor`.
+   This one process owns the follower lease, follows the leader at a conservative velocity,
+   and renders the follower's measured encoders. It is a POWERED operation.
+2. Move the leader until the follower reaches the target pose. Press space to pause following
+   and hold the follower at the measured pose. Do not type the pose in.
+3. Press `p` to capture the current follower state, then `q`. Once the TUI restores the
+   terminal it prints a copyable `joints: [...]` vector in canonical radians with robot,
+   calibration, and configuration identity. Support the arm while the session releases torque.
 4. Repeat the measurement three times, re-approaching the pose from a different direction
    each time. If any joint varies by more than the configured `tolerance_rad`, the pose is
    not repeatable: fix the fixture or the calibration before continuing.
+
+For hand positioning with motors disabled, use `just monitor-read-only`. `just monitor-once`
+remains a single non-powered snapshot. A separate monitor cannot run alongside teleoperation:
+both would participate on the same CAN bus, which is why powered following and display are
+combined in `just monitor`.
 
 ## 2. Record it
 

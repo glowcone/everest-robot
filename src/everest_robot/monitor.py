@@ -1,11 +1,9 @@
-"""``robot-monitor``: watch every joint's encoder feedback in the terminal.
+"""``robot-monitor``: teleoperate for calibration while watching joint feedback.
 
-A read-only instrument. It claims the arm, connects, checks it is the arm the parameters
-file describes, and then does nothing but call ``read_state()`` in a loop. It never
-enables the motors and never sends a target, so the arm stays exactly as limp or as held
-as you found it -- which is what makes it the right tool for step 1 of
-docs/named-position-capture.md, where the operator moves the arm by hand and reads the
-pose back.
+The default interactive mode owns both the follower and Star leader under one follower
+lease, follows the leader at a bounded rate, and renders the same encoder TUI.  A separate
+process cannot monitor an active controller safely because both would participate on the
+CAN bus.  ``--read-only`` and ``--once`` retain the torque-disabled hand-teaching path.
 
 It does claim the robot lease, and that is not incidental. Reading feedback from a merely
 connected arm makes the driver poll the bus (``MakerArmPort.read_state`` refreshes when
@@ -37,6 +35,7 @@ from everest_robot.robot.monitor import (
 
 if TYPE_CHECKING:
     from everest_robot.robot.parameters import RobotParameters
+    from everest_robot.robot.teleoperation import TeleoperationController
 
 # Column widths, and the terminal width each optional column needs before it earns its
 # place. A 7-joint arm has to stay readable in an 80-column window.
@@ -49,7 +48,7 @@ _NEEDS_TORQUE = _NEEDS_TEMP + _TORQUE_W
 _BAR_W = 18
 _NEEDS_BAR = _NEEDS_TORQUE + _BAR_W
 
-_HELP = "q quit · z mark reference · Z clear · space pause"
+_HELP = "q quit+hold · p capture pose · z mark reference · Z clear · space pause follow"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +61,7 @@ class MonitorContext:
     config_digest: str
     poll_hz: float
     fake: bool
+    powered: bool = False
 
 
 # ── the terminal ───────────────────────────────────────────────────────────────────
@@ -190,6 +190,8 @@ def _draw(
     # demonstration and a reading off a real machine.
     if context.fake:
         source = "FAKE ARM -- no hardware" if width >= 80 else "FAKE ARM"
+    elif context.powered:
+        source = "STAR TELEOP -- POWERED" if width >= 80 else "POWERED"
     else:
         source = "READ ONLY -- never enables" if width >= 80 else "READ ONLY"
     title = f"everest joint monitor  {context.robot_id} ({context.model})"
@@ -199,7 +201,7 @@ def _draw(
         0,
         max(len(title) + 2, width - len(source) - 2),
         source,
-        palette.warn if context.fake else palette.dim,
+        palette.warn if context.fake or context.powered else palette.dim,
     )
     _put(
         screen,
@@ -214,8 +216,10 @@ def _draw(
         2,
         0,
         f"lifecycle {sample.lifecycle.value.upper()}  ·  {context.poll_hz:g} Hz  ·  "
-        f"sample {sample.index}  ·  {reference}{'  ·  PAUSED' if paused else ''}",
-        palette.warn if paused or sample.lifecycle is not ArmLifecycle.CONNECTED else palette.dim,
+        f"sample {sample.index}  ·  {reference}{'  ·  FOLLOW PAUSED' if paused else ''}",
+        palette.warn
+        if paused or sample.lifecycle not in (ArmLifecycle.CONNECTED, ArmLifecycle.ENABLED)
+        else palette.dim,
     )
 
     _put(screen, 4, 0, _header_row(width), palette.head)
@@ -250,10 +254,14 @@ def _summary_attr(sample: MonitorSample, palette: _Palette) -> int:
     return palette.ok
 
 
-def run_tui(monitor: JointMonitor, context: MonitorContext) -> None:
-    """Poll and redraw until the operator quits."""
+def run_tui(
+    monitor: JointMonitor,
+    context: MonitorContext,
+    controller: TeleoperationController | None = None,
+) -> MonitorSample | None:
+    """Poll and redraw until the operator quits; return the last captured pose."""
 
-    def loop(screen: curses.window) -> None:
+    def loop(screen: curses.window) -> MonitorSample | None:
         curses.curs_set(0)
         screen.nodelay(False)
         # getch() doubles as the pacing wait: a keypress is answered at once, and a
@@ -261,24 +269,30 @@ def run_tui(monitor: JointMonitor, context: MonitorContext) -> None:
         screen.timeout(max(1, int(1000.0 / context.poll_hz)))
         palette = _Palette()
         paused = False
+        captured: MonitorSample | None = None
         sample = monitor.sample()
         while True:
             _draw(screen, monitor, sample, context, palette, paused=paused)
+            if controller is not None and controller.error:
+                return captured
             key = screen.getch()
             if key in (ord("q"), ord("Q"), 27):
-                return
+                return captured
             if key == ord("z"):
                 monitor.mark_reference()
             elif key == ord("Z"):
                 monitor.clear_reference()
+            elif key == ord("p"):
+                captured = monitor.sample()
+                sample = captured
             elif key == ord(" "):
-                paused = not paused
+                paused = controller.toggle_pause() if controller is not None else not paused
             elif key == curses.KEY_RESIZE:
                 continue
-            if not paused:
+            if not paused or controller is not None:
                 sample = monitor.sample()
 
-    curses.wrapper(loop)
+    return curses.wrapper(loop)
 
 
 # ── entry point ────────────────────────────────────────────────────────────────────
@@ -307,7 +321,7 @@ def _build_fake_monitor(parameters: RobotParameters, stale_after_s: float) -> Jo
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Watch every joint's encoder feedback. Reads only; never enables the arm."
+        description="Teleoperate from a Star 102 leader while watching follower feedback."
     )
     parser.add_argument("--poll-hz", type=float, default=DEFAULT_POLL_HZ)
     parser.add_argument(
@@ -319,16 +333,33 @@ def main() -> None:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="print one snapshot as plain text and exit; works when redirected",
+        help="read-only: print one snapshot as plain text and exit",
     )
     parser.add_argument(
         "--fake",
         action="store_true",
         help="run against the deterministic FakeArm: no CAN, no claim, no real numbers",
     )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="watch a torque-disabled arm without opening the Star leader",
+    )
+    parser.add_argument("--star-port", help="Star 102 serial port; defaults to EVEREST_STAR_PORT")
+    parser.add_argument("--star-ids", default="0,1,2,3,4,5,6")
+    parser.add_argument("--star-map", help="Star mapping JSON; defaults to maker-arm's profile")
+    parser.add_argument("--leader-rate", type=float, default=25.0)
+    parser.add_argument("--max-velocity", type=float, default=0.25)
+    parser.add_argument("--leader-loss-timeout", type=float, default=0.5)
+    parser.add_argument("--sync-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--yes", action="store_true", help="accept a startup pose difference without prompting"
+    )
     args = parser.parse_args()
     if args.poll_hz <= 0:
         parser.error(f"--poll-hz must be positive, got {args.poll_hz}")
+
+    import os
 
     from everest_robot.robot.deployment import build_lease, build_port, load_parameters
     from everest_robot.robot.session import RobotSession
@@ -342,6 +373,7 @@ def main() -> None:
         config_digest=parameters.config_digest,
         poll_hz=args.poll_hz,
         fake=args.fake,
+        powered=not (args.fake or args.once or args.read_only),
     )
 
     if args.fake:
@@ -349,29 +381,89 @@ def main() -> None:
         _present(monitor, context, once=args.once)
         return
 
-    # No cameras: a joint monitor has no use for them, and opening a camera is a side
-    # effect this program has no business having.
+    # No cameras: calibration teleoperation and joint monitoring consume no images.
     session = RobotSession(
         build_port(parameters), parameters, lease=build_lease(parameters), cameras=None
     )
     with session:
-        _present(
-            JointMonitor(session.port, stale_after_s=args.stale_after), context, once=args.once
+        monitor = JointMonitor(session.port, stale_after_s=args.stale_after)
+        if args.once or args.read_only:
+            _present(monitor, context, once=args.once)
+            return
+
+        from everest_robot.robot.teleoperation import (
+            Star102LeaderPort,
+            TeleoperationController,
+            load_star_mapper,
         )
 
+        star_port = args.star_port or os.environ.get("EVEREST_STAR_PORT")
+        if not star_port:
+            raise SystemExit(
+                "Star leader port is required: set EVEREST_STAR_PORT or pass --star-port; "
+                "use --read-only to monitor without powered following"
+            )
+        try:
+            star_ids = tuple(int(value.strip()) for value in args.star_ids.split(","))
+        except ValueError as error:
+            raise SystemExit("--star-ids must be comma-separated integers") from error
+        controller = TeleoperationController(
+            session.port,
+            Star102LeaderPort(star_port, star_ids),
+            load_star_mapper(args.star_map),
+            rate_hz=args.leader_rate,
+            max_velocity_rad_s=args.max_velocity,
+            leader_loss_timeout_s=args.leader_loss_timeout,
+        )
+        try:
+            difference = controller.connect_and_measure()
+            if difference > args.sync_threshold and not args.yes:
+                answer = input(
+                    f"leader/follower pose difference is {difference:.2f} rad; "
+                    "clear the area and type FOLLOW to enable > "
+                )
+                if answer.strip() != "FOLLOW":
+                    raise SystemExit("teleoperation cancelled before enabling")
+            controller.start()
+            captured = _present(monitor, context, once=False, controller=controller)
+        finally:
+            controller.close()
+        if controller.error:
+            raise SystemExit(f"teleoperation stopped: {controller.error}")
+        if captured is not None:
+            _print_capture(captured, context)
 
-def _present(monitor: JointMonitor, context: MonitorContext, *, once: bool) -> None:
+
+def _present(
+    monitor: JointMonitor,
+    context: MonitorContext,
+    *,
+    once: bool,
+    controller: TeleoperationController | None = None,
+) -> MonitorSample | None:
     if once:
         print(f"{context.robot_id} ({context.model})  calibration {context.calibration_id}")
         for line in format_table(monitor.sample()):
             print(line)
-        return
+        return None
     if not sys.stdout.isatty():
         raise SystemExit(
             "robot-monitor needs a terminal; use --once for a single snapshot you can redirect"
         )
     with contextlib.suppress(KeyboardInterrupt):
-        run_tui(monitor, context)
+        return run_tui(monitor, context, controller)
+    return None
+
+
+def _print_capture(sample: MonitorSample, context: MonitorContext) -> None:
+    """Print copyable canonical radians after curses restores the terminal."""
+
+    values = ", ".join(f"{reading.position_rad:.7f}" for reading in sample.readings)
+    print("captured calibration pose (canonical radians):")
+    print(f"  robot_id: {context.robot_id}")
+    print(f"  calibration_id: {context.calibration_id}")
+    print(f"  config_digest: {context.config_digest}")
+    print(f"  joints: [{values}]")
 
 
 if __name__ == "__main__":

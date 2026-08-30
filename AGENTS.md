@@ -2,7 +2,8 @@
 
 Use `just` as the primary interface for development and operations. Run `just` to list the
 recipes, which are grouped: `setup` (`setup`, `setup-hardware`, `config`), `robot`
-(`monitor`, `monitor-once`, `monitor-fake` -- read-only), `database`
+(`monitor` -- powered calibration teleoperation; `monitor-read-only`, `monitor-once`,
+`monitor-fake` -- read-only), `database`
 (`db-up`, `db-init`, `db-reset`, `psql`), `workflow` (`worker`, `start`, `tasks`, `task`,
 `checkpoints`, `cancel`), `replay` (the numbered path from `replay-preflight` to `replay`),
 and `dev` (`check`, `test`, `lint`, `fmt`, `test-network`). Recipes load `.env`
@@ -59,10 +60,11 @@ Absurd checkpoints store.
   A new import of `lerobot` or `maker_arm` at module scope breaks the hardware-free tests.
 - `deployment.py` owns every environment-specific value (CAN interface, cameras, lease
   backend, parameters path). Do not read the environment anywhere else in the runtime.
-- `monitor.py` is read-only and must stay that way: it calls `read_state()` and `limits()`
-  and nothing else. It claims the lease because reading a connected arm makes the driver
-  poll the bus. Its terminal rendering lives in `everest_robot.monitor`; keep derivation in
-  the runtime module so it stays testable against `FakeArm`.
+- `robot/monitor.py` remains the read-only feedback view model. The `robot-monitor` CLI
+  defaults to a powered, lease-local calibration session: `robot/teleoperation.py` owns the
+  Star leader and commands the already-claimed follower while the same process renders that
+  view. `--read-only` and `--once` never enable. Never split control and monitoring across
+  processes or allow either to bypass the robot lease.
 
 ## Working on workflow components
 
