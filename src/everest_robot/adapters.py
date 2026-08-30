@@ -574,8 +574,12 @@ def attachment_fsm_handlers(
 
 
     # The pixel map is read and refused here for the same reason the policies are: a stale
-    # or missing calibration is not worth an energized arm to discover.
-    calibration = load_pixel_map()
+    # or missing calibration is not worth an energized arm to discover. With SEARCH_CV
+    # routed around it is not read at all -- nothing servos on it, and requiring a
+    # calibration for a state the FSM will never enter would be a refusal about nothing.
+    # The handlers still carry no follower, so a SEARCH_CV step reached by any other path
+    # refuses rather than servoing blind.
+    calibration = None if params.get("skip_cv") else load_pixel_map()
 
     session = open_session()
     try:

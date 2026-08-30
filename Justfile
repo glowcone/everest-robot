@@ -188,11 +188,16 @@ psql:
 # It needs EVEREST_CAMERAS to name the `front` and `wrist` cameras the checkpoint was
 # trained on, and it will not report SUCCESS: attachment verification is not built, so
 # --no-attachment-verification is what makes that explicit.
+#
+# `attach-fsm-rl` is the same loop with `--skip-cv`: SEARCH_CV is routed around entirely,
+# a detection hands straight to CLIP_RL, and no pixel map is read. It exists to measure a
+# policy that approaches well enough without visual following -- with CV out, nothing
+# checks that the gripper was placed on the carabiner before the clip policy starts.
 
 # Exercise the attachment FSM with deterministic handlers. No camera, database, or motion.
 [group('workflow')]
-attach-fsm-fake initial_detection="":
-    uv run robot-attach-fsm --backend scaffold {{ initial_detection }}
+attach-fsm-fake flags="":
+    uv run robot-attach-fsm --backend scaffold {{ flags }}
 
 # Run one local attachment FSM attempt with a policy per learned state. POWERED.
 [group('workflow')]
@@ -206,6 +211,14 @@ attach-fsm-act checkpoint device="auto":
     uv run robot-attach-fsm --backend hardware \
         --search-policy {{ checkpoint }} --clip-policy {{ checkpoint }} \
         --device {{ device }} \
+        --no-attachment-verification --allow-unverified-lerobot-frame
+
+# Run the ACT loop with SEARCH_CV skipped: one checkpoint owns the whole approach. POWERED.
+[group('workflow')]
+attach-fsm-rl checkpoint device="auto":
+    uv run robot-attach-fsm --backend hardware \
+        --search-policy {{ checkpoint }} --clip-policy {{ checkpoint }} \
+        --device {{ device }} --skip-cv \
         --no-attachment-verification --allow-unverified-lerobot-frame
 
 # Load a checkpoint and print the feature mapping it will run under. No robot, no motion.

@@ -9,6 +9,7 @@ Exercise the complete state graph without cameras or hardware:
 ```bash
 just attach-fsm-fake
 just attach-fsm-fake --initial-detection
+just attach-fsm-fake --skip-cv
 ```
 
 `just attach-fsm` selects the hardware adapter. Every state now has an implementation:
@@ -50,6 +51,32 @@ Passing one reference to both flags is what expresses that. They remain **separa
 between the two, and an action chunk cached before that describes a pose the arm has left.
 Entering either state re-seeds its own session from live feedback and leaves the other
 alone.
+
+### Turning the CV state off
+
+`--skip-cv` (`AttachmentFSMConfig(use_search_cv=False)`) routes around `SEARCH_CV`
+entirely, for measuring a learned policy that approaches well enough without it:
+
+```bash
+just attach-fsm-rl <checkpoint>
+```
+
+- A detection hands straight from `INITIAL` or `SEARCH_RL` to `CLIP_RL`.
+- No pixel map is read, and none is required. `attachment_fsm_handlers()` skips
+  `load_pixel_map()` rather than refusing over a calibration nothing will servo on.
+- A degraded alignment keeps the arm with the clip policy instead of returning to CV.
+  There is no state left whose job is to re-establish the approach: the search policy would
+  hand back on the detection this step already has, so bouncing there would re-seed both
+  sessions to arrive at the same pose. If the alignment keeps degrading the carabiner
+  leaves the frame and the ungrasped-loss guard returns to `SEARCH_RL` on real evidence.
+- Every other transition, budget and refusal is unchanged. `search_cv` stays in
+  `state_actions` and reads 0.
+
+What is given up is `SEARCH_CV`'s guarantee, which is the reason the state exists: that the
+*measured* pose settled on the pixel map's pre-grasp target before the clip policy took
+over. With CV out, nothing checks that the gripper was placed on the carabiner -- the
+detection that triggers the hand-over says only that the carabiner is visible. This is a
+measurement, not a way to run without a calibration.
 
 Check a checkpoint before going anywhere near the arm:
 
@@ -277,7 +304,8 @@ gates are read fresh from `AttachmentPerception`:
   reports `None`.
 
 Verification should use the eventual sensor/CV/VLM fusion behind the adapter. A verified
-attachment succeeds. A visible, degraded alignment returns to CV. An invisible, ungrasped
+attachment succeeds. A visible, degraded alignment returns to CV (or, under `--skip-cv`,
+stays with the clip policy). An invisible, ungrasped
 carabiner returns to RL search. A grasped carabiner stays with clip RL even when it occludes
 the detector. `returned_to_neutral` takes precedence: it returns to `INITIAL`, clears
 per-cycle action budgets and policy context, and takes a fresh initial observation. Because

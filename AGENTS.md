@@ -45,7 +45,12 @@ database call inside its action loop.
 
 Run it with `just attach-fsm-fake` (add `--initial-detection` to enter at `SEARCH_CV`),
 which exercises every state and prints the JSON result with no hardware, camera, or
-database -- this is the command to reach for when changing the FSM. `just attach-fsm
+database -- this is the command to reach for when changing the FSM. `--skip-cv`
+(`AttachmentFSMConfig(use_search_cv=False)`, `just attach-fsm-rl`) removes `SEARCH_CV` from
+the graph so a learned policy can be measured without visual following: detections hand
+straight to `CLIP_RL`, a degraded alignment stays there, and no pixel map is read. It gives
+up the guarantee the state exists for -- that the measured pose settled on the taught
+pre-grasp target before clipping began -- so keep it an option, never the default. `just attach-fsm
 <search-policy> <clip-policy>` is the hardware form, and `just attach-fsm-act <checkpoint>`
 is the intended shape: one model in both learned states with classical CV between them,
 still as two separate `PolicySession`s. Every state is implemented -- `INITIAL` and the

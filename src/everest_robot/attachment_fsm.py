@@ -103,6 +103,13 @@ class AttachmentFSMConfig:
     max_search_rl_actions: int = 400
     max_search_cv_actions: int = 300
     max_clip_rl_actions: int = 400
+    #: Whether classical visual following is part of the loop. ``False`` routes around
+    #: ``SEARCH_CV`` entirely: a fresh detection hands straight from ``INITIAL`` or
+    #: ``SEARCH_RL`` to ``CLIP_RL``, and a degraded alignment has no state to recover it,
+    #: so the clip policy keeps the arm. This exists to measure a learned policy that
+    #: approaches well enough on its own; it is not a way to run without a pixel map while
+    #: still expecting CV's guarantee that the gripper was placed before the clip starts.
+    use_search_cv: bool = True
 
     def __post_init__(self) -> None:
         for name in (
@@ -185,7 +192,7 @@ class AttachmentFSM:
                         next_state = AttachmentState.SUCCESS
                         reason = "attachment already verified"
                     elif initial.carabiner_detected:
-                        next_state = AttachmentState.SEARCH_CV
+                        next_state = self._after_detection()
                         reason = "carabiner initially detected"
                     else:
                         next_state = AttachmentState.SEARCH_RL
@@ -266,10 +273,12 @@ class AttachmentFSM:
         if state is AttachmentState.SEARCH_RL:
             result = self.handlers.search_rl_step()
             if result.carabiner_detected:
-                return result, AttachmentState.SEARCH_CV, "carabiner detected"
+                return result, self._after_detection(), "carabiner detected"
             return result, state, "search policy continuing"
 
         if state is AttachmentState.SEARCH_CV:
+            if not self.config.use_search_cv:
+                raise AssertionError("SEARCH_CV stepped while visual following is disabled")
             result = self.handlers.search_cv_step()
             if not result.target_visible:
                 return result, AttachmentState.SEARCH_RL, "CV lost carabiner"
@@ -284,12 +293,26 @@ class AttachmentFSM:
             if result.attachment_verified:
                 return result, AttachmentState.SUCCESS, "attachment verified"
             if result.carabiner_visible and result.alignment_degraded:
-                return result, AttachmentState.SEARCH_CV, "alignment degraded"
+                if self.config.use_search_cv:
+                    return result, AttachmentState.SEARCH_CV, "alignment degraded"
+                # Nothing else re-establishes the approach with CV out of the loop: the
+                # search policy hands back on the detection this step already has, so
+                # bouncing there would re-seed both sessions to arrive at the same pose.
+                # If the alignment keeps degrading the carabiner leaves the frame, and the
+                # ungrasped-loss guard below returns to search on real evidence.
+                return result, state, "alignment degraded, no CV state to recover it"
             if not result.carabiner_visible and not result.carabiner_grasped:
                 return result, AttachmentState.SEARCH_RL, "ungrasped carabiner lost"
             return result, state, "clip policy continuing"
 
         raise AssertionError(f"no step handler for {state}")
+
+    def _after_detection(self) -> AttachmentState:
+        """Where a fresh carabiner detection hands off to."""
+
+        if self.config.use_search_cv:
+            return AttachmentState.SEARCH_CV
+        return AttachmentState.CLIP_RL
 
     def _transition(
         self,

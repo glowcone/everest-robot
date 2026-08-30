@@ -115,6 +115,19 @@ Search and clip may use the same checkpoint, but they are separate policy sessio
 physically intervened between them, so cached actions and recurrent state from before CV
 are stale. Entering either RL state resets or reseeds the policy from a fresh observation.
 
+### Running without the CV state
+
+`AttachmentFSMConfig(use_search_cv=False)` (`--skip-cv`) removes `SEARCH_CV` from the graph:
+a detection transitions from `INITIAL` or `SEARCH_RL` straight to `CLIP_RL`, and a visible
+but poorly aligned carabiner stays in `CLIP_RL` because no remaining state re-establishes
+the approach. Every other transition and budget is unchanged, and the run reads no pixel
+map.
+
+This is a measurement option for a learned policy that may approach well enough on its own,
+not a way to operate without a calibration. What it gives up is precisely why the state was
+adopted here: with CV in the loop, `CLIP_RL` begins only after the *measured* pose settled
+on the taught pre-grasp target, and without it the hand-over rests on a detection alone.
+
 ## Assumption pending verification: how a policy reports its return to neutral
 
 **Status: UNVERIFIED. Implemented as described below; not yet confirmed against a trained

@@ -31,6 +31,7 @@ class ScriptedHandlers:
         default_factory=list
     )
     holds: list[str] = field(default_factory=list)
+    cv_calls: int = 0
 
     def enter_state(
         self, state: AttachmentState, previous: AttachmentState | None
@@ -44,6 +45,7 @@ class ScriptedHandlers:
         return self.search.popleft()
 
     def search_cv_step(self) -> SearchCVStep:
+        self.cv_calls += 1
         return self.cv.popleft()
 
     def clip_rl_step(self) -> ClipRLStep:
@@ -174,6 +176,92 @@ def test_policy_return_to_neutral_resets_through_initial():
         AttachmentState.SUCCESS,
     ]
     assert handlers.entered.count((AttachmentState.INITIAL, AttachmentState.CLIP_RL)) == 1
+
+
+# ── the loop with visual following turned off ──────────────────────────────────────
+def test_skipping_cv_hands_a_detection_straight_to_the_clip_policy():
+    handlers = ScriptedHandlers()
+    config = AttachmentFSMConfig(use_search_cv=False)
+
+    result = AttachmentFSM(handlers, config).run()
+
+    assert result.succeeded
+    assert result.actions == 2
+    assert destinations(result) == [
+        AttachmentState.SEARCH_RL,
+        AttachmentState.CLIP_RL,
+        AttachmentState.SUCCESS,
+    ]
+    assert result.state_actions == {"clip_rl": 1, "search_cv": 0, "search_rl": 1}
+    assert not handlers.cv_calls
+
+
+def test_skipping_cv_also_bypasses_it_out_of_initial():
+    handlers = ScriptedHandlers(initial=InitialObservation(False, True))
+    config = AttachmentFSMConfig(use_search_cv=False)
+
+    result = AttachmentFSM(handlers, config).run()
+
+    assert result.succeeded
+    assert result.actions == 1
+    assert destinations(result) == [AttachmentState.CLIP_RL, AttachmentState.SUCCESS]
+    assert handlers.entered == [
+        (AttachmentState.INITIAL, None),
+        (AttachmentState.CLIP_RL, AttachmentState.INITIAL),
+    ]
+    assert not handlers.cv_calls
+
+
+def test_a_degraded_alignment_stays_with_the_clip_policy_when_cv_is_off():
+    """Nothing else re-establishes the approach, so the FSM does not bounce to search."""
+
+    handlers = ScriptedHandlers(
+        initial=InitialObservation(False, True),
+        clip=deque(
+            [
+                ClipRLStep(
+                    attachment_verified=False,
+                    carabiner_visible=True,
+                    alignment_degraded=True,
+                    carabiner_grasped=True,
+                ),
+                ClipRLStep(True, carabiner_grasped=True),
+            ]
+        ),
+    )
+    config = AttachmentFSMConfig(use_search_cv=False)
+
+    result = AttachmentFSM(handlers, config).run()
+
+    assert result.succeeded
+    assert destinations(result) == [AttachmentState.CLIP_RL, AttachmentState.SUCCESS]
+    assert result.state_actions["clip_rl"] == 2
+    assert not handlers.cv_calls
+
+
+def test_a_lost_ungrasped_carabiner_still_returns_to_search_when_cv_is_off():
+    handlers = ScriptedHandlers(
+        initial=InitialObservation(False, True),
+        search=deque([SearchRLStep(True)]),
+        clip=deque(
+            [
+                ClipRLStep(attachment_verified=False, carabiner_visible=False),
+                ClipRLStep(True, carabiner_grasped=True),
+            ]
+        ),
+    )
+    config = AttachmentFSMConfig(use_search_cv=False)
+
+    result = AttachmentFSM(handlers, config).run()
+
+    assert result.succeeded
+    assert destinations(result) == [
+        AttachmentState.CLIP_RL,
+        AttachmentState.SEARCH_RL,
+        AttachmentState.CLIP_RL,
+        AttachmentState.SUCCESS,
+    ]
+    assert not handlers.cv_calls
 
 
 def test_state_budget_stops_a_policy_that_never_finds_the_target():

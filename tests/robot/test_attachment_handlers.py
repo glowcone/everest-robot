@@ -365,6 +365,51 @@ def test_missing_named_neutral_is_refused_before_robot_claim(tmp_path, monkeypat
         pass
 
 
+def test_skipping_cv_demands_no_pixel_map(tmp_path, monkeypatch) -> None:
+    """No state servos on the fit, so requiring one would refuse over nothing."""
+
+    import dataclasses
+    import datetime
+
+    from everest_robot.robot.parameters import NamedPosition
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the pixel map must not be read when SEARCH_CV is routed around")
+
+    class Claimed(RuntimeError):
+        pass
+
+    def claim(*args, **kwargs):
+        raise Claimed("preflight got as far as the robot claim")
+
+    base = parameters()
+    neutral = NamedPosition(
+        name="neutral",
+        joints=(0.0, -1.0, -0.1),
+        calibration_id=base.identity.calibration_id,
+        approved_by="test",
+        captured_at=datetime.date(2026, 8, 30),
+        profile=base.motion_defaults,
+    )
+    monkeypatch.setattr(
+        "everest_robot.robot.deployment.load_parameters",
+        lambda *a, **k: dataclasses.replace(base, named_positions={"neutral": neutral}),
+    )
+    monkeypatch.setattr("everest_robot.robot.deployment.load_pixel_map", explode)
+    monkeypatch.setattr("everest_robot.robot.deployment.open_session", claim)
+    params = {
+        "backend": "hardware",
+        "skip_cv": True,
+        "search_policy": str(write_policy(tmp_path, "search.json")),
+        "clip_policy": str(write_policy(tmp_path, "clip.json")),
+    }
+
+    with pytest.raises(Claimed), attachment_fsm_handlers(
+        params, perception=ScriptedPerception()
+    ):
+        pass
+
+
 def test_a_bad_policy_file_costs_no_claim(tmp_path, monkeypatch) -> None:
     def explode(*args, **kwargs):
         raise AssertionError("the robot must not be claimed before the policies load")

@@ -30,6 +30,14 @@ def main() -> None:
         "to run one checkpoint in both learned states, in two separate sessions",
     )
     parser.add_argument(
+        "--skip-cv",
+        action="store_true",
+        help="route around SEARCH_CV: a detection hands straight from INITIAL or SEARCH_RL "
+        "to CLIP_RL, and no pixel map is needed. The learned clip policy then owns the "
+        "whole approach, with nothing checking that the gripper was placed on the carabiner "
+        "before it starts",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="torch device for inference: auto (default), cuda, mps, or cpu",
@@ -60,10 +68,12 @@ def main() -> None:
     config = AttachmentFSMConfig(
         max_total_actions=args.max_actions,
         max_duration_s=args.max_duration,
+        use_search_cv=not args.skip_cv,
     )
     params = {
         "backend": args.backend,
         "initial_detection": args.initial_detection,
+        "skip_cv": args.skip_cv,
         "search_policy": args.search_policy,
         "clip_policy": args.clip_policy,
         "policy_fps": args.policy_fps,
