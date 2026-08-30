@@ -52,6 +52,26 @@ between the two, and an action chunk cached before that describes a pose the arm
 Entering either state re-seeds its own session from live feedback and leaves the other
 alone.
 
+### ACT temporal ensembling
+
+ACT checkpoints use temporal ensembling by default with coefficient `0.01`. Each control
+step predicts a new action chunk, and LeRobot averages the overlapping predictions for the
+current timestep before Everest sends that single action. Enabling it sets
+`n_action_steps = 1`, as required by LeRobot; the state machine still performs its checks
+between every physical action.
+
+The exponential weights are `exp(-coefficient * age)`, where age follows LeRobot's stored
+prediction ordering. The default is the ACT paper's coefficient and matches MakerMods Lab.
+To compare against the checkpoint's ordinary chunk execution, disable the override:
+
+```bash
+just attach-fsm-act <checkpoint> auto "--no-temporal-ensemble"
+just attach-fsm-rl <checkpoint> auto "--no-temporal-ensemble"
+```
+
+This setting applies only to ACT. Other policy types retain their checkpoint configuration,
+and scripted policies are unchanged.
+
 ### Turning the CV state off
 
 `--skip-cv` (`AttachmentFSMConfig(use_search_cv=False)`) routes around `SEARCH_CV`

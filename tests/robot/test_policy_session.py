@@ -2,6 +2,7 @@
 
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from everest_robot.robot.policy import (
     PolicySession,
     PolicySessionError,
     ScriptedPolicy,
+    _configure_temporal_ensemble,
     load_policy,
 )
 
@@ -366,6 +368,40 @@ def test_the_context_manager_holds_even_when_the_body_raises() -> None:
 
 
 # ── loading a policy from a file ───────────────────────────────────────────────────
+def test_act_temporal_ensembling_is_configured_for_one_prediction_per_step() -> None:
+    config = SimpleNamespace(type="act", temporal_ensemble_coeff=None, n_action_steps=100)
+
+    _configure_temporal_ensemble(config, 0.01)
+
+    assert config.temporal_ensemble_coeff == pytest.approx(0.01)
+    assert config.n_action_steps == 1
+
+
+def test_act_temporal_ensembling_can_be_disabled() -> None:
+    config = SimpleNamespace(type="act", temporal_ensemble_coeff=0.01, n_action_steps=17)
+
+    _configure_temporal_ensemble(config, None)
+
+    assert config.temporal_ensemble_coeff is None
+    assert config.n_action_steps == 17
+
+
+def test_temporal_ensemble_override_does_not_change_non_act_policies() -> None:
+    config = SimpleNamespace(type="diffusion", temporal_ensemble_coeff="checkpoint-value")
+
+    _configure_temporal_ensemble(config, 0.01)
+
+    assert config.temporal_ensemble_coeff == "checkpoint-value"
+
+
+@pytest.mark.parametrize("coefficient", [0.0, -0.01, math.inf, math.nan, True])
+def test_act_temporal_ensemble_coefficient_must_be_positive_and_finite(coefficient) -> None:
+    config = SimpleNamespace(type="act", temporal_ensemble_coeff=None, n_action_steps=100)
+
+    with pytest.raises(PolicyLoadError, match="finite and greater than 0"):
+        _configure_temporal_ensemble(config, coefficient)
+
+
 def scripted_document(**overrides) -> dict:
     document = {
         "controller": "search-v0",

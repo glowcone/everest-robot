@@ -43,6 +43,11 @@ def main() -> None:
         help="torch device for inference: auto (default), cuda, mps, or cpu",
     )
     parser.add_argument(
+        "--no-temporal-ensemble",
+        action="store_true",
+        help="disable ACT temporal ensembling (enabled by default with coefficient 0.01)",
+    )
+    parser.add_argument(
         "--no-attachment-verification",
         action="store_true",
         help="run without an attachment verifier. The loop runs, but a successful "
@@ -79,6 +84,7 @@ def main() -> None:
         "policy_fps": args.policy_fps,
         "attachment_task": args.task,
         "policy_device": args.device,
+        "temporal_ensemble_coeff": None if args.no_temporal_ensemble else 0.01,
         "allow_unverified_attachment": args.no_attachment_verification,
         "allow_unverified_lerobot_frame": args.allow_unverified_lerobot_frame,
     }

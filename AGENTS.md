@@ -101,6 +101,9 @@ Absurd checkpoints store.
   (`clock.ManualClock` in tests), a heartbeat and a cancellation check. Absurd signals
   cancellation by raising from `ctx.heartbeat()`, so any loop that commands the arm must
   leave it held on `BaseException`, not only on its own failure paths.
+- ACT inference enables LeRobot temporal ensembling by default with coefficient `0.01` and
+  `n_action_steps = 1`. Keep the override in `robot/policy.py`, before model construction;
+  `--no-temporal-ensemble` is the operator escape hatch for ordinary chunk execution.
 - `policy.PolicySession` is the one-action primitive the FSM's learned states run on:
   `seed()` / `step()` / `close()`, keeping policy context across the decisions the caller
   makes in between. Never emulate it with repeated `PolicyRunner.run(max_steps=1)`, which

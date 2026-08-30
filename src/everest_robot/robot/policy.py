@@ -439,6 +439,23 @@ def resolve_torch_device(preference: str | None = None) -> Any:
     return torch.device("cpu")
 
 
+def _configure_temporal_ensemble(config: Any, coefficient: float | None) -> None:
+    """Apply Everest's inference-time temporal ensembling override to ACT only."""
+
+    if config.type != "act":
+        return
+    if coefficient is None:
+        config.temporal_ensemble_coeff = None
+        return
+    if isinstance(coefficient, bool) or not math.isfinite(coefficient) or coefficient <= 0:
+        raise PolicyLoadError("ACT temporal ensemble coefficient must be finite and greater than 0")
+
+    config.temporal_ensemble_coeff = coefficient
+    # LeRobot requires one executed action per newly predicted chunk when temporal
+    # ensembling is active. The policy then averages all predictions for this timestep.
+    config.n_action_steps = 1
+
+
 class LeRobotPolicyHandle:
     """A trained LeRobot checkpoint, loaded and wrapped in its own processor pipelines.
 
@@ -469,6 +486,7 @@ class LeRobotPolicyHandle:
         controller: str | None = None,
         device: str | None = None,
         use_amp: bool = False,
+        temporal_ensemble_coeff: float | None = 0.01,
     ) -> None:
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
@@ -488,6 +506,7 @@ class LeRobotPolicyHandle:
         # on CUDA refuses to load its own processor pipeline on a Mac.
         config.device = str(self.device)
         config.use_amp = use_amp
+        _configure_temporal_ensemble(config, temporal_ensemble_coeff)
 
         policy = get_policy_class(config.type).from_pretrained(root, config=config)
         policy.to(self.device)
@@ -855,6 +874,11 @@ class PolicySession:
 #: never from the file alone, so these exist to give that mistake a useful message.
 CHECKPOINT_SUFFIXES = frozenset({".safetensors", ".pt", ".ckpt", ".bin"})
 
+# ACT's published/default temporal ensemble coefficient. Everest enables it for ACT
+# checkpoints because the FSM advances the policy one control step at a time and benefits
+# from averaging the overlapping action chunks predicted at consecutive steps.
+DEFAULT_ACT_TEMPORAL_ENSEMBLE_COEFF = 0.01
+
 #: A Hugging Face reference, distinguished from a path only after the path misses on disk.
 _REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -871,6 +895,7 @@ def load_policy(
     revision: str | None = None,
     dataset_repo_id: str | None = None,
     allow_download: bool = True,
+    temporal_ensemble_coeff: float | None = DEFAULT_ACT_TEMPORAL_ENSEMBLE_COEFF,
 ) -> PolicyHandle:
     """Turn a reference into a handle. The single seam where that conversion happens.
 
@@ -900,6 +925,7 @@ def load_policy(
             revision=revision,
             dataset_repo_id=dataset_repo_id,
             allow_download=allow_download,
+            temporal_ensemble_coeff=temporal_ensemble_coeff,
         )
 
     if resolved.is_file():
@@ -926,6 +952,7 @@ def load_policy(
             revision=revision,
             dataset_repo_id=dataset_repo_id,
             allow_download=allow_download,
+            temporal_ensemble_coeff=temporal_ensemble_coeff,
         )
     raise PolicyLoadError(
         f"policy {str(path)!r} does not exist, and is not a Hugging Face repo id of the "
@@ -941,6 +968,7 @@ def _load_checkpoint(
     revision: str | None,
     dataset_repo_id: str | None,
     allow_download: bool,
+    temporal_ensemble_coeff: float | None,
 ) -> PolicyHandle:
     from everest_robot.robot.checkpoints import CheckpointError, resolve_checkpoint
 
@@ -953,7 +981,12 @@ def _load_checkpoint(
         )
     except CheckpointError as error:
         raise PolicyLoadError(str(error)) from None
-    return LeRobotPolicyHandle(checkpoint, controller=controller, device=device)
+    return LeRobotPolicyHandle(
+        checkpoint,
+        controller=controller,
+        device=device,
+        temporal_ensemble_coeff=temporal_ensemble_coeff,
+    )
 
 
 def _load_scripted_policy(path: Path, *, controller: str | None) -> ScriptedPolicy:

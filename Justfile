@@ -201,25 +201,25 @@ attach-fsm-fake flags="":
 
 # Run one local attachment FSM attempt with a policy per learned state. POWERED.
 [group('workflow')]
-attach-fsm search_policy clip_policy:
+attach-fsm search_policy clip_policy flags="":
     uv run robot-attach-fsm --backend hardware \
-        --search-policy {{ search_policy }} --clip-policy {{ clip_policy }}
+        --search-policy {{ search_policy }} --clip-policy {{ clip_policy }} {{ flags }}
 
 # Run the ACT loop: one checkpoint for both learned states, CV in between. POWERED.
 [group('workflow')]
-attach-fsm-act checkpoint device="auto":
+attach-fsm-act checkpoint device="auto" flags="":
     uv run robot-attach-fsm --backend hardware \
         --search-policy {{ checkpoint }} --clip-policy {{ checkpoint }} \
         --device {{ device }} \
-        --no-attachment-verification --allow-unverified-lerobot-frame
+        --no-attachment-verification --allow-unverified-lerobot-frame {{ flags }}
 
 # Run the ACT loop with SEARCH_CV skipped: one checkpoint owns the whole approach. POWERED.
 [group('workflow')]
-attach-fsm-rl checkpoint device="auto":
+attach-fsm-rl checkpoint device="auto" flags="":
     uv run robot-attach-fsm --backend hardware \
         --search-policy {{ checkpoint }} --clip-policy {{ checkpoint }} \
         --device {{ device }} --skip-cv \
-        --no-attachment-verification --allow-unverified-lerobot-frame
+        --no-attachment-verification --allow-unverified-lerobot-frame {{ flags }}
 
 # Load a checkpoint and print the feature mapping it will run under. No robot, no motion.
 [group('workflow')]

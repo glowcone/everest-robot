@@ -552,12 +552,17 @@ def attachment_fsm_handlers(
     )
 
     device = params.get("policy_device") or policy_device()
+    temporal_ensemble_coeff = params.get("temporal_ensemble_coeff", 0.01)
     # Search and clip are separate sessions even when this resolves to the same reference
     # twice: ADR-0003 requires separate carried state, not a shared handle. The weights are
     # loaded once each here, before the lease, so a bad reference or an unavailable device
     # never costs an energized arm.
-    search_policy = load_policy(search_path, device=device)
-    clip_policy = load_policy(clip_path, device=device)
+    search_policy = load_policy(
+        search_path, device=device, temporal_ensemble_coeff=temporal_ensemble_coeff
+    )
+    clip_policy = load_policy(
+        clip_path, device=device, temporal_ensemble_coeff=temporal_ensemble_coeff
+    )
 
     checks = perception if perception is not None else build_attachment_perception(params)
     checks.preflight()
