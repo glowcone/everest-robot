@@ -9,6 +9,7 @@ neutral looks like right now". The carabiner is the teal side of that estimate.
 Output is a GraspTarget in pixel coordinates. Nothing here touches the robot.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import cv2
@@ -37,6 +38,14 @@ class NotFound(Exception):
 # extremes of the descent change apparent size by roughly 4x.
 MIN_AREA = 900
 MAX_AREA = 60000
+
+#: Hysteresis floors, in background sigmas, tried strictest first. See `detect`:
+#: 3.0 is what the near-field frames were tuned on and stays the default answer;
+#: the lower rungs exist for the far end of the descent, where the ring thins to a
+#: few pixels of stock and its shaded spine falls under 3 sigma. 2.0 is below the
+#: ~2.2 sigma at which the worst overexposed wood grain leaks, so a detection that
+#: needed it rests on weak evidence -- which is why it is last and never preferred.
+LOW_THRESHOLDS = (3.0, 2.5, 2.0)
 
 
 def teal_score(bgr: np.ndarray) -> np.ndarray:
@@ -89,7 +98,37 @@ def teal_score(bgr: np.ndarray) -> np.ndarray:
     return np.where(0.55 * np.median(L) < L, d, 0.0)
 
 
-def chroma_mask(bgr: np.ndarray, hi: float = 5.0, lo: float = 3.0) -> np.ndarray:
+def in_roi(score: np.ndarray, roi_xywh: Sequence[int] | None) -> np.ndarray:
+    """Zero the score outside a region of interest, keeping full-frame coordinates.
+
+    Masking the score rather than cropping the image is deliberate: every caller
+    works in absolute pixels -- the wrist servo's goal, the pixel map, the
+    overlay -- and a crop would silently shift all of them by the ROI origin.
+
+    This is the answer to background clutter, and it is not a nicety. The teal
+    score is relative to the frame's own median, so a bench in a room with a
+    bright screen, plants and people produces teal-scoring blobs that are
+    genuinely ring-shaped. Nothing in one frame distinguishes a small carabiner
+    far away from a ring-shaped object across the room; what distinguishes them
+    is that the robot cannot reach across the room. That is a fact about the
+    workspace, so it has to be told, not inferred.
+    """
+    if roi_xywh is None:
+        return score
+    x, y, w, h = (int(value) for value in roi_xywh)
+    if w <= 0 or h <= 0:
+        raise ValueError(f"roi_xywh must have positive width and height, got {w}x{h}")
+    kept = np.zeros(score.shape, bool)
+    kept[max(0, y) : y + h, max(0, x) : x + w] = True
+    return np.where(kept, score, 0.0)
+
+
+def chroma_mask(
+    bgr: np.ndarray,
+    hi: float = 5.0,
+    lo: float = 3.0,
+    score: np.ndarray | None = None,
+) -> np.ndarray:
     """Hysteresis threshold on the teal score, in background sigmas.
 
     A single threshold cannot win here: set it high and the washed-out lower
@@ -97,8 +136,11 @@ def chroma_mask(bgr: np.ndarray, hi: float = 5.0, lo: float = 3.0) -> np.ndarray
     leaks in. Hysteresis takes confident seeds at `hi` sigma and grows them
     through contiguous `lo`-sigma pixels, so a marginal arc survives as long as
     some part of the ring is confidently teal.
+
+    `score` lets a caller supply an already-computed (and possibly ROI-masked)
+    score, so the ladder in `detect` pays for the Mahalanobis pass once.
     """
-    d = teal_score(bgr)
+    d = teal_score(bgr) if score is None else score
     strong = d > hi
     weak = (d > lo).astype(np.uint8)
 
@@ -115,9 +157,17 @@ def chroma_mask(bgr: np.ndarray, hi: float = 5.0, lo: float = 3.0) -> np.ndarray
     return m
 
 
-def _largest_valid(mask: np.ndarray) -> np.ndarray:
+def _plausible(mask: np.ndarray) -> list[np.ndarray]:
+    """Every component of the right rough size and build, largest first.
+
+    Largest first, and *every* one rather than only the largest: the largest
+    teal thing in view is often not the carabiner -- a bright screen or a
+    plant scores teal against a wood median and can be an order of magnitude
+    bigger. Size and aspect are cheap pre-filters; `_validate` is the arbiter,
+    so the caller tries them in turn instead of committing to one.
+    """
     n, lbl, st, _ = cv2.connectedComponentsWithStats(mask, 8)
-    best, best_area = None, 0
+    ranked = []
     for i in range(1, n):
         area = st[i, cv2.CC_STAT_AREA]
         if not (MIN_AREA <= area <= MAX_AREA):
@@ -125,22 +175,55 @@ def _largest_valid(mask: np.ndarray) -> np.ndarray:
         w, h = st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT]
         if max(w, h) / max(1, min(w, h)) > 4.0:  # carabiner is ~1.7:1, not a sliver
             continue
-        if area > best_area:
-            best, best_area = i, area
-    if best is None:
-        raise NotFound("no component in the expected size/shape range")
-    return (lbl == best).astype(np.uint8) * 255
+        ranked.append((area, i))
+    return [
+        (lbl == i).astype(np.uint8) * 255 for _, i in sorted(ranked, key=lambda r: -r[0])
+    ]
 
 
-def detect(bgr: np.ndarray) -> GraspTarget:
-    """Locate the aperture and spine of the carabiner in a wrist-camera frame."""
-    mask = _largest_valid(chroma_mask(bgr))
+def detect(bgr: np.ndarray, roi_xywh: Sequence[int] | None = None) -> GraspTarget:
+    """Locate the aperture and spine of the carabiner in a wrist-camera frame.
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    outer = max(cnts, key=cv2.contourArea)
-    inner = _aperture(mask, outer)
-    _validate(mask, outer, inner)
+    The hysteresis floor is a ladder walked strictest first, not a constant.
+    One floor cannot serve the whole descent: near the table the ring is broad
+    and bright and `LOW_THRESHOLDS[0]` is right, while a leak at that range
+    fills the aperture and fails validation. Far away the ring is a few pixels
+    of stock, the spine falls to ~3 sigma, and the loop breaks into arcs that
+    no longer contain a hole. Lowering the floor globally to fix the far case
+    breaks the near one, which is measurable: on the tuning frames it costs
+    more detections than it wins.
 
+    So the floor descends only when *nothing* validated above it. Every frame
+    that resolved at the strictest floor still resolves there, with the same
+    answer; only frames that would otherwise have been a miss pay the extra
+    passes and accept weaker evidence.
+    """
+    score = in_roi(teal_score(bgr), roi_xywh)
+    refusals: list[str] = []
+
+    for lo in LOW_THRESHOLDS:
+        mask_at = chroma_mask(bgr, lo=lo, score=score)
+        for mask in _plausible(mask_at):
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            outer = max(cnts, key=cv2.contourArea)
+            try:
+                inner = _aperture(mask, outer)
+                _validate(mask, outer, inner)
+            except (NotFound, ValueError) as error:
+                refusals.append(f"{lo:g}sigma: {error}")
+                continue
+            return _target(bgr, mask, outer, inner)
+
+    where = "" if roi_xywh is None else f" inside ROI {tuple(int(v) for v in roi_xywh)}"
+    if not refusals:
+        raise NotFound(f"no component in the expected size/shape range{where}")
+    raise NotFound(f"no carabiner-shaped component{where} ({'; '.join(refusals[:3])})")
+
+
+def _target(
+    bgr: np.ndarray, mask: np.ndarray, outer: np.ndarray, inner: np.ndarray
+) -> GraspTarget:
+    """Turn one accepted component into the grasp target."""
     mi = cv2.moments(inner)
     ap = (mi["m10"] / mi["m00"], mi["m01"] / mi["m00"])
 

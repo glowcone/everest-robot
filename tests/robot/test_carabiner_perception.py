@@ -193,7 +193,7 @@ def test_rgb_frames_are_handed_to_the_detector_as_bgr() -> None:
     arm = FakeArm(identity=IDENTITY, joint_limits=LIMITS, clock=ManualClock())
     seen: list[np.ndarray] = []
 
-    def capture(frame):
+    def capture(frame, roi_xywh=None):
         seen.append(frame)
         raise LookupError("stop here; the conversion is what is under test")
 
@@ -216,3 +216,38 @@ def test_rgb_frames_are_handed_to_the_detector_as_bgr() -> None:
     assert np.array_equal(seen[0], rgb[:, :, ::-1])
     # OpenCV rejects a reversed view; the conversion must produce a real array.
     assert seen[0].flags["C_CONTIGUOUS"]
+
+
+def test_the_configured_roi_reaches_the_detector() -> None:
+    """The wrist detector's thresholds are relative to the frame's own background, so a
+    room behind the bench produces ring-shaped teal blobs it cannot rule out on its own.
+    The ROI is how the workspace is declared, and it has to actually arrive."""
+
+    spec = CameraSpec("wrist", "fake", "0", 4, 4, 30)
+    cameras = CameraRuntime({"wrist": FakeCamera(spec)}, [spec])
+    cameras.connect()
+    arm = FakeArm(identity=IDENTITY, joint_limits=LIMITS, clock=ManualClock())
+    seen: list[object] = []
+
+    def capture(frame, roi_xywh=None):
+        seen.append(roi_xywh)
+        raise LookupError("stop here; the ROI is what is under test")
+
+    perception = CarabinerVisionPerception(
+        verifier=UnverifiableAttachment(acknowledged=True),
+        configured_cameras=("wrist",),
+        roi_xywh=(10, 20, 300, 400),
+    )
+    perception.preflight()
+    perception.bind(cameras, arm)
+
+    import everest_robot.carabiner_detect as detector
+
+    original, detector.detect = detector.detect, capture
+    try:
+        with pytest.raises(LookupError):
+            perception.carabiner_detection()
+    finally:
+        detector.detect = original
+
+    assert seen == [(10, 20, 300, 400)]

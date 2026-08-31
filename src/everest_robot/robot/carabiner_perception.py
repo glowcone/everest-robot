@@ -117,6 +117,10 @@ class CarabinerVisionPerception:
     color_mode: str = "rgb"
     #: Drift of the insertion point from the hand-over baseline that counts as degraded.
     alignment_tolerance_px: float = 60.0
+    #: Where in the wrist frame the detector may look, in full-frame pixels, or the whole
+    #: frame. Set it whenever the bench is not the only thing in view -- see
+    #: ``carabiner_detect.in_roi`` for why background clutter cannot be rejected otherwise.
+    roi_xywh: tuple[int, int, int, int] | None = None
     #: Gripper position, in this arm's joint radians, below which it is holding something.
     #: Measured by closing the gripper on the carabiner and reading the monitor's feedback.
     grasp_gripper_below_rad: float | None = None
@@ -235,7 +239,7 @@ class CarabinerVisionPerception:
             # Contiguous, not a reversed view: OpenCV rejects negative strides.
             frame = np.ascontiguousarray(frame[:, :, ::-1])
         try:
-            return detect(frame)
+            return detect(frame, self.roi_xywh)
         except (NotFound, ValueError):
             # ValueError covers the degenerate geometry the detector's own validation does
             # not reach (a hull with no interior, an unsolvable spine fit). Both mean the

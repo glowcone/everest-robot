@@ -41,6 +41,14 @@ Environment:
   through (default ``wrist``). It must be one of the ``EVEREST_CAMERAS`` names, because
   perception shares the session's already-open camera rather than opening a second one.
 * ``EVEREST_WRIST_CAMERA_COLOR`` -- ``rgb`` (default, LeRobot's convention) or ``bgr``.
+* ``EVEREST_WRIST_ROI`` -- ``x,y,w,h`` in wrist-camera pixels, restricting where the
+  carabiner detector looks. Unset means the whole frame. Set it whenever the bench is not
+  the only thing in view: the detector's thresholds are relative to the frame's own
+  background, so a bright screen, a plant or a person across the room can produce a
+  ring-shaped teal blob that no single-frame test distinguishes from a small carabiner
+  far away. What distinguishes them is that the robot cannot reach across the room, and
+  that is a fact about the workspace which has to be configured rather than inferred.
+  Find the numbers with ``uv run tools/preview.py -c wrist --roi X Y W H``.
 * ``EVEREST_GRASP_GRIPPER_BELOW_RAD`` -- gripper position, in this arm's joint radians,
   below which it counts as holding the carabiner. Unset means grasp is never asserted.
 * ``EVEREST_ALIGNMENT_TOLERANCE_PX`` -- how far the carabiner's insertion point may drift
@@ -138,6 +146,25 @@ def load_wrist_servo(environ: Mapping[str, str] | None = None) -> WristServoCali
     return calibration
 
 
+def wrist_roi(environ: Mapping[str, str] | None = None) -> tuple[int, int, int, int] | None:
+    """Where in the wrist frame the carabiner detector may look, or the whole frame."""
+
+    environ = os.environ if environ is None else environ
+    raw = environ.get("EVEREST_WRIST_ROI", "").strip()
+    if not raw:
+        return None
+    parts = raw.replace(" ", "").split(",")
+    if len(parts) != 4:
+        raise ValueError(f"EVEREST_WRIST_ROI must be 'x,y,w,h' in pixels, got {raw!r}")
+    try:
+        x, y, w, h = (int(value) for value in parts)
+    except ValueError:
+        raise ValueError(f"EVEREST_WRIST_ROI must be four integers, got {raw!r}") from None
+    if w <= 0 or h <= 0:
+        raise ValueError(f"EVEREST_WRIST_ROI needs positive width and height, got {w}x{h}")
+    return (x, y, w, h)
+
+
 def search_cv_backend(environ: Mapping[str, str] | None = None) -> str:
     """Which camera ``SEARCH_CV`` closes its loop on: ``fixed`` or ``wrist``.
 
@@ -190,6 +217,7 @@ def build_attachment_perception(
         camera_name=environ.get("EVEREST_WRIST_CAMERA", "wrist"),
         color_mode=environ.get("EVEREST_WRIST_CAMERA_COLOR", "rgb"),
         alignment_tolerance_px=float(environ.get("EVEREST_ALIGNMENT_TOLERANCE_PX", 60.0)),
+        roi_xywh=wrist_roi(environ),
         grasp_gripper_below_rad=None if threshold is None else float(threshold),
         configured_cameras=tuple(spec.name for spec in load_camera_specs(environ=environ)),
     )

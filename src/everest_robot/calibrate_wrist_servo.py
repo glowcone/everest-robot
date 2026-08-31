@@ -117,6 +117,15 @@ def _open_session(args: argparse.Namespace) -> Any:
     return open_session()
 
 
+def _roi(args: argparse.Namespace) -> Any:
+    """The detector's search region: the flag if given, else EVEREST_WRIST_ROI."""
+
+    from everest_robot.robot.deployment import wrist_roi
+
+    given = getattr(args, "roi", None)
+    return tuple(given) if given else wrist_roi()
+
+
 def _stamp_of(session: Any) -> RobotStamp:
     identity = session.port.identity
     return RobotStamp(
@@ -175,15 +184,15 @@ def _measure(read: Any, samples: int) -> tuple[float, ...]:
 class _Reader:
     """One frame source plus the detector, so ``_measure`` needs a single argument."""
 
-    def __init__(self, frames: Any, point: str = "insert") -> None:
+    def __init__(self, frames: Any, point: str = "insert", roi: Any = None) -> None:
         self.frame = frames
         self.point = point
+        self.roi = roi
 
-    @staticmethod
-    def detect(frame: Any) -> Any:
+    def detect(self, frame: Any) -> Any:
         from everest_robot.carabiner_detect import detect
 
-        return detect(frame)
+        return detect(frame, self.roi)
 
 
 def _print_features(label: str, values: Sequence[float]) -> None:
@@ -233,7 +242,7 @@ def cmd_teach(args: argparse.Namespace) -> int:
             raise WristServoError(
                 f"unknown joint(s) {', '.join(unknown)}; this arm has {', '.join(joint_names)}"
             )
-        reader = _Reader(_frames(session, args.camera, args.color), args.point)
+        reader = _Reader(_frames(session, args.camera, args.color), args.point, _roi(args))
 
         print(
             "\nTEACH MOVES THE ARM. Each of "
@@ -421,7 +430,9 @@ def cmd_look(args: argparse.Namespace) -> int:
     try:
         calibration.verify(_stamp_of(session))
         reader = _Reader(
-            _frames(session, calibration.camera_name, calibration.color_mode), calibration.point
+            _frames(session, calibration.camera_name, calibration.color_mode),
+            calibration.point,
+            _roi(args),
         )
         features = _measure(reader, args.samples)
         _print_features("measured", features)
@@ -529,7 +540,7 @@ def _build_follower(session: Any, calibration: WristServoCalibration, args: argp
             clock=session.clock,
         ),
         frames=_frames(session, calibration.camera_name, calibration.color_mode),
-        detect=detect_carabiner_wrist,
+        detect=lambda frame: detect_carabiner_wrist(frame, _roi(args)),
         clock=session.clock,
         settle_ticks=args.settle_ticks,
     )
@@ -600,6 +611,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", default=None, help="calibration path; defaults to EVEREST_WRIST_SERVO"
     )
     shared.add_argument("--fake", action="store_true", help="run against FakeArm; nothing physical")
+    shared.add_argument(
+        "--roi", nargs=4, type=int, default=None, metavar=("X", "Y", "W", "H"),
+        help="restrict the detector to this rectangle; defaults to EVEREST_WRIST_ROI",
+    )
     shared.add_argument(
         "--samples", type=int, default=5,
         help="detections median-combined into one measurement (default 5)",

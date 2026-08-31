@@ -105,12 +105,17 @@ def wrist_frames(cameras: Any, camera_name: str, color_mode: str) -> Callable[[]
     return read
 
 
-def detect_carabiner_wrist(frame: Any) -> Any:
-    """One BGR wrist frame through the carabiner detector. A miss raises."""
+def detect_carabiner_wrist(frame: Any, roi_xywh: Any = None) -> Any:
+    """One BGR wrist frame through the carabiner detector. A miss raises.
+
+    ``roi_xywh`` restricts where the detector looks, in full-frame pixels. It matters
+    whenever the bench is not the only thing the wrist camera can see: see
+    ``carabiner_detect.in_roi``.
+    """
 
     from everest_robot.carabiner_detect import detect
 
-    return detect(frame)
+    return detect(frame, roi_xywh)
 
 
 @dataclass

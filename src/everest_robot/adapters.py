@@ -541,9 +541,17 @@ class EverestAttachmentFSMHandlers:
             frames=wrist_frames(
                 self.session.bridge.cameras, servo.camera_name, servo.color_mode
             ),
-            detect=detect_carabiner_wrist,
+            # The same ROI the gate perception uses. Two detectors on one camera disagreeing
+            # about where they may look would be a genuinely confusing failure: SEARCH_CV
+            # would servo onto something INITIAL and CLIP_RL cannot see.
+            detect=lambda frame: detect_carabiner_wrist(frame, self._roi()),
             clock=self.session.clock,
         )
+
+    def _roi(self) -> Any:
+        """The wrist detector ROI, taken from the perception so both agree."""
+
+        return getattr(self.perception, "roi_xywh", None)
 
     def _open_capture(self, camera: Any) -> Any:
         """Open the fixed camera once and keep it for the attempt.

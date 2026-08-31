@@ -9,6 +9,8 @@ Nothing here commands the robot.
     ./tools/preview.py -c 2            # raw index
     ./tools/preview.py --video FILE    # replay a recording instead
 
+    ./tools/preview.py --roi 0 0 990 900   # only look at the bench
+
 Keys:  q/Esc quit   m cycle view (overlay / mask / score)   s save a snapshot
 """
 
@@ -22,7 +24,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from carabiner.detect import NotFound, chroma_mask, detect, draw, teal_score
+from everest_robot.carabiner_detect import NotFound, chroma_mask, detect, draw, in_roi, teal_score
 
 # Camera indices live in the recording app's robot config, so the names here
 # stay in sync with whatever the arm was recorded with.
@@ -71,20 +73,21 @@ def open_source(args) -> tuple[cv2.VideoCapture, str]:
 VIEWS = ("overlay", "mask", "score")
 
 
-def render(frame: np.ndarray, view: str) -> tuple[np.ndarray, str]:
+def render(frame: np.ndarray, view: str, roi=None) -> tuple[np.ndarray, str]:
     """Draw the requested view and return it with a one-line status."""
     if view == "score":
-        d = teal_score(frame)
+        d = in_roi(teal_score(frame), roi)
         vis = cv2.applyColorMap(
             np.clip(d / 8.0 * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO
         )
         return vis, "score (sigma, 0-8)"
 
     if view == "mask":
-        return cv2.cvtColor(chroma_mask(frame), cv2.COLOR_GRAY2BGR), "mask"
+        masked = chroma_mask(frame, score=in_roi(teal_score(frame), roi))
+        return cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR), "mask"
 
     try:
-        t = detect(frame)
+        t = detect(frame, roi)
     except NotFound as e:
         vis = frame.copy()
         cv2.putText(vis, f"no detection: {e}", (8, 44), cv2.FONT_HERSHEY_SIMPLEX,
@@ -97,6 +100,14 @@ def render(frame: np.ndarray, view: str) -> tuple[np.ndarray, str]:
     return vis, f"centre ({cx:.0f}, {cy:.0f})  area {t.area:.0f}px"
 
 
+def draw_roi(vis: np.ndarray, roi) -> None:
+    """Outline the search region, so its numbers can be checked against the scene."""
+    if roi is None:
+        return
+    x, y, w, h = roi
+    cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 255), 1)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -106,6 +117,13 @@ def main() -> None:
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--view", default="overlay", choices=VIEWS)
+    p.add_argument(
+        "--roi", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
+        help="only look inside this rectangle. Use it when the bench is not the only thing "
+             "in view: the detector's thresholds are relative to the frame's own background, "
+             "so a screen or a plant across the room can look like a small carabiner. The "
+             "numbers you settle on go in EVEREST_WRIST_ROI",
+    )
     args = p.parse_args()
 
     cap, label = open_source(args)
@@ -128,7 +146,9 @@ def main() -> None:
                 break
 
             t0 = time.perf_counter()
-            vis, status = render(frame, view)
+            roi = tuple(args.roi) if args.roi else None
+            vis, status = render(frame, view, roi)
+            draw_roi(vis, roi)
             ms = (time.perf_counter() - t0) * 1000
             smoothed_ms = ms if smoothed_ms is None else 0.9 * smoothed_ms + 0.1 * ms
 

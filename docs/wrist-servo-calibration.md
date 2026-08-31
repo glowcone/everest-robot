@@ -146,7 +146,38 @@ energized. Supplying both calibrations is refused rather than ranked — two cal
 commanding one arm with no arbiter between them is not a configuration to pick a winner
 from.
 
+## When the detector reports nothing
+
+Two things in the frame defeat it, and they have different fixes.
+
+**Background clutter.** The teal score is relative to the frame's *own* median, so a room
+behind the bench — a bright screen, plants, people — produces teal-scoring blobs that are
+genuinely ring-shaped. No single-frame test separates "a ring-shaped object across the room"
+from "a small carabiner far away"; what separates them is that the arm cannot reach across
+the room. So it has to be configured:
+
+```bash
+uv run tools/preview.py -c wrist --roi 0 0 990 900   # find the numbers, drawn on the frame
+```
+
+then put them in `EVEREST_WRIST_ROI=0,0,990,900`. Every wrist command (`teach`, `look`,
+`centre`, `track`) and the FSM's perception read it, and `--roi` overrides per run.
+
+**Distance.** Far from the table the ring thins to a few pixels of stock and its shaded side
+falls under the strictest hysteresis floor, leaving arcs that no longer enclose a hole. The
+floor is a ladder (`LOW_THRESHOLDS`, strictest first) that descends only when nothing
+validated above it, so this recovers on its own — at the cost of weaker evidence.
+
+Read `mask` and `score` in the preview (`m` cycles them) before changing any threshold. If
+the ring is complete in `score` but broken in `mask`, it is a threshold problem. If it is
+broken in `score` too, the colour evidence is not there and no threshold will conjure it.
+
 ## Limits worth knowing
+
+- **Far away, the spine is unreliable.** A dark, shadowed spine bar can score near zero
+  while the rest of the ring is clearly teal, so the mask is a partial ring and the spine
+  midpoint and angle are fitted to it. Position stays usable — which is why `wrist-centre`
+  servos translation only — but do not trust `spine_angle` until the carabiner is near.
 
 - **The Jacobian is measured at one pose.** Away from it the calibration gives a direction,
   not a step. That is enough because `VisualTracker` clamps the step anyway, but a solve

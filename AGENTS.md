@@ -288,6 +288,18 @@ re-export shim) because `robot-attach-fsm` is a console script: `sys.path` start
 script's directory, not the working directory, so a top-level package is not importable from
 it. Runtime perception code must import `everest_robot.carabiner_detect`.
 
+Its two arbitration rules are load-bearing and were both built from real failures. The
+hysteresis floor is `LOW_THRESHOLDS`, walked **strictest first**, descending only when
+nothing validated above it -- lowering it globally wins far-field frames and loses more
+near-field ones, which is measurable on the capture corpus, so never turn the ladder into a
+single tuned constant. And `_plausible` returns *every* size-plausible component, largest
+first, for `_validate` to arbitrate: the largest teal thing in view is often a screen or a
+plant, and committing to it is what made a carabiner in plain view report "no detection".
+Neither of those can reject a ring-shaped object across the room -- nothing in one frame
+can -- so `detect(frame, roi_xywh)` takes a search region from `EVEREST_WRIST_ROI`. Keep the
+ROI masking the *score* rather than cropping the image: every caller works in absolute
+pixels.
+
 Add deterministic unit tests under `tests/` for every adapter result and recovery branch.
 Before handing off a change, run `just check`. For orchestration changes, also run the
 database-backed smoke path on whichever backend `just db-backend` reports: `just db-up`,
